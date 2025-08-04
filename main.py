@@ -1,3 +1,5 @@
+import hmac
+import hashlib
 import os
 import time
 import requests
@@ -35,25 +37,25 @@ def send_message(text):
     except: pass
 
 # 🔐 طلب موقع Bitvavo
+def create_signature(timestamp, method, path, body):
+    body_str = json.dumps(body, separators=(',', ':')) if body else ""
+    msg = f"{timestamp}{method}{path}{body_str}"
+    return hmac.new(BITVAVO_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
 def bitvavo_request(method, path, body=None):
     timestamp = str(int(time.time() * 1000))
-    body_str = json.dumps(body, separators=(',', ':')) if body else ""
-    message = timestamp + method + path + body_str
-    signature = requests.utils.to_native_string(
-        requests.auth._basic_auth_str('', '')
-    )
-    import hmac, hashlib
-    signature = hmac.new(BITVAVO_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    signature = create_signature(timestamp, method, f"/v2{path}", body)
     headers = {
         'Bitvavo-Access-Key': BITVAVO_API_KEY,
-        'Bitvavo-Access-Signature': signature,
         'Bitvavo-Access-Timestamp': timestamp,
-        'Bitvavo-Access-Window': '10000',
-        'Content-Type': 'application/json'
+        'Bitvavo-Access-Signature': signature,
+        'Bitvavo-Access-Window': '10000'
     }
-    url = f"https://api.bitvavo.com/v2{path}"
-    r = requests.request(method, url, headers=headers, data=body_str)
-    return r.json()
+    try:
+        response = requests.request(method, f"https://api.bitvavo.com/v2{path}", headers=headers, json=body or {})
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 # ✅ سعر السوق الحالي
 def fetch_price(symbol):
