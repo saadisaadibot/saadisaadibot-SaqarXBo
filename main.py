@@ -206,6 +206,10 @@ def webhook():
         enabled = False
         send_message("🛑 تم إيقاف الشراء.")
 
+    elif "رصيد" in text:
+        balance = bitvavo_request("GET", "/balance")
+        send_message(json.dumps(balance, indent=2))
+    
     elif "ابدأ" in text:
         enabled = True
         send_message("✅ تم تفعيل الشراء.")
