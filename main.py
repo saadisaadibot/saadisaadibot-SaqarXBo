@@ -208,25 +208,47 @@ def webhook():
         enabled = False
         send_message("🛑 تم إيقاف الشراء.")
 
-    elif "رصيد" in text:
-        balance = bitvavo_request("GET", "/balance")
-        if not isinstance(balance, list):
+    elif "الرصيد" in text:
+        balances = bitvavo_request("GET", "/balance")
+        if not isinstance(balances, list):
             send_message("❌ فشل جلب الرصيد.")
             return
 
-        lines = ["💰 الرصيد:"]
-        for b in balance:
+        lines = ["💰 الرصيد التفصيلي:"]
+        total_value = 0
+
+        for b in balances:
             symbol = b.get("symbol")
             available = float(b.get("available", 0))
-            if available > 0:
-                lines.append(f"- {symbol}: {available:.4f}")
-    
+            if available == 0 or symbol == "EUR":
+                if symbol == "EUR" and available > 0:
+                    lines.append(f"- EUR 💶: {available:.2f}")
+                    total_value += available
+                continue
+
+        pair = f"{symbol}-EUR"
+        price_data = bitvavo_request("GET", f"/ticker/price?market={pair}")
+        price = float(price_data.get("price", 0)) if isinstance(price_data, dict) else 0
+        value = available * price
+
+        if value > 0:
+            lines.append(f"- {symbol}: {available:.4f} ≈ {value:.2f} EUR")
+            total_value += value
+
+        lines.append(f"\n📊 الإجمالي التقريبي: {total_value:.2f} EUR")
         send_message("\n".join(lines))
     
     elif "ابدأ" in text:
         enabled = True
         send_message("✅ تم تفعيل الشراء.")
 
+    elif "انسى" in text:
+        active_trades.clear()
+        executed_trades.clear()
+        buy_blacklist.clear()
+        sell_blacklist.clear()
+        send_message("🧠 تم نسيان كل شيء! البوت نضاف 🤖")
+    
     elif "عدل الصفقات" in text:
         try:
             num = int(text.split(" ")[-1])
