@@ -85,6 +85,30 @@ def buy(symbol):
     if symbol in buy_blacklist:
         return
 
+    # 🔁 الاستبدال الذكي إذا امتلأت الصفقات
+    if len(active_trades) >= max_trades:
+        weakest = None
+        lowest_pnl = float('inf')
+
+        for trade in active_trades:
+            current = fetch_price(trade["symbol"])
+            if not current:
+                continue
+            pnl = ((current - trade["entry"]) / trade["entry"]) * 100
+            if pnl < lowest_pnl:
+                lowest_pnl = pnl
+                weakest = trade
+
+        if weakest:
+            send_message(f"♻️ استبدال أضعف صفقة: {weakest['symbol']} (ربح {lowest_pnl:.2f}%)")
+            sell(weakest["symbol"], weakest["entry"])
+            active_trades.remove(weakest)
+            r.set("nems:active_trades", json.dumps(active_trades))
+        else:
+            send_message("❌ لا يمكن تنفيذ الاستبدال.")
+            return
+
+    # ✅ تنفيذ الشراء
     body = {
         "market": f"{symbol}-EUR",
         "side": "buy",
