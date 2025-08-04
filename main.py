@@ -4,6 +4,7 @@ import os
 import time
 import requests
 import json
+import redis
 from flask import Flask, request
 from threading import Thread
 from uuid import uuid4
@@ -18,6 +19,8 @@ BITVAVO_API_KEY = os.getenv("BITVAVO_API_KEY")
 BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET")
 BUY_AMOUNT_EUR = float(os.getenv("BUY_AMOUNT_EUR", 10))
 
+r = redis.from_url(os.getenv("REDIS_URL"))
+
 # 🧠 حالة البوت
 enabled = True
 max_trades = 2
@@ -25,6 +28,18 @@ active_trades = []
 executed_trades = []
 buy_blacklist = {}
 sell_blacklist = {}
+
+# 🔁 تحميل الصفقات من Redis عند التشغيل
+try:
+    at = r.get("nems:active_trades")
+    if at:
+        active_trades = json.loads(at)
+
+    et = r.lrange("nems:executed_trades", 0, -1)
+    executed_trades = [json.loads(t) for t in et]
+except:
+    active_trades = []
+    executed_trades = []
 
 # ✅ إرسال رسالة تلغرام
 def send_message(text):
@@ -107,6 +122,10 @@ def buy(symbol):
             "amount": total_amount
         })
 
+        # 🧠 حفظ في Redis
+        r.set("nems:active_trades", json.dumps(active_trades))
+        r.rpush("nems:executed_trades", json.dumps(trade))
+
         send_message(f"✅ شراء {symbol} بسعر {avg_price:.4f}")
     else:
         buy_blacklist[symbol] = True
@@ -168,12 +187,14 @@ def monitor_loop():
                 if trade["max_profit"] >= 2 and profit <= trade["max_profit"] - 0.5:
                     sell(symbol, entry)
                     active_trades.remove(trade)
+                    r.set("nems:active_trades", json.dumps(active_trades))
 
                 elif profit <= -2:
                     sell(symbol, entry)
                     active_trades.remove(trade)
+                    r.set("nems:active_trades", json.dumps(active_trades))
 
-            time.sleep(5)
+            time.sleep(2)
         except Exception as e:
             print("خطأ في المراقبة:", e)
             time.sleep(5)
@@ -183,7 +204,7 @@ Thread(target=monitor_loop, daemon=True).start()
 # ✅ أوامر تلغرام عبر Webhook
 @app.route("/", methods=["POST"])
 def webhook():
-    global enabled, max_trades  # ✅ لازم يكون بأول السطر داخل الدالة
+    global enabled, max_trades
 
     data = request.json
     if not data or "message" not in data:
@@ -226,18 +247,18 @@ def webhook():
                     total_value += available
                 continue
 
-        pair = f"{symbol}-EUR"
-        price_data = bitvavo_request("GET", f"/ticker/price?market={pair}")
-        price = float(price_data.get("price", 0)) if isinstance(price_data, dict) else 0
-        value = available * price
+            pair = f"{symbol}-EUR"
+            price_data = bitvavo_request("GET", f"/ticker/price?market={pair}")
+            price = float(price_data.get("price", 0)) if isinstance(price_data, dict) else 0
+            value = available * price
 
-        if value > 0:
-            lines.append(f"- {symbol}: {available:.4f} ≈ {value:.2f} EUR")
-            total_value += value
+            if value > 0:
+                lines.append(f"- {symbol}: {available:.4f} ≈ {value:.2f} EUR")
+                total_value += value
 
         lines.append(f"\n📊 الإجمالي التقريبي: {total_value:.2f} EUR")
         send_message("\n".join(lines))
-    
+
     elif "ابدأ" in text:
         enabled = True
         send_message("✅ تم تفعيل الشراء.")
@@ -247,8 +268,10 @@ def webhook():
         executed_trades.clear()
         buy_blacklist.clear()
         sell_blacklist.clear()
+        r.delete("nems:active_trades")
+        r.delete("nems:executed_trades")
         send_message("🧠 تم نسيان كل شيء! البوت نضاف 🤖")
-    
+
     elif "عدل الصفقات" in text or "عدد الصفقات" in text:
         try:
             numbers = [int(s) for s in text.split() if s.isdigit()]
