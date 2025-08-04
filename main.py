@@ -210,7 +210,18 @@ def webhook():
 
     elif "رصيد" in text:
         balance = bitvavo_request("GET", "/balance")
-        send_message(json.dumps(balance, indent=2))
+        if not isinstance(balance, list):
+            send_message("❌ فشل جلب الرصيد.")
+            return
+
+        lines = ["💰 الرصيد:"]
+        for b in balance:
+            symbol = b.get("symbol")
+            available = float(b.get("available", 0))
+            if available > 0:
+                lines.append(f"- {symbol}: {available:.4f}")
+    
+        send_message("\n".join(lines))
     
     elif "ابدأ" in text:
         enabled = True
