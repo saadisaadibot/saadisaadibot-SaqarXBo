@@ -249,14 +249,18 @@ def webhook():
         sell_blacklist.clear()
         send_message("🧠 تم نسيان كل شيء! البوت نضاف 🤖")
     
-    elif "عدل الصفقات" in text:
+    elif "عدل الصفقات" in text or "عدد الصفقات" in text:
         try:
-            num = int(text.split(" ")[-1])
-            if 1 <= num <= 4:
-                max_trades = num
-                send_message(f"⚙️ تم تعديل عدد الصفقات إلى: {num}")
+            numbers = [int(s) for s in text.split() if s.isdigit()]
+            if numbers:
+                num = numbers[0]
+                if 1 <= num <= 4:
+                    max_trades = num
+                    send_message(f"⚙️ تم تعديل عدد الصفقات إلى: {num}")
+                else:
+                    send_message("❌ فقط بين 1 و 4.")
             else:
-                send_message("❌ فقط بين 1 و 4.")
+                raise ValueError("No number found")
         except:
             send_message("❌ الصيغة: عدل الصفقات 2")
 
