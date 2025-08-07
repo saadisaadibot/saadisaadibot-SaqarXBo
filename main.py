@@ -150,7 +150,7 @@ def buy(symbol):
         r.set("nems:active_trades", json.dumps(active_trades))
         r.rpush("nems:executed_trades", json.dumps(trade))
 
-        send_message(f"✅ شراء {symbol} بسعر {avg_price:.4f}")
+        send_message(f"✅ شراء {symbol} بسعر {avg_price:.10f}")
     else:
         buy_blacklist[symbol] = True
         send_message(f"❌ فشل شراء {symbol}")
@@ -213,7 +213,7 @@ def monitor_loop():
                     active_trades.remove(trade)
                     r.set("nems:active_trades", json.dumps(active_trades))
 
-                elif profit <= -2:
+                elif profit <= -1.2:
                     sell(symbol, entry)
                     active_trades.remove(trade)
                     r.set("nems:active_trades", json.dumps(active_trades))
