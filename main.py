@@ -213,7 +213,7 @@ def monitor_loop():
                     active_trades.remove(trade)
                     r.set("nems:active_trades", json.dumps(active_trades))
 
-                elif profit <= -1.2:
+                elif profit <= -1.8:
                     sell(symbol, entry)
                     active_trades.remove(trade)
                     r.set("nems:active_trades", json.dumps(active_trades))
