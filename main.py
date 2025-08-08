@@ -246,28 +246,30 @@ def webhook():
 
     elif "الملخص" in text:
         lines = []
+
         if active_trades:
             lines.append("📌 الصفقات النشطة:")
             for t in active_trades:
-                symbol = t['symbol']
+                symbol = t['symbol'].replace("-EUR", "")
                 entry = t['entry']
                 amount = t['amount']
-                current = fetch_price(symbol)
+                current = fetch_price(f"{symbol}-EUR")
                 pnl = ((current - entry) / entry) * 100 if current else 0
-                emoji = "✅" if pnl >= 0 else "❌"
-                lines.append(f"{emoji} {symbol} @ {entry:.4f} → {current:.4f} | كمية: {amount:.4f} | ربح: {pnl:.2f}%")
+                emoji = "📈" if pnl >= 0 else "📉"
+                lines.append(f"❌ {symbol} @ {entry:.4f} → {current:.4f}")
+                lines.append(f"🔹 كمية: {amount:.4f} | ربح: {pnl:+.2f}% {emoji}")
         else:
             lines.append("📌 لا توجد صفقات نشطة.")
 
         if executed_trades:
             lines.append("\n📊 صفقات سابقة:")
             for i, t in enumerate(executed_trades[-5:], 1):
-                symbol = t['symbol']
+                symbol = t['symbol'].replace("-EUR", "")
                 entry = t['entry']
-                current = fetch_price(symbol)
+                current = fetch_price(f"{symbol}-EUR")
                 pnl = ((current - entry) / entry) * 100 if current else 0
                 emoji = "📈" if pnl >= 0 else "📉"
-                lines.append(f"{i}. {emoji} {symbol} | دخول: {entry:.4f} → الآن: {current:.4f} | {pnl:.2f}%")
+                lines.append(f"{i}. {symbol}: {entry:.4f} → {current:.4f} | {pnl:+.2f}% {emoji}")
         else:
             lines.append("\n📊 لا توجد صفقات سابقة.")
 
