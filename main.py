@@ -218,6 +218,8 @@ def monitor_loop():
 
 Thread(target=monitor_loop, daemon=True).start()
 
+# بعد كل ما سبق (الاستيرادات والدوال)...
+
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled, max_trades
@@ -237,8 +239,10 @@ def webhook():
         try:
             symbol = text.split("اشتري", 1)[-1].strip().upper()
             buy(symbol)
+            return "ok"
         except:
             send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
+            return "ok"
 
     elif "الملخص" in text:
         lines = []
@@ -268,32 +272,7 @@ def webhook():
             lines.append("\n📊 لا توجد صفقات سابقة.")
 
         send_message("\n".join(lines))
-
-    elif "قف" in text:
-        enabled = False
-        send_message("🛑 تم إيقاف الشراء.")
-
-    elif "ابدأ" in text:
-        enabled = True
-        send_message("✅ تم تفعيل الشراء.")
-
-    elif "انسى" in text:
-        active_trades.clear()
-        executed_trades.clear()
-        r.delete("nems:active_trades")
-        r.delete("nems:executed_trades")
-        send_message("🧠 تم نسيان كل شيء! البوت نضاف 🤖")
-
-    elif "عدد الصفقات" in text or "عدل الصفقات" in text:
-        try:
-            num = int(text.split()[-1])
-            if 1 <= num <= 4:
-                max_trades = num
-                send_message(f"⚙️ تم تعديل عدد الصفقات إلى: {num}")
-            else:
-                send_message("❌ فقط بين 1 و 4.")
-        except:
-            send_message("❌ الصيغة: عدل الصفقات 2")
+        return "ok"
 
     elif "الرصيد" in text:
         balances = bitvavo_request("GET", "/balance")
@@ -326,6 +305,38 @@ def webhook():
             lines.append("\n🚫 لا توجد عملات قيد التداول.")
         send_message("\n".join(lines))
         return "ok"
+
+    elif "قف" in text:
+        enabled = False
+        send_message("🛑 تم إيقاف الشراء.")
+        return "ok"
+
+    elif "ابدأ" in text:
+        enabled = True
+        send_message("✅ تم تفعيل الشراء.")
+        return "ok"
+
+    elif "انسى" in text:
+        active_trades.clear()
+        executed_trades.clear()
+        r.delete("nems:active_trades")
+        r.delete("nems:executed_trades")
+        send_message("🧠 تم نسيان كل شيء! البوت نضاف 🤖")
+        return "ok"
+
+    elif "عدد الصفقات" in text or "عدل الصفقات" in text:
+        try:
+            num = int(text.split()[-1])
+            if 1 <= num <= 4:
+                max_trades = num
+                send_message(f"⚙️ تم تعديل عدد الصفقات إلى: {num}")
+            else:
+                send_message("❌ فقط بين 1 و 4.")
+        except:
+            send_message("❌ الصيغة: عدل الصفقات 2")
+        return "ok"
+
+    return "ok"  # ✅ لضمان أنه في أي حالة لم تُغطى فوق، يرجع رد صحيح
 
 if __name__ == "__main__":
     app.run(port=5000)
