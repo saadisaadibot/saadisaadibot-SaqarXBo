@@ -296,10 +296,35 @@ def webhook():
             send_message("❌ الصيغة: عدل الصفقات 2")
 
     elif "الرصيد" in text:
-        # (نفس الرصيد السابق لم يتم تغييره هنا)
-        pass
+        balances = bitvavo_request("GET", "/balance")
+        eur = sum(float(b["available"]) for b in balances if b["symbol"] == "EUR")
+        total = eur
+        winners, losers = [], []
 
-    return "ok"
+        for b in balances:
+            sym = b.get("symbol")
+            if sym == "EUR":
+                continue
+            qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
+            if qty < 0.0001:
+                continue
+            pair = f"{sym}-EUR"
+            entry = next((t["entry"] for t in executed_trades if t["symbol"] == pair), None)
+            price = fetch_price(pair)
+            if not entry or not price:
+                continue
+            value = qty * price
+            pnl = ((price - entry) / entry) * 100
+            total += value
+            line = f"{sym}: {qty:.2f} @ {price:.3f} → {pnl:+.2f}%"
+            (winners if pnl >= 0 else losers).append(line)
+
+        lines = [f"💰 الرصيد الكلي: €{total:.2f}"]
+        if winners: lines.append("\n📈 رابحين:\n" + "\n".join(winners))
+        if losers:  lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
+        if not winners and not losers:
+            lines.append("\n🚫 لا توجد عملات قيد التداول.")
+        send_message("\n".join(lines))
 
 if __name__ == "__main__":
     app.run(port=5000)
