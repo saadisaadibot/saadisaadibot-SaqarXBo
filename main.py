@@ -143,7 +143,8 @@ def buy(symbol):
             "entry": avg_price,
             "amount": total_amount,
             "trail": avg_price,
-            "max_profit": 0
+            "max_profit": 0,
+            "timestamp": time.time()
         }
 
         active_trades.append(trade)
@@ -179,9 +180,12 @@ def sell(symbol, entry):
     res = bitvavo_request("POST", "/order", body)
     if isinstance(res, dict) and res.get("status") == "filled":
         fills = res.get("fills", [])
-        price = float(fills[0]["price"]) if fills else entry
-        pnl = ((price - entry) / entry) * 100
-        send_message(f"💰 بيع {symbol} بسعر {price:.4f} | ربح: {pnl:.2f}%")
+        total_amount = sum(float(f["amount"]) for f in fills)
+        total_value = sum(float(f["amount"]) * float(f["price"]) for f in fills)
+        real_price = total_value / total_amount if total_amount > 0 else entry
+
+        pnl = ((real_price - entry) / entry) * 100
+        send_message(f"💰 بيع {symbol} بسعر {real_price:.4f} | ربح: {pnl:.2f}%")
     else:
         r.setex(f"blacklist:sell:{symbol}", 1, BLACKLIST_EXPIRE_SECONDS)
         send_message(f"❌ فشل بيع {symbol}")
@@ -218,8 +222,6 @@ def monitor_loop():
 
 Thread(target=monitor_loop, daemon=True).start()
 
-# بعد كل ما سبق (الاستيرادات والدوال)...
-
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled, max_trades
@@ -248,28 +250,37 @@ def webhook():
         lines = []
 
         if active_trades:
-            lines.append("📌 الصفقات النشطة:")
-            for t in active_trades:
+            sorted_trades = sorted(active_trades, key=lambda t: ((fetch_price(t["symbol"]) or t["entry"]) - t["entry"]) / t["entry"], reverse=True)
+            total_value = 0
+            lines.append(f"📌 الصفقات النشطة ({len(active_trades)}):")
+
+            for i, t in enumerate(sorted_trades, 1):
                 symbol = t['symbol'].replace("-EUR", "")
                 entry = t['entry']
                 amount = t['amount']
-                current = fetch_price(f"{symbol}-EUR")
-                pnl = ((current - entry) / entry) * 100 if current else 0
-                emoji = "📈" if pnl >= 0 else "📉"
-                lines.append(f"❌ {symbol} @ {entry:.4f} → {current:.4f}")
-                lines.append(f"🔹 كمية: {amount:.4f} | ربح: {pnl:+.2f}% {emoji}")
+                current = fetch_price(t['symbol']) or entry
+                pnl = ((current - entry) / entry) * 100
+                emoji = "✅" if pnl >= 0 else "❌"
+                value = amount * current
+                total_value += value
+                duration = int((time.time() - t.get("timestamp", time.time())) / 60)
+
+                lines.append(f"{i}. {symbol}: €{entry:.3f} → €{current:.3f} {emoji} {pnl:+.2f}%")
+                lines.append(f"   • كمية: {amount:.4f} | منذ: {duration} د")
+
+            lines.append(f"💼 قيمة الصفقات: €{total_value:.2f}")
         else:
             lines.append("📌 لا توجد صفقات نشطة.")
 
         if executed_trades:
-            lines.append("\n📊 صفقات سابقة:")
+            lines.append("\n📊 آخر صفقات منفذة:")
             for i, t in enumerate(executed_trades[-5:], 1):
                 symbol = t['symbol'].replace("-EUR", "")
                 entry = t['entry']
-                current = fetch_price(f"{symbol}-EUR")
-                pnl = ((current - entry) / entry) * 100 if current else 0
-                emoji = "📈" if pnl >= 0 else "📉"
-                lines.append(f"{i}. {symbol}: {entry:.4f} → {current:.4f} | {pnl:+.2f}% {emoji}")
+                exit_price = t.get("exit", fetch_price(t['symbol']))
+                pnl = ((exit_price - entry) / entry) * 100 if exit_price else 0
+                emoji = "✅" if pnl >= 0 else "❌"
+                lines.append(f"{i}. {symbol}: دخول @ €{entry:.3f} → بيع @ €{exit_price:.3f} {emoji} {pnl:+.2f}%")
         else:
             lines.append("\n📊 لا توجد صفقات سابقة.")
 
@@ -338,7 +349,7 @@ def webhook():
             send_message("❌ الصيغة: عدل الصفقات 2")
         return "ok"
 
-    return "ok"  # ✅ لضمان أنه في أي حالة لم تُغطى فوق، يرجع رد صحيح
+    return "ok"
 
 if __name__ == "__main__":
     app.run(port=5000)
