@@ -325,6 +325,7 @@ def webhook():
         if not winners and not losers:
             lines.append("\n🚫 لا توجد عملات قيد التداول.")
         send_message("\n".join(lines))
+        return "ok"
 
 if __name__ == "__main__":
     app.run(port=5000)
