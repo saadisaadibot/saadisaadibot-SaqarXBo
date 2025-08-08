@@ -218,7 +218,7 @@ def monitor_loop():
                     active_trades.remove(trade)
                     r.set("nems:active_trades", json.dumps(active_trades))
 
-            time.sleep(2)
+            time.sleep(1)
         except Exception as e:
             print("خطأ في المراقبة:", e)
             time.sleep(5)
