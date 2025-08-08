@@ -11,14 +11,15 @@ from uuid import uuid4
 from dotenv import load_dotenv
 
 # 📌 إعدادات قابلة للتعديل
+load_dotenv()
 BUY_AMOUNT_EUR = float(os.getenv("BUY_AMOUNT_EUR", 10))
 MAX_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", 2))
-TRAIL_START = 2         # بداية التريلينغ ستوب عند +2%
-TRAIL_BACKSTEP = 0.5    # التراجع المقبول من القمة
-STOP_LOSS = -1.8        # وقف الخسارة
+TRAIL_START = 2
+TRAIL_BACKSTEP = 0.5
+STOP_LOSS = -1.8
+BLACKLIST_EXPIRE_SECONDS = int(os.getenv("BLACKLIST_EXPIRE_SECONDS", 300))
 
 # 🧠 تهيئة المتغيرات
-load_dotenv()
 app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -30,10 +31,19 @@ enabled = True
 max_trades = MAX_TRADES
 active_trades = []
 executed_trades = []
-buy_blacklist = {}
-sell_blacklist = {}
 
-# 📦 تحميل الصفقات من Redis عند التشغيل
+# ✅ جلب العملات المدعومة من Bitvavo
+def load_supported_symbols():
+    try:
+        res = requests.get("https://api.bitvavo.com/v2/markets")
+        data = res.json()
+        return set(m["market"].replace("-EUR", "").upper() for m in data if m["market"].endswith("-EUR"))
+    except:
+        return set()
+
+SUPPORTED_SYMBOLS = load_supported_symbols()
+
+# 📦 تحميل الصفقات من Redis
 try:
     at = r.get("nems:active_trades")
     if at:
@@ -43,24 +53,20 @@ try:
 except:
     pass
 
-# ✅ إرسال رسالة تلغرام
 def send_message(text):
     print(">>", text)
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={
-            "chat_id": CHAT_ID,
-            "text": text
+            "chat_id": CHAT_ID, "text": text
         })
     except:
         pass
 
-# 🔐 توقيع طلب Bitvavo
 def create_signature(timestamp, method, path, body):
     body_str = json.dumps(body, separators=(',', ':')) if body else ""
     msg = f"{timestamp}{method}{path}{body_str}"
     return hmac.new(BITVAVO_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
-# 🌐 إرسال طلب إلى Bitvavo
 def bitvavo_request(method, path, body=None):
     timestamp = str(int(time.time() * 1000))
     signature = create_signature(timestamp, method, f"/v2{path}", body)
@@ -76,7 +82,6 @@ def bitvavo_request(method, path, body=None):
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ سعر العملة
 def fetch_price(symbol):
     try:
         res = bitvavo_request("GET", f"/ticker/price?market={symbol}")
@@ -84,9 +89,12 @@ def fetch_price(symbol):
     except:
         return None
 
-# ✅ شراء العملة
 def buy(symbol):
-    if symbol in buy_blacklist:
+    if symbol not in SUPPORTED_SYMBOLS:
+        send_message(f"❌ العملة {symbol} غير مدعومة على Bitvavo.")
+        return
+
+    if r.exists(f"blacklist:buy:{symbol}"):
         return
 
     if len(active_trades) >= max_trades:
@@ -99,7 +107,6 @@ def buy(symbol):
             if pnl < lowest_pnl:
                 lowest_pnl = pnl
                 weakest = trade
-
         if weakest:
             send_message(f"♻️ استبدال أضعف صفقة: {weakest['symbol']} (ربح {lowest_pnl:.2f}%)")
             sell(weakest["symbol"], weakest["entry"])
@@ -109,7 +116,6 @@ def buy(symbol):
             send_message("❌ لا يمكن تنفيذ الاستبدال.")
             return
 
-    # تنفيذ الشراء
     body = {
         "market": f"{symbol}-EUR",
         "side": "buy",
@@ -129,7 +135,7 @@ def buy(symbol):
 
         if total_amount == 0 or avg_price == 0:
             send_message(f"❌ فشل شراء {symbol} - السعر أو الكمية غير صالحة")
-            buy_blacklist[symbol] = True
+            r.setex(f"blacklist:buy:{symbol}", 1, BLACKLIST_EXPIRE_SECONDS)
             return
 
         trade = {
@@ -146,12 +152,11 @@ def buy(symbol):
         r.rpush("nems:executed_trades", json.dumps(trade))
         send_message(f"✅ شراء {symbol} بسعر {avg_price:.10f}")
     else:
-        buy_blacklist[symbol] = True
+        r.setex(f"blacklist:buy:{symbol}", 1, BLACKLIST_EXPIRE_SECONDS)
         send_message(f"❌ فشل شراء {symbol}")
 
-# ✅ بيع كل الكمية
 def sell(symbol, entry):
-    if symbol in sell_blacklist:
+    if r.exists(f"blacklist:sell:{symbol}"):
         return
 
     balances = bitvavo_request("GET", "/balance")
@@ -159,7 +164,7 @@ def sell(symbol, entry):
     amount = next((float(b["available"]) for b in balances if b["symbol"] == base), 0)
 
     if amount < 0.0001:
-        sell_blacklist[symbol] = True
+        r.setex(f"blacklist:sell:{symbol}", 1, BLACKLIST_EXPIRE_SECONDS)
         return
 
     body = {
@@ -178,10 +183,9 @@ def sell(symbol, entry):
         pnl = ((price - entry) / entry) * 100
         send_message(f"💰 بيع {symbol} بسعر {price:.4f} | ربح: {pnl:.2f}%")
     else:
-        sell_blacklist[symbol] = True
+        r.setex(f"blacklist:sell:{symbol}", 1, BLACKLIST_EXPIRE_SECONDS)
         send_message(f"❌ فشل بيع {symbol}")
 
-# ✅ مراقبة الصفقات
 def monitor_loop():
     while True:
         try:
@@ -214,11 +218,9 @@ def monitor_loop():
 
 Thread(target=monitor_loop, daemon=True).start()
 
-# ✅ Webhook تلغرام
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled, max_trades
-
     data = request.json
     if not data or "message" not in data:
         return "ok"
@@ -278,8 +280,6 @@ def webhook():
     elif "انسى" in text:
         active_trades.clear()
         executed_trades.clear()
-        buy_blacklist.clear()
-        sell_blacklist.clear()
         r.delete("nems:active_trades")
         r.delete("nems:executed_trades")
         send_message("🧠 تم نسيان كل شيء! البوت نضاف 🤖")
