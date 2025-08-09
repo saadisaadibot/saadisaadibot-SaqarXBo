@@ -247,6 +247,7 @@ def buy(symbol):
 
     if isinstance(res, dict) and res.get("status") == "filled":
         fills = res.get("fills", [])
+        print("📦 FILLS:", json.dumps(fills, ensure_ascii=False))
         total_amount = sum(float(f["amount"]) for f in fills) if fills else 0.0
         total_price = sum(float(f["amount"]) * float(f["price"]) for f in fills) if fills else 0.0
         avg_price = (total_price / total_amount) if total_amount > 0 else (fetch_price(market) or 0.0)
