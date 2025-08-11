@@ -33,7 +33,7 @@ BITVAVO_API_KEY = os.getenv("BITVAVO_API_KEY")
 BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET")
 r = redis.from_url(os.getenv("REDIS_URL"))
 lock = Lock()
-
+swap_lock = Lock()  # قفل محلي لمنع استبدال متوازي
 enabled = True
 max_trades = MAX_TRADES
 active_trades = []     # صفقات مفتوحة
@@ -304,24 +304,53 @@ def buy(symbol):
 
     # استبدال الأضعف إذا امتلأت
     with lock:
-        if len(active_trades) >= max_trades:
-            weakest = None
-            lowest_pnl = float('inf')
-            for t in active_trades:
-                current = fetch_price(t["symbol"]) or t["entry"]
-                pnl = ((current - t["entry"]) / t["entry"]) * 100
-                if pnl < lowest_pnl:
-                    lowest_pnl = pnl
-                    weakest = t
-            if weakest:
+        needs_swap = len(active_trades) >= max_trades
+
+    if needs_swap:
+        # امنع استبدالين مع بعض
+        if not swap_lock.acquire(blocking=False):
+            send_message("⏳ يوجد استبدال قيد التنفيذ، تجاهلت الطلب الحالي.")
+            return
+
+        try:
+            # اختر الأضعف خارج الـlock الثقيل
+            with lock:
+                weakest = None
+                lowest_pnl = float('inf')
+                for t in active_trades:
+                    current = fetch_price(t["symbol"]) or t["entry"]
+                    pnl = ((current - t["entry"]) / t["entry"]) * 100
+                    if pnl < lowest_pnl:
+                        lowest_pnl = pnl
+                        weakest = t
+
+                if not weakest:
+                    send_message("❌ لا يمكن تنفيذ الاستبدال.")
+                    return
+
+                # لا تستبدل صفقة جديدة جداً
                 if time.time() - weakest.get("timestamp", time.time()) < 60:
                     send_message("⏳ تجاهل الاستبدال: الصفقة الأضعف حديثة جدًا.")
                     return
+
                 send_message(f"♻️ استبدال أضعف صفقة: {weakest['symbol']} (ربح {lowest_pnl:.2f}%)")
-                sell_trade(weakest)
+
+            # نفّذ البيع
+            sell_trade(weakest)
+
+            # انتظر حتى يُحذف من active_trades (نجاح البيع) أو ينتهي المهلة
+            deadline = time.time() + 12  # 12 ثانية مهلة
+            while time.time() < deadline:
+                with lock:
+                    still_there = any(id(t) == id(weakest) for t in active_trades)
+                if not still_there:
+                    break
+                time.sleep(0.25)
             else:
-                send_message("❌ لا يمكن تنفيذ الاستبدال.")
+                send_message("⏳ إلغاء الاستبدال: البيع لم يكتمل خلال المهلة.")
                 return
+        finally:
+            swap_lock.release()
 
     body = {
         "market": market,
