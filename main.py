@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import os
 import time
+import math
 import requests
 import json
 import redis
@@ -20,7 +21,7 @@ TRAIL_START = 2.0                # يبدأ التريلينغ بعد ربح %
 TRAIL_BACKSTEP = 0.5             # الرجوع المسموح قبل التريلينغ %
 STOP_LOSS = -1.8                 # ستوب لوس %
 BLACKLIST_EXPIRE_SECONDS = 300   # حظر مؤقت بعد فشل شراء/بيع (ثوانٍ)
-SELL_RETRY_SECONDS = 30          # حظر بيع قصير عند الفشل
+SELL_RETRY_SECONDS = 30          # حظر بيع قصير لإعادة المحاولة
 BUY_COOLDOWN_SEC = 600           # كولداون بعد الإغلاق لنفس العملة (10 د)
 
 # =========================
@@ -157,6 +158,28 @@ def totals_from_fills_eur(fills):
     return total_base, total_eur, fee_eur
 
 # =========================
+# 📏 دقة الكمية لكل ماركت (amount precision)
+# =========================
+_market_rules = {"t": 0, "map": {}}
+
+def get_amount_decimals(market):
+    # كاش 10 دقائق
+    now = time.time()
+    if (now - _market_rules["t"]) > 600 or not _market_rules["map"]:
+        try:
+            data = requests.get("https://api.bitvavo.com/v2/markets", timeout=8).json()
+            _market_rules["map"] = {m["market"]: m.get("precision", {}) for m in data}
+            _market_rules["t"] = now
+        except Exception:
+            pass
+    prec = _market_rules["map"].get(market, {})
+    return int(prec.get("amount", 8) or 8)  # افتراضي 8 خانات
+
+def trunc_amount(x, decimals):
+    factor = 10 ** decimals
+    return math.floor(float(x) * factor) / factor
+
+# =========================
 # 💱 البيع — بيع على الرصيد الفعلي + edge crossing
 # =========================
 def sell_trade(trade):
@@ -173,7 +196,9 @@ def sell_trade(trade):
     except Exception:
         available = 0.0
 
-    target_amt = min(float(trade.get("amount", 0) or 0), available) * 0.999  # هامش أمان بسيط
+    raw_amt = min(float(trade.get("amount", 0) or 0.0), available) * 0.999  # هامش أمان
+    dec = get_amount_decimals(market)
+    target_amt = trunc_amount(raw_amt, dec)
     if target_amt <= 0:
         r.setex(f"blacklist:sell:{market}", 15, 1)
         return
@@ -183,7 +208,7 @@ def sell_trade(trade):
         "market": market,
         "side": "sell",
         "orderType": "market",
-        "amount": f"{target_amt:.10f}",
+        "amount": f"{target_amt:.{dec}f}",
         "clientOrderId": str(uuid4()),
         "operatorId": ""
     }
@@ -285,16 +310,13 @@ def buy(symbol):
     market = f"{symbol}-EUR"
 
     with lock:
-        # لا تشتري نفس الرمز مرتين
         if any(t["symbol"] == market for t in active_trades):
             send_message(f"⛔ عندك صفقة مفتوحة على {symbol}.")
             return
-        # احسب السلوّتات (نشطة + محجوزة)
         current_slots = len(active_trades) + len(pending_buys)
         if current_slots >= max_trades:
             send_message("⛔ وصلت الحد الأقصى للصفقات.")
             return
-        # احجز سلوّت لهاي العملية
         pending_buys.add(symbol)
 
     try:
@@ -583,7 +605,7 @@ def webhook():
         send_message("🧠 تم نسيان كل شيء! بدأنا عد جديد للإحصائيات 🤖")
         return "ok"
 
-    elif "عدد الصفقات" in text or "عدل الصفقات" in text:
+    elif "عدد الصفقات" in text أو "عدل الصفقات" in text:
         try:
             num = int(text.split()[-1])
             if 1 <= num <= 4:
