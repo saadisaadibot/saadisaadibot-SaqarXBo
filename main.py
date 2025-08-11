@@ -24,7 +24,7 @@ PHASE_A_TRAIL_START    =  2.0
 PHASE_A_BACKSTEP       =  0.5
 
 # مرحلة B (>10 دقائق)
-PHASE_B_STOP_LOSS_PCT  = -1.0
+PHASE_B_STOP_LOSS_PCT  = -0.1
 PHASE_B_TRAIL_START    =  1.0
 PHASE_B_BACKSTEP       =  0.3
 
