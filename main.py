@@ -14,13 +14,13 @@ from dotenv import load_dotenv
 # =========================
 # 📌 إعدادات يدوية (ثابتة هنا)
 # =========================
-BUY_AMOUNT_EUR = 22.0            # قيمة المبلغ الإجمالي
-MAX_TRADES = 2                   # الحد الأقصى (ثابت = صفقتان دائمًا)
+BUY_AMOUNT_EUR = 22.0            # لم نعد نستخدمه للشراء (أبقيناه فقط للانسجام)
+MAX_TRADES = 2                   # الحد الأقصى للصفقات النشطة = 2 دائمًا
 
 # نافذة الخروج المبكر (أول 15 دقيقة)
 EARLY_WINDOW_SEC = 15 * 60
 EARLY_TRAIL_ACTIVATE = 3.0       # تفعيل التريلينغ عند +3%
-EARLY_TRAIL_BACKSTEP = 1.0       # يتراجع 1% من القمة
+EARLY_TRAIL_BACKSTEP = 1.0       # يغلق إذا تراجع 1% من القمة
 EARLY_STOP_LOSS = -3.0           # ستوب لوس -3%
 
 # بعد ربع ساعة: إغلاق سريع ±1%
@@ -46,8 +46,8 @@ BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET")
 r = redis.from_url(os.getenv("REDIS_URL"))
 lock = Lock()
 enabled = True
-active_trades = []     # الصفقات المفتوحة (كل إشارة = صفقة)
-executed_trades = []   # سجل الصفقات
+active_trades = []     # صفقات مفتوحة
+executed_trades = []   # سجل جميع الصفقات (نسخة عند الشراء + تفاصيل الإغلاق لاحقًا)
 
 # لحساب “منذ الانسى”
 SINCE_RESET_KEY = "nems:since_reset"
@@ -104,6 +104,17 @@ def bitvavo_request(method, path, body=None):
         return resp.json()
     except Exception:
         return {"error": "invalid_json", "status_code": resp.status_code, "text": resp.text}
+
+# >>> أضفنا هذه الدالة لحساب رصيد EUR المتاح <<<
+def get_eur_available():
+    try:
+        balances = bitvavo_request("GET", "/balance")
+        for b in balances:
+            if b.get("symbol") == "EUR":
+                return max(0.0, float(b.get("available", 0) or 0))
+    except Exception:
+        pass
+    return 0.0
 
 # =========================
 # 💶 الأسعار (كاش خفيف)
@@ -281,24 +292,15 @@ def sell_trade(trade):
     r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
 
 # =========================
-# 🛒 الشراء (بدون استبدال — كل إشارة = نصف المبلغ)
+# 🛒 الشراء (ديناميكي من الرصيد — 1) نصف الرصيد، 2) كل المتبقي)
 # =========================
-def place_market_buy(market, amount_quote_eur):
-    body = {
-        "market": market,
-        "side": "buy",
-        "orderType": "market",
-        "amountQuote": f"{amount_quote_eur:.2f}",
-        "clientOrderId": str(uuid4()),
-        "operatorId": ""
-    }
-    return bitvavo_request("POST", "/order", body)
-
 def buy(symbol):
     """
-    - يمنع الاستبدال: إن امتلأت الصفقات (2) يرفض الشراء.
-    - كل إشارة شراء = صفقة مستقلة بنصف المبلغ (BUY_AMOUNT_EUR/2).
+    - بدون استبدال نهائيًا (حد أقصى صفقتان).
+    - الصفقة الأولى: نصف رصيد EUR المتاح.
+    - الصفقة الثانية: كل المبلغ المتبقي بالـ EUR.
     - يمنع تكرار نفس الرمز إذا عندك صفقة مفتوحة عليه أو في كولداون.
+    - يعتمد على fills من Bitvavo لحساب الكمية/الكلفة بدقة.
     """
     ensure_symbols_fresh()
     symbol = symbol.upper().strip()
@@ -312,6 +314,7 @@ def buy(symbol):
 
     market = f"{symbol}-EUR"
 
+    # ممنوع صفقتين على نفس الزوج
     with lock:
         if any(t["symbol"] == market for t in active_trades):
             send_message(f"⛔ عندك صفقة مفتوحة على {symbol}.")
@@ -324,51 +327,77 @@ def buy(symbol):
     if r.exists(f"blacklist:buy:{symbol}"):
         return
 
-    per_trade_eur = round(BUY_AMOUNT_EUR / MAX_TRADES, 2)  # نصف المبلغ
-
-    res = place_market_buy(market, per_trade_eur)
-    if not (isinstance(res, dict) and res.get("status") == "filled"):
-        r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
-        send_message(f"❌ فشل شراء {symbol} بقيمة €{per_trade_eur:.2f}")
+    # احسب المبلغ حسب الرصيد الحقيقي
+    eur_avail = get_eur_available()
+    if eur_avail <= 0:
+        send_message("💤 لا يوجد رصيد EUR متاح للشراء.")
         return
 
-    fills = res.get("fills", [])
-    print("📦 BUY FILLS:", json.dumps(fills, ensure_ascii=False))
+    # أول صفقة = نصف الرصيد، الثانية = كل الباقي
+    if len(active_trades) == 0:
+        amount_quote = eur_avail / 2.0
+        tranche = "النصف (50%)"
+    else:
+        amount_quote = eur_avail
+        tranche = "المبلغ المتبقي"
 
-    tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
-    amount_net = tb
-    cost_eur   = tq_eur + fee_eur  # التكلفة الصافية €
-
-    if amount_net <= 0 or cost_eur <= 0:
-        send_message(f"❌ فشل شراء {symbol} - بيانات fills غير صالحة")
-        r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
+    amount_quote = round(amount_quote, 2)
+    # حماية من مبالغ صغيرة جدًا قد يرفضها Bitvavo
+    if amount_quote < 5.0:
+        send_message(f"⚠️ المبلغ المتاح صغير (€{amount_quote:.2f}). لن أنفذ الشراء.")
         return
 
-    avg_price_incl_fees = cost_eur / amount_net
-
-    trade = {
-        "symbol": market,
-        "entry": avg_price_incl_fees,
-        "amount": amount_net,
-        "cost_eur": cost_eur,
-        "buy_fee_eur": fee_eur,
-        "opened_at": time.time(),
-        "phase": "EARLY",           # خلال 15 دقيقة
-        "peak_pct": 0.0,            # أعلى ربح مُسجّل (للتريلينغ المبكر)
-        # أعلام الخروج
-        "exit_in_progress": False,
-        "last_profit": 0.0,
-        "last_exit_try": 0.0
+    body = {
+        "market": market,
+        "side": "buy",
+        "orderType": "market",
+        "amountQuote": f"{amount_quote:.2f}",
+        "clientOrderId": str(uuid4()),
+        "operatorId": ""
     }
+    res = bitvavo_request("POST", "/order", body)
 
-    with lock:
-        active_trades.append(trade)
-        executed_trades.append(trade.copy())
-        r.set("nems:active_trades", json.dumps(active_trades))
-        r.rpush("nems:executed_trades", json.dumps(trade))
+    if isinstance(res, dict) and res.get("status") == "filled":
+        fills = res.get("fills", [])
+        print("📦 BUY FILLS:", json.dumps(fills, ensure_ascii=False))
 
-    slot_idx = len(active_trades)  # بعد الإضافة
-    send_message(f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | قيمة: €{per_trade_eur:.2f} | كمية: {amount_net:.5f}")
+        tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
+        amount_net = tb
+        cost_eur   = tq_eur + fee_eur  # التكلفة الصافية €
+
+        if amount_net <= 0 or cost_eur <= 0:
+            send_message(f"❌ فشل شراء {symbol} - بيانات fills غير صالحة")
+            r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
+            return
+
+        avg_price_incl_fees = cost_eur / amount_net
+
+        trade = {
+            "symbol": market,
+            "entry": avg_price_incl_fees,
+            "amount": amount_net,
+            "cost_eur": cost_eur,
+            "buy_fee_eur": fee_eur,
+            "opened_at": time.time(),
+            "phase": "EARLY",           # خلال 15 دقيقة
+            "peak_pct": 0.0,            # أعلى ربح مُسجّل (للتريلينغ المبكر)
+            # أعلام الخروج
+            "exit_in_progress": False,
+            "last_profit": 0.0,
+            "last_exit_try": 0.0
+        }
+
+        with lock:
+            active_trades.append(trade)
+            executed_trades.append(trade.copy())
+            r.set("nems:active_trades", json.dumps(active_trades))
+            r.rpush("nems:executed_trades", json.dumps(trade))
+
+        slot_idx = len(active_trades)  # بعد الإضافة
+        send_message(f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | كمية: {amount_net:.5f}")
+    else:
+        r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
+        send_message(f"❌ فشل شراء {symbol}")
 
 # =========================
 # 👀 حلقة المراقبة (منطق الخروج الجديد)
@@ -612,8 +641,8 @@ def webhook():
         return "ok"
 
     elif "عدد الصفقات" in text or "عدل الصفقات" in text:
-        # ثابت دائمًا على 2 بناءً على طلبك
-        send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال). كل إشارة شراء = نصف المبلغ.")
+        # ثابت دائمًا على 2
+        send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال).")
         return "ok"
 
     return "ok"
