@@ -14,11 +14,23 @@ from dotenv import load_dotenv
 # =========================
 # 📌 إعدادات يدوية (ثابتة هنا)
 # =========================
-BUY_AMOUNT_EUR = 22.0            # قيمة الشراء باليورو
-MAX_TRADES = 2                   # الحد الأقصى للصفقات النشطة
-TRAIL_START = 2.0                # يبدأ التريلينغ بعد ربح %
-TRAIL_BACKSTEP = 0.5             # الرجوع المسموح قبل التريلينغ %
-STOP_LOSS = -1.8                 # ستوب لوس %
+BUY_AMOUNT_EUR = 22.0            # قيمة المبلغ الإجمالي
+MAX_TRADES = 2                   # الحد الأقصى (ثابت = صفقتان دائمًا)
+
+# نافذة الخروج المبكر (أول 15 دقيقة)
+EARLY_WINDOW_SEC = 15 * 60
+EARLY_TRAIL_ACTIVATE = 3.0       # تفعيل التريلينغ عند +3%
+EARLY_TRAIL_BACKSTEP = 1.0       # يتراجع 1% من القمة
+EARLY_STOP_LOSS = -3.0           # ستوب لوس -3%
+
+# بعد ربع ساعة: إغلاق سريع ±1%
+LATE_TP = 1.0                    # أخذ ربح +1%
+LATE_SL = -1.0                   # وقف خسارة -1%
+
+# إعادة المحاولة عند فشل البيع
+SELL_RETRY_DELAY = 5             # ثوانٍ بين المحاولات
+SELL_MAX_RETRIES = 6             # إجمالي المحاولات (≈ 30ث)
+
 BLACKLIST_EXPIRE_SECONDS = 300   # حظر مؤقت بعد فشل شراء/بيع (ثوانٍ)
 BUY_COOLDOWN_SEC = 600           # كولداون بعد الإغلاق لنفس العملة (10 د)
 
@@ -33,11 +45,9 @@ BITVAVO_API_KEY = os.getenv("BITVAVO_API_KEY")
 BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET")
 r = redis.from_url(os.getenv("REDIS_URL"))
 lock = Lock()
-swap_lock = Lock()  # قفل محلي لمنع استبدال متوازي
 enabled = True
-max_trades = MAX_TRADES
-active_trades = []     # صفقات مفتوحة
-executed_trades = []   # سجل جميع الصفقات (نسخة عند الشراء + تفاصيل الإغلاق لاحقًا)
+active_trades = []     # الصفقات المفتوحة (كل إشارة = صفقة)
+executed_trades = []   # سجل الصفقات
 
 # لحساب “منذ الانسى”
 SINCE_RESET_KEY = "nems:since_reset"
@@ -156,23 +166,9 @@ def totals_from_fills_eur(fills):
     return total_base, total_eur, fee_eur
 
 # =========================
-# 💱 البيع — صفقة-بصفقة
+# 💱 البيع — مع إعادة المحاولة والـ fills
 # =========================
-def sell_trade(trade):
-    """
-    يبيع كمية الصفقة نفسها فقط، ويحسب الربح المحقق بدقة.
-    يتعامل مع البيع الجزئي بتحديث الكمية/التكلفة المتبقية.
-    """
-    market = trade["symbol"]
-
-    # حظر بيع مؤقت؟
-    if r.exists(f"blacklist:sell:{market}"):
-        return
-
-    amt = float(trade.get("amount", 0) or 0)
-    if amt <= 0:
-        return
-
+def place_market_sell(market, amt):
     body = {
         "market": market,
         "side": "sell",
@@ -181,105 +177,128 @@ def sell_trade(trade):
         "clientOrderId": str(uuid4()),
         "operatorId": ""
     }
-    res = bitvavo_request("POST", "/order", body)
+    return bitvavo_request("POST", "/order", body)
 
-    if not isinstance(res, dict):
-        r.setex(f"blacklist:sell:{market}", BLACKLIST_EXPIRE_SECONDS, 1)
-        send_message(f"❌ فشل بيع {market}")
+def sell_trade(trade):
+    """
+    يبيع كمية الصفقة نفسها فقط، ويحسب الربح بدقة من fills.
+    يعيد المحاولة تلقائيًا عند الفشل، بدون سبام.
+    """
+    market = trade["symbol"]
+
+    if r.exists(f"blacklist:sell:{market}"):
         return
 
-    if res.get("status") == "filled":
-        fills = res.get("fills", [])
-        print("📦 SELL FILLS:", json.dumps(fills, ensure_ascii=False))
+    amt = float(trade.get("amount", 0) or 0)
+    if amt <= 0:
+        return
 
-        tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
-        proceeds_eur = tq_eur - fee_eur  # عائد صافي €
-        sold_amount  = tb
+    ok = False
+    resp = None
+    for attempt in range(1, SELL_MAX_RETRIES + 1):
+        resp = place_market_sell(market, amt)
+        if isinstance(resp, dict) and resp.get("status") == "filled":
+            ok = True
+            break
+        time.sleep(SELL_RETRY_DELAY)
 
-        orig_amt  = float(trade["amount"])
-        orig_cost = float(trade.get("cost_eur", trade["entry"] * trade["amount"]))
+    if not ok:
+        r.setex(f"blacklist:sell:{market}", BLACKLIST_EXPIRE_SECONDS, 1)
+        send_message(f"❌ فشل بيع {market} بعد محاولات متعددة.")
+        return
 
-        # مصالحة إن حصل بيع جزئي أو اختلاف بسيط
-        if sold_amount < orig_amt - 1e-10:
-            # بيع جزئي: نسب الكلفة على الجزء المباع
-            ratio = sold_amount / orig_amt if orig_amt > 0 else 1.0
-            attributed_cost = orig_cost * ratio
-            pnl_eur = proceeds_eur - attributed_cost
-            pnl_pct = (proceeds_eur / attributed_cost - 1.0) * 100.0
+    fills = resp.get("fills", [])
+    print("📦 SELL FILLS:", json.dumps(fills, ensure_ascii=False))
 
-            # حدّث المتبقي
-            remaining_amt  = orig_amt - sold_amount
-            remaining_cost = orig_cost - attributed_cost
-            with lock:
-                trade["amount"]   = remaining_amt
-                trade["cost_eur"] = remaining_cost
+    tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
+    proceeds_eur = tq_eur - fee_eur  # عائد صافي €
+    sold_amount  = tb
 
-            send_message(f"💰 بيع جزئي {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
+    orig_amt  = float(trade["amount"])
+    orig_cost = float(trade.get("cost_eur", trade["entry"] * trade["amount"]))
 
-            # أضف صفقة منتهية جزئيًا إلى السجل
-            closed = trade.copy()
-            closed.update({
-                "exit_eur": proceeds_eur,
-                "sell_fee_eur": fee_eur,
-                "pnl_eur": pnl_eur,
-                "pnl_pct": pnl_pct,
-                "exit_time": time.time(),
-                "amount": sold_amount,
-                "cost_eur": attributed_cost
-            })
-            with lock:
-                executed_trades.append(closed)
-                r.delete("nems:executed_trades")
-                for t in executed_trades:
-                    r.rpush("nems:executed_trades", json.dumps(t))
-                r.set("nems:active_trades", json.dumps(active_trades))
-            return
+    # بيع جزئي؟
+    if sold_amount < orig_amt - 1e-10:
+        ratio = sold_amount / orig_amt if orig_amt > 0 else 1.0
+        attributed_cost = orig_cost * ratio
+        pnl_eur = proceeds_eur - attributed_cost
+        pnl_pct = (proceeds_eur / attributed_cost - 1.0) * 100.0
 
-        # بيع كامل
-        pnl_eur = proceeds_eur - orig_cost
-        pnl_pct = (proceeds_eur / orig_cost - 1.0) * 100.0
-        send_message(f"💰 بيع {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
-
+        remaining_amt  = orig_amt - sold_amount
+        remaining_cost = orig_cost - attributed_cost
         with lock:
-            # أزل من النشطة
-            try:
-                active_trades.remove(trade)
-            except ValueError:
-                pass
-            r.set("nems:active_trades", json.dumps(active_trades))
+            trade["amount"]   = remaining_amt
+            trade["cost_eur"] = remaining_cost
 
-            # حدّث نسخة السجل المطابقة (آخر واحدة بدون exit)
-            for i in range(len(executed_trades)-1, -1, -1):
-                if executed_trades[i]["symbol"] == market and "exit_eur" not in executed_trades[i]:
-                    executed_trades[i].update({
-                        "exit_eur": proceeds_eur,
-                        "sell_fee_eur": fee_eur,
-                        "pnl_eur": pnl_eur,
-                        "pnl_pct": pnl_pct,
-                        "exit_time": time.time()
-                    })
-                    break
+        send_message(f"💰 بيع جزئي {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
+
+        closed = trade.copy()
+        closed.update({
+            "exit_eur": proceeds_eur,
+            "sell_fee_eur": fee_eur,
+            "pnl_eur": pnl_eur,
+            "pnl_pct": pnl_pct,
+            "exit_time": time.time(),
+            "amount": sold_amount,
+            "cost_eur": attributed_cost
+        })
+        with lock:
+            executed_trades.append(closed)
             r.delete("nems:executed_trades")
             for t in executed_trades:
                 r.rpush("nems:executed_trades", json.dumps(t))
+            r.set("nems:active_trades", json.dumps(active_trades))
+        return
 
-        # كولداون على الشراء لنفس الرمز
-        base = market.replace("-EUR", "")
-        r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
+    # بيع كامل
+    pnl_eur = proceeds_eur - orig_cost
+    pnl_pct = (proceeds_eur / orig_cost - 1.0) * 100.0
+    send_message(f"💰 بيع {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
-    else:
-        r.setex(f"blacklist:sell:{market}", BLACKLIST_EXPIRE_SECONDS, 1)
-        send_message(f"❌ فشل بيع {market}")
+    with lock:
+        try:
+            active_trades.remove(trade)
+        except ValueError:
+            pass
+        r.set("nems:active_trades", json.dumps(active_trades))
+
+        # حدّث نسخة السجل المطابقة (آخر واحدة بدون exit)
+        for i in range(len(executed_trades)-1, -1, -1):
+            if executed_trades[i]["symbol"] == market and "exit_eur" not in executed_trades[i]:
+                executed_trades[i].update({
+                    "exit_eur": proceeds_eur,
+                    "sell_fee_eur": fee_eur,
+                    "pnl_eur": pnl_eur,
+                    "pnl_pct": pnl_pct,
+                    "exit_time": time.time()
+                })
+                break
+        r.delete("nems:executed_trades")
+        for t in executed_trades:
+            r.rpush("nems:executed_trades", json.dumps(t))
+
+    base = market.replace("-EUR", "")
+    r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
 
 # =========================
-# 🛒 الشراء (لا تكرار لنفس الرمز)
+# 🛒 الشراء (بدون استبدال — كل إشارة = نصف المبلغ)
 # =========================
+def place_market_buy(market, amount_quote_eur):
+    body = {
+        "market": market,
+        "side": "buy",
+        "orderType": "market",
+        "amountQuote": f"{amount_quote_eur:.2f}",
+        "clientOrderId": str(uuid4()),
+        "operatorId": ""
+    }
+    return bitvavo_request("POST", "/order", body)
+
 def buy(symbol):
     """
-    - يتحقق من الدعم على Bitvavo.
-    - يمنع شراء نفس الرمز إذا عندك صفقة مفتوحة أو في كولداون.
-    - إذا امتلأت الصفقات: استبدال الأضعف (اختياري).
-    - شراء ماركت بمبلغ EUR ثابت (amountQuote) وتسجيل fills بدقة.
+    - يمنع الاستبدال: إن امتلأت الصفقات (2) يرفض الشراء.
+    - كل إشارة شراء = صفقة مستقلة بنصف المبلغ (BUY_AMOUNT_EUR/2).
+    - يمنع تكرار نفس الرمز إذا عندك صفقة مفتوحة عليه أو في كولداون.
     """
     ensure_symbols_fresh()
     symbol = symbol.upper().strip()
@@ -291,122 +310,68 @@ def buy(symbol):
         send_message(f"⏳ {symbol} تحت فترة تهدئة مؤقتة.")
         return
 
-    # ممنوع شراء نفس العملة مرتين
+    market = f"{symbol}-EUR"
+
     with lock:
-        if any(t["symbol"] == f"{symbol}-EUR" for t in active_trades):
+        if any(t["symbol"] == market for t in active_trades):
             send_message(f"⛔ عندك صفقة مفتوحة على {symbol}.")
+            return
+        free_slots = MAX_TRADES - len(active_trades)
+        if free_slots <= 0:
+            send_message("🚫 وصلنا الحد الأقصى (صفقتان). لا يوجد استبدال بعد الآن.")
             return
 
     if r.exists(f"blacklist:buy:{symbol}"):
         return
 
-    market = f"{symbol}-EUR"
+    per_trade_eur = round(BUY_AMOUNT_EUR / MAX_TRADES, 2)  # نصف المبلغ
 
-    # استبدال الأضعف إذا امتلأت
-    with lock:
-        needs_swap = len(active_trades) >= max_trades
-
-    if needs_swap:
-        # امنع استبدالين مع بعض
-        if not swap_lock.acquire(blocking=False):
-            send_message("⏳ يوجد استبدال قيد التنفيذ، تجاهلت الطلب الحالي.")
-            return
-
-        try:
-            # اختر الأضعف خارج الـlock الثقيل
-            with lock:
-                weakest = None
-                lowest_pnl = float('inf')
-                for t in active_trades:
-                    current = fetch_price(t["symbol"]) or t["entry"]
-                    pnl = ((current - t["entry"]) / t["entry"]) * 100
-                    if pnl < lowest_pnl:
-                        lowest_pnl = pnl
-                        weakest = t
-
-                if not weakest:
-                    send_message("❌ لا يمكن تنفيذ الاستبدال.")
-                    return
-
-                # لا تستبدل صفقة جديدة جداً
-                if time.time() - weakest.get("timestamp", time.time()) < 60:
-                    send_message("⏳ تجاهل الاستبدال: الصفقة الأضعف حديثة جدًا.")
-                    return
-
-                send_message(f"♻️ استبدال أضعف صفقة: {weakest['symbol']} (ربح {lowest_pnl:.2f}%)")
-
-            # نفّذ البيع
-            sell_trade(weakest)
-
-            # انتظر حتى يُحذف من active_trades (نجاح البيع) أو ينتهي المهلة
-            deadline = time.time() + 12  # 12 ثانية مهلة
-            while time.time() < deadline:
-                with lock:
-                    still_there = any(id(t) == id(weakest) for t in active_trades)
-                if not still_there:
-                    break
-                time.sleep(0.25)
-            else:
-                send_message("⏳ إلغاء الاستبدال: البيع لم يكتمل خلال المهلة.")
-                return
-        finally:
-            swap_lock.release()
-
-    body = {
-        "market": market,
-        "side": "buy",
-        "orderType": "market",
-        "amountQuote": f"{BUY_AMOUNT_EUR:.2f}",
-        "clientOrderId": str(uuid4()),
-        "operatorId": ""
-    }
-    res = bitvavo_request("POST", "/order", body)
-
-    if isinstance(res, dict) and res.get("status") == "filled":
-        fills = res.get("fills", [])
-        print("📦 BUY FILLS:", json.dumps(fills, ensure_ascii=False))
-
-        tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
-        amount_net = tb
-        cost_eur   = tq_eur + fee_eur  # التكلفة الصافية €
-
-        if amount_net <= 0 or cost_eur <= 0:
-            send_message(f"❌ فشل شراء {symbol} - بيانات fills غير صالحة")
-            r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
-            return
-
-        avg_price_incl_fees = cost_eur / amount_net
-
-        trade = {
-            "symbol": market,
-            "entry": avg_price_incl_fees,
-            "amount": amount_net,
-            "cost_eur": cost_eur,
-            "buy_fee_eur": fee_eur,
-            "trail": avg_price_incl_fees,
-            "max_profit": 0.0,
-            "milestone_sent": False,   # إشعار +TRAIL_START%
-            "timestamp": time.time(),
-            # أعلام الخروج (لمنع السبام والعبور)
-            "exit_in_progress": False,
-            "last_profit": 0.0,
-            "exit_armed": False,
-            "last_exit_try": 0.0
-        }
-
-        with lock:
-            active_trades.append(trade)
-            executed_trades.append(trade.copy())
-            r.set("nems:active_trades", json.dumps(active_trades))
-            r.rpush("nems:executed_trades", json.dumps(trade))
-
-        send_message(f"✅ شراء {symbol} | كمية: {amount_net:.5f} | تكلفة: €{cost_eur:.2f}")
-    else:
+    res = place_market_buy(market, per_trade_eur)
+    if not (isinstance(res, dict) and res.get("status") == "filled"):
         r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
-        send_message(f"❌ فشل شراء {symbol}")
+        send_message(f"❌ فشل شراء {symbol} بقيمة €{per_trade_eur:.2f}")
+        return
+
+    fills = res.get("fills", [])
+    print("📦 BUY FILLS:", json.dumps(fills, ensure_ascii=False))
+
+    tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
+    amount_net = tb
+    cost_eur   = tq_eur + fee_eur  # التكلفة الصافية €
+
+    if amount_net <= 0 or cost_eur <= 0:
+        send_message(f"❌ فشل شراء {symbol} - بيانات fills غير صالحة")
+        r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
+        return
+
+    avg_price_incl_fees = cost_eur / amount_net
+
+    trade = {
+        "symbol": market,
+        "entry": avg_price_incl_fees,
+        "amount": amount_net,
+        "cost_eur": cost_eur,
+        "buy_fee_eur": fee_eur,
+        "opened_at": time.time(),
+        "phase": "EARLY",           # خلال 15 دقيقة
+        "peak_pct": 0.0,            # أعلى ربح مُسجّل (للتريلينغ المبكر)
+        # أعلام الخروج
+        "exit_in_progress": False,
+        "last_profit": 0.0,
+        "last_exit_try": 0.0
+    }
+
+    with lock:
+        active_trades.append(trade)
+        executed_trades.append(trade.copy())
+        r.set("nems:active_trades", json.dumps(active_trades))
+        r.rpush("nems:executed_trades", json.dumps(trade))
+
+    slot_idx = len(active_trades)  # بعد الإضافة
+    send_message(f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | قيمة: €{per_trade_eur:.2f} | كمية: {amount_net:.5f}")
 
 # =========================
-# 👀 حلقة المراقبة (edge + cooldown)
+# 👀 حلقة المراقبة (منطق الخروج الجديد)
 # =========================
 def monitor_loop():
     while True:
@@ -414,6 +379,7 @@ def monitor_loop():
             with lock:
                 snapshot = list(active_trades)
 
+            now = time.time()
             for trade in snapshot:
                 symbol = trade["symbol"]             # e.g. 'ADA-EUR'
                 entry = trade["entry"]
@@ -421,46 +387,56 @@ def monitor_loop():
                 if not current:
                     continue
 
-                profit = ((current - entry) / entry) * 100
-                mp = trade["max_profit"]
+                pnl_pct = ((current - entry) / entry) * 100.0
+                trade["peak_pct"] = max(trade.get("peak_pct", 0.0), pnl_pct)
 
-                # تحديث أعلى ربح + تسليح التريل
-                with lock:
-                    if profit > mp:
-                        trade["max_profit"] = profit
-                        trade["trail"] = current
-                        mp = profit
-                    if mp >= TRAIL_START:
-                        trade["exit_armed"] = True
-
-                    # خزّن آخر ربح لمقارنة العبور
-                    prev_profit = trade.get("last_profit", profit)
-                    trade["last_profit"] = profit
-
-                # تهدئة لو بيع قيد التنفيذ
-                if trade.get("exit_in_progress") and (time.time() - trade.get("last_exit_try", 0)) < 15:
+                in_progress = trade.get("exit_in_progress") and (now - trade.get("last_exit_try", 0)) < 15
+                if in_progress:
                     continue
 
-                # تحقّق عبور الشروط (edge crossing)
-                crossed_trail = trade.get("exit_armed") and (profit <= mp - TRAIL_BACKSTEP) and (prev_profit > mp - TRAIL_BACKSTEP)
-                crossed_sl    = (profit <= STOP_LOSS) and (prev_profit > STOP_LOSS)
+                age = now - trade.get("opened_at", now)
 
-                if crossed_trail or crossed_sl:
-                    reason = f"trailing {mp:.2f}%→{profit:.2f}%" if crossed_trail else f"stoploss {profit:.2f}% <= {STOP_LOSS:.2f}%"
-                    with lock:
+                # المرحلة المبكرة: أول 15 دقيقة
+                if age <= EARLY_WINDOW_SEC:
+                    # تريلينغ: مفعل عند بلوغ +3%، يغلق إذا تراجع 1% من القمة
+                    if trade["peak_pct"] >= EARLY_TRAIL_ACTIVATE:
+                        if (trade["peak_pct"] - pnl_pct) >= EARLY_TRAIL_BACKSTEP:
+                            trade["exit_in_progress"] = True
+                            trade["last_exit_try"] = now
+                            send_message(f"🔔 خروج {symbol} (Early trailing {trade['peak_pct']:.2f}%→{pnl_pct:.2f}%)")
+                            sell_trade(trade)
+                            trade["exit_in_progress"] = False
+                            continue
+                    # ستوب لوس مبكر -3%
+                    if pnl_pct <= EARLY_STOP_LOSS:
                         trade["exit_in_progress"] = True
-                        trade["last_exit_try"] = time.time()
-                    send_message(f"🔔 خروج {symbol} بسبب {reason} (جارِ التنفيذ)")
-
-                    # احترم blacklist البيع
-                    if r.exists(f"blacklist:sell:{symbol}"):
+                        trade["last_exit_try"] = now
+                        send_message(f"🔔 خروج {symbol} (Early SL {pnl_pct:.2f}% ≤ {EARLY_STOP_LOSS:.2f}%)")
+                        sell_trade(trade)
+                        trade["exit_in_progress"] = False
                         continue
 
-                    sell_trade(trade)
+                else:
+                    # المرحلة المتأخرة: ±1%
+                    if trade.get("phase") != "LATE":
+                        trade["phase"] = "LATE"
+                        send_message(f"⏱️ {symbol.replace('-EUR','')} دخل مرحلة ما بعد 15 دقيقة: قواعد ±1%")
 
-                    # بعد محاولة البيع (ناجحة/فاشلة) حرّر العلم للسماح بمحاولة لاحقة
-                    with lock:
+                    if pnl_pct >= LATE_TP:
+                        trade["exit_in_progress"] = True
+                        trade["last_exit_try"] = now
+                        send_message(f"🔔 خروج {symbol} (Late TP +{LATE_TP:.2f}% الآن {pnl_pct:.2f}%)")
+                        sell_trade(trade)
                         trade["exit_in_progress"] = False
+                        continue
+
+                    if pnl_pct <= LATE_SL:
+                        trade["exit_in_progress"] = True
+                        trade["last_exit_try"] = now
+                        send_message(f"🔔 خروج {symbol} (Late SL {pnl_pct:.2f}% ≤ {LATE_SL:.2f}%)")
+                        sell_trade(trade)
+                        trade["exit_in_progress"] = False
+                        continue
 
             time.sleep(1)
         except Exception as e:
@@ -498,10 +474,10 @@ def build_summary():
             value   = amount * current
             total_value += value
             total_cost  += t.get("cost_eur", entry * amount)
-            duration_min = int((now - t.get("timestamp", now)) / 60)
+            duration_min = int((now - t.get("opened_at", now)) / 60)
             emoji = "✅" if pnl_pct >= 0 else "❌"
-            lines.append(f"{i}. {symbol}: €{entry:.4f} → €{current:.4f} {emoji} {pnl_pct:+.2f}%")
-            lines.append(f"   • كمية: {amount:.5f} | منذ: {duration_min} د | أعلى: {t.get('max_profit',0):.2f}%")
+            lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}%")
+            lines.append(f"   • كمية: {amount:.5f} | منذ: {duration_min} د | أعلى: {t.get('peak_pct',0):.2f}% | مرحلة: {t.get('phase','EARLY')}")
 
         floating_pnl_eur = total_value - total_cost
         floating_pnl_pct = ((total_value / total_cost) - 1.0) * 100 if total_cost > 0 else 0.0
@@ -547,7 +523,7 @@ def build_summary():
 # =========================
 @app.route("/", methods=["POST"])
 def webhook():
-    global enabled, max_trades
+    global enabled
     data = request.json
     if not data or "message" not in data:
         return "ok"
@@ -636,15 +612,8 @@ def webhook():
         return "ok"
 
     elif "عدد الصفقات" in text or "عدل الصفقات" in text:
-        try:
-            num = int(text.split()[-1])
-            if 1 <= num <= 4:
-                max_trades = num
-                send_message(f"⚙️ تم تعديل عدد الصفقات إلى: {num}")
-            else:
-                send_message("❌ فقط بين 1 و 4.")
-        except Exception:
-            send_message("❌ الصيغة: عدل الصفقات 2")
+        # ثابت دائمًا على 2 بناءً على طلبك
+        send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال). كل إشارة شراء = نصف المبلغ.")
         return "ok"
 
     return "ok"
