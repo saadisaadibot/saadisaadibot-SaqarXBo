@@ -553,13 +553,21 @@ def build_summary():
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled
-    data = request.json
-    if not data or "message" not in data:
+
+    data = request.get_json(silent=True) or {}
+
+    # استخراج النص من تيليغرام أو من بوت B
+    if "message" in data and isinstance(data["message"], dict):
+        text = (data["message"].get("text") or "").strip()
+    else:
+        text = (data.get("text") or "").strip()
+
+    if not text:
         return "ok"
 
-    text = (data["message"].get("text") or "").strip().lower()
+    t_lower = text.lower()
 
-    if "اشتري" in text:
+    if "اشتري" in t_lower:
         if not enabled:
             send_message("🚫 البوت متوقف عن الشراء.")
             return "ok"
@@ -572,13 +580,14 @@ def webhook():
             send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
         return "ok"
 
-    elif "الملخص" in text:
+    elif "الملخص" in t_lower:
         send_message(build_summary())
         return "ok"
 
-    elif "الرصيد" in text:
+    elif "الرصيد" in t_lower:
         balances = bitvavo_request("GET", "/balance")
-        eur = sum(float(b.get("available", 0)) + float(b.get("inOrder", 0)) for b in balances if b.get("symbol") == "EUR")
+        eur = sum(float(b.get("available", 0)) + float(b.get("inOrder", 0)) 
+                  for b in balances if b.get("symbol") == "EUR")
         total = eur
         winners, losers = [], []
 
@@ -620,17 +629,17 @@ def webhook():
         send_message("\n".join(lines))
         return "ok"
 
-    elif "قف" in text:
+    elif "قف" in t_lower:
         enabled = False
         send_message("🛑 تم إيقاف الشراء.")
         return "ok"
 
-    elif "ابدأ" in text:
+    elif "ابدأ" in t_lower:
         enabled = True
         send_message("✅ تم تفعيل الشراء.")
         return "ok"
 
-    elif "انسى" in text:
+    elif "انسى" in t_lower:
         with lock:
             active_trades.clear()
             executed_trades.clear()
@@ -640,8 +649,7 @@ def webhook():
         send_message("🧠 تم نسيان كل شيء! بدأنا عد جديد للإحصائيات 🤖")
         return "ok"
 
-    elif "عدد الصفقات" in text or "عدل الصفقات" in text:
-        # ثابت دائمًا على 2
+    elif "عدد الصفقات" in t_lower or "عدل الصفقات" in t_lower:
         send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال).")
         return "ok"
 
