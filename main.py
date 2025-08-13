@@ -18,7 +18,7 @@ BUY_AMOUNT_EUR = 22.0            # لم نعد نستخدمه للشراء (أب
 MAX_TRADES = 2                   # الحد الأقصى للصفقات النشطة = 2 دائمًا
 
 # نافذة الخروج المبكر (أول 15 دقيقة)
-EARLY_WINDOW_SEC = 15 * 60
+EARLY_WINDOW_SEC = 25 * 60
 EARLY_TRAIL_ACTIVATE = 3.0       # تفعيل التريلينغ عند +3%
 EARLY_TRAIL_BACKSTEP = 1.0       # يغلق إذا تراجع 1% من القمة
 EARLY_STOP_LOSS = -3.0           # ستوب لوس -3%
