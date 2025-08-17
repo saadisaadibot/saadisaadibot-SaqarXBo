@@ -28,7 +28,7 @@ DYN_SL_START         = -2.0   # الستوب الابتدائي كنسبة % م�
 DYN_SL_STEP          = 1.0    # يرتفع 1% لكل 1% ربح إضافي
 
 MOM_LOOKBACK_SEC     = 120    # تاريخ لحظي للزخم (ثواني)
-STALL_SEC            = 45     # يعتبر "توقّف" إذا ما انعملت قمة جديدة خلال هالفترة
+STALL_SEC            = 90     # يعتبر "توقّف" إذا ما انعملت قمة جديدة خلال هالفترة
 DROP_FROM_PEAK_EXIT  = 0.8    # خروج لو هبط 0.8% عن القمة وكان الزخم سلبي
 
 # عتبات الزخم (بالمئة %)
@@ -509,19 +509,18 @@ def monitor_loop():
                 # ===== قفل ربح ذكي بعد 15 دقيقة =====
                 if age >= LATE_FALLBACK_SEC:
                     peak = trade.get("peak_pct", 0.0)
-                    # قفل الربح بناءً على القمة
                     lock_from_peak = peak - LATE_LOCK_BACKSTEP
                     desired_lock = max(lock_from_peak, LATE_MIN_LOCK)
 
-                    # شدّ الستوب السلّمي ليصبح على الأقل desired_lock
+                    # شدّ الستوب ليصبح >= desired_lock
                     if desired_lock > trade.get("sl_dyn", DYN_SL_START):
                         prev_lock = trade["sl_dyn"]
                         trade["sl_dyn"] = desired_lock
-                        # إشعار مرّة واحدة إذا كان التشديد كبير
                         if (desired_lock - prev_lock) >= 0.4 and not trade.get("late_lock_notified"):
                             send_message(f"🔒 تفعيل قفل ربح {market}: SL ⇧ إلى {desired_lock:.2f}% (قمة {peak:.2f}%)")
                             trade["late_lock_notified"] = True
-                    # لو الزخم ضعيف وكسر القفل بهامش بسيط → خروج
+
+                    # زخم ضعيف وكسر القفل بهامش بسيط → خروج
                     if r30 <= LATE_WEAK_R and r90 <= LATE_WEAK_R and pnl_pct <= trade["sl_dyn"] + 0.10:
                         trade["exit_in_progress"] = True; trade["last_exit_try"] = now
                         send_message(f"🔔 خروج {market} (زخم ضعيف بعد 15د | r30 {r30:.2f}% r90 {r90:.2f}% | قفل {trade['sl_dyn']:.2f}%)")
@@ -548,16 +547,17 @@ def monitor_loop():
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # 3) توقّف تقدّم (STALL): ما عمل قمة جديدة فترة طويلة والزخم خفيف/سلبي
+                # 3) توقّف تقدّم (STALL) — أهدأ: 90ث وزخم سلبي فعلي
                 last_hi = trade.get("last_new_high", trade.get("opened_at", now))
-                stalled = (now - last_hi) >= STALL_SEC
-                if stalled and r30 <= 0.10 and r90 <= 0.10 and pnl_pct > trade["sl_dyn"] + 0.3:
+                required_stall_sec = 90 if STALL_SEC < 90 else STALL_SEC  # ضمان 90ث حتى لو الإعداد أقدم
+                stalled = (now - last_hi) >= required_stall_sec
+                if stalled and r30 <= -0.10 and r90 <= -0.10 and pnl_pct > trade["sl_dyn"] + 0.3:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (توقّف تقدّم {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
+                    send_message(f"🔔 خروج {market} (توقّف {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # 4) الزخم قوي جدًا؟ أعطه مجال يتنفّس (لا نبيع)
+                # 4) الزخم قوي جدًا؟ أعطه مجال يتنفّس
                 if r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
                     pass  # السماح بالتنفس
 
@@ -590,33 +590,44 @@ def build_summary():
         lines.append(f"📌 الصفقات النشطة ({len(sorted_trades)}):")
         for i, t in enumerate(sorted_trades, 1):
             symbol = t['symbol'].replace("-EUR", "")
-            entry  = t['entry']
-            amount = t['amount']
+            entry  = float(t['entry'])
+            amount = float(t['amount'])
             current = fetch_price(t['symbol']) or entry
-            pnl_pct = ((current - entry) / entry) * 100
+            pnl_pct = ((current - entry) / entry) * 100.0
             value   = amount * current
             total_value += value
-            total_cost  += t.get("cost_eur", entry * amount)
+            total_cost  += float(t.get("cost_eur", entry * amount))
             duration_min = int((now - t.get("opened_at", now)) / 60)
             emoji = "✅" if pnl_pct >= 0 else "❌"
 
             # قيم ذكية
-            peak_pct   = t.get("peak_pct", 0.0)
-            dyn_sl     = t.get("sl_dyn", DYN_SL_START)   # ستوب سلّمي ديناميكي
-            last_hi_ts = t.get("last_new_high", t.get("opened_at", now))
+            peak_pct   = float(t.get("peak_pct", 0.0))
+            dyn_sl     = float(t.get("sl_dyn", DYN_SL_START))   # SL ديناميكي
+            last_hi_ts = float(t.get("last_new_high", t.get("opened_at", now)))
             stall_age  = int(now - last_hi_ts)
 
+            # r30/r90 لحظيًا (مع أمان)
             try:
                 r30, r90, _ = _mom_metrics(t, current)
             except Exception:
                 r30 = r90 = 0.0
+
+            # حالة قرار بسيطة مفهومة
+            if r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
+                state = "🚀 زخم قوي — استمرار"
+            elif pnl_pct <= dyn_sl:
+                state = "🛑 ضرب SL"
+            elif stall_age >= max(90, STALL_SEC) and r30 <= -0.10 and r90 <= -0.10:
+                state = "⚠️ توقّف وضعف زخم"
+            else:
+                state = "⏳ مراقبة"
 
             lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}%")
             lines.append(
                 f"   • كمية: {amount:.5f} | منذ: {duration_min}د | أعلى: {peak_pct:.2f}% | SL ديناميكي: {dyn_sl:.2f}%"
             )
             lines.append(
-                f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | آخر قمة: {stall_age}s"
+                f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | آخر قمة: {stall_age}s | حالة: {state}"
             )
 
         floating_pnl_eur = total_value - total_cost
@@ -631,17 +642,18 @@ def build_summary():
     shown = 0
 
     if exec_copy:
-        since_ts = float(r.get(SINCE_RESET_KEY) or 0)
+        raw = r.get(SINCE_RESET_KEY)
+        since_ts = float(raw.decode() if isinstance(raw, (bytes, bytearray)) else (raw or 0))
         lines.append("\n📊 آخر صفقات منفذة:")
         for t in reversed(exec_copy):
             if "pnl_eur" in t and "exit_time" in t:
-                if t["exit_time"] >= since_ts:
+                if float(t["exit_time"]) >= since_ts:
                     realized_pnl += float(t["pnl_eur"])
                     buy_fees  += float(t.get("buy_fee_eur", 0))
                     sell_fees += float(t.get("sell_fee_eur", 0))
-                sign = "✅" if t["pnl_eur"] >= 0 else "❌"
+                sign = "✅" if float(t["pnl_eur"]) >= 0 else "❌"
                 sym = t["symbol"].replace("-EUR","")
-                lines.append(f"- {sym}: {sign} {t['pnl_eur']:+.2f}€ ({t['pnl_pct']:+.2f}%)")
+                lines.append(f"- {sym}: {sign} {float(t['pnl_eur']):+ .2f}€ ({float(t['pnl_pct']):+ .2f}%)")
                 shown += 1
                 if shown >= 5:
                     break
