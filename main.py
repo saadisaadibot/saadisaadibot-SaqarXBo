@@ -10,12 +10,26 @@ from flask import Flask, request
 from threading import Thread, Lock
 from uuid import uuid4
 from dotenv import load_dotenv
+from collections import deque
 
 # =========================
 # 📌 إعدادات يدوية (ثابتة هنا)
 # =========================
 BUY_AMOUNT_EUR = 22.0            # لم نعد نستخدمه للشراء (أبقيناه فقط للانسجام)
 MAX_TRADES = 2                   # الحد الأقصى للصفقات النشطة = 2 دائمًا
+
+# —— ستوب سلّمي + خروج ذكي بدون وقت ——
+DYN_SL_START         = -2.0   # الستوب الابتدائي كنسبة % من سعر الدخول
+DYN_SL_STEP          = 1.0    # يرتفع 1% لكل 1% ربح إضافي
+
+MOM_LOOKBACK_SEC     = 120    # تاريخ لحظي للزخم (ثواني)
+STALL_SEC            = 45     # يعتبر "توقّف" إذا ما انعملت قمة جديدة خلال هالفترة
+DROP_FROM_PEAK_EXIT  = 0.8    # خروج لو هبط 0.8% عن القمة وكان الزخم سلبي
+
+# عتبات الزخم (بالمئة %)
+MOM_R30_STRONG       = 0.50   # r30 قوي
+MOM_R90_STRONG       = 0.80   # r90 قوي
+
 
 # نافذة الخروج المبكر (أول 15 دقيقة)
 EARLY_WINDOW_SEC = 15 * 60
@@ -413,6 +427,49 @@ def buy(symbol):
         r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
         send_message(f"❌ فشل شراء {symbol}")
 
+def _init_hist(trade):
+    if "hist" not in trade:
+        trade["hist"] = deque(maxlen=600)  # ~ دقيقتين
+    if "last_new_high" not in trade:
+        trade["last_new_high"] = trade.get("opened_at", time.time())
+
+def _update_hist(trade, now_ts, price):
+    _init_hist(trade)
+    trade["hist"].append((now_ts, price))
+    cutoff = now_ts - MOM_LOOKBACK_SEC
+    while trade["hist"] and trade["hist"][0][0] < cutoff:
+        trade["hist"].popleft()
+
+def _mom_metrics(trade, price_now):
+    """
+    r30, r90 نسبة التغير % خلال 30/90 ثانية، و new_high=هل السعر قريب جدًا من قمة النافذة.
+    """
+    _init_hist(trade)
+    if not trade["hist"]:
+        return 0.0, 0.0, False
+
+    now_ts = trade["hist"][-1][0]
+    p30 = p90 = None
+    hi = lo = price_now
+    for ts, p in trade["hist"]:
+        hi = max(hi, p); lo = min(lo, p)
+        age = now_ts - ts
+        if p30 is None and age >= 30:
+            p30 = p
+        if p90 is None and age >= 90:
+            p90 = p
+    if p30 is None: p30 = trade["hist"][0][1]
+    if p90 is None: p90 = trade["hist"][0][1]
+
+    r30 = (price_now / p30 - 1.0) * 100.0 if p30 > 0 else 0.0
+    r90 = (price_now / p90 - 1.0) * 100.0 if p90 > 0 else 0.0
+    new_high = price_now >= hi * 0.999  # قريب جدًا من القمة
+
+    if new_high:
+        trade["last_new_high"] = now_ts
+
+    return r30, r90, new_high
+
 # =========================
 # 👀 حلقة المراقبة (منطق الخروج الجديد)
 # =========================
@@ -424,62 +481,56 @@ def monitor_loop():
 
             now = time.time()
             for trade in snapshot:
-                symbol = trade["symbol"]             # e.g. 'ADA-EUR'
-                entry = trade["entry"]
-                current = fetch_price(symbol)
+                market = trade["symbol"]
+                entry  = float(trade["entry"])
+                current = fetch_price(market)
                 if not current:
                     continue
+
+                # تحديث التاريخ اللحظي وحساب الزخم
+                _update_hist(trade, now, current)
+                r30, r90, _ = _mom_metrics(trade, current)
 
                 pnl_pct = ((current - entry) / entry) * 100.0
                 trade["peak_pct"] = max(trade.get("peak_pct", 0.0), pnl_pct)
 
+                # ستوب لوس سلّمي: -2% + (1% لكل 1% ربح)
+                inc = int(max(0.0, pnl_pct) // 1)  # درجات صحيحة
+                dyn_sl = DYN_SL_START + inc * DYN_SL_STEP
+                trade["sl_dyn"] = dyn_sl  # للعرض في الملخص
+
+                # منع تكرار محاولات الخروج
                 in_progress = trade.get("exit_in_progress") and (now - trade.get("last_exit_try", 0)) < 15
                 if in_progress:
                     continue
 
-                age = now - trade.get("opened_at", now)
+                # 1) SL سلّمي — حماية أساسية
+                if pnl_pct <= dyn_sl:
+                    trade["exit_in_progress"] = True; trade["last_exit_try"] = now
+                    send_message(f"🔔 خروج {market} (SL سلّمي {dyn_sl:.2f}% | الآن {pnl_pct:.2f}%)")
+                    sell_trade(trade); trade["exit_in_progress"] = False
+                    continue
 
-                # المرحلة المبكرة: أول 15 دقيقة
-                if age <= EARLY_WINDOW_SEC:
-                    # تريلينغ: مفعل عند بلوغ +3%، يغلق إذا تراجع 1% من القمة
-                    if trade["peak_pct"] >= EARLY_TRAIL_ACTIVATE:
-                        if (trade["peak_pct"] - pnl_pct) >= EARLY_TRAIL_BACKSTEP:
-                            trade["exit_in_progress"] = True
-                            trade["last_exit_try"] = now
-                            send_message(f"🔔 خروج {symbol} (Early trailing {trade['peak_pct']:.2f}%→{pnl_pct:.2f}%)")
-                            sell_trade(trade)
-                            trade["exit_in_progress"] = False
-                            continue
-                    # ستوب لوس مبكر -3%
-                    if pnl_pct <= EARLY_STOP_LOSS:
-                        trade["exit_in_progress"] = True
-                        trade["last_exit_try"] = now
-                        send_message(f"🔔 خروج {symbol} (Early SL {pnl_pct:.2f}% ≤ {EARLY_STOP_LOSS:.2f}%)")
-                        sell_trade(trade)
-                        trade["exit_in_progress"] = False
-                        continue
+                # 2) انعكاس زخم بعد قمة: هبوط واضح من القمة + r30 & r90 سلبيين
+                drop_from_peak = trade["peak_pct"] - pnl_pct
+                if trade["peak_pct"] >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 < 0 and r90 < 0:
+                    trade["exit_in_progress"] = True; trade["last_exit_try"] = now
+                    send_message(f"🔔 خروج {market} (انعكاس زخم: من قمة {trade['peak_pct']:.2f}% هبوط {drop_from_peak:.2f}%)")
+                    sell_trade(trade); trade["exit_in_progress"] = False
+                    continue
 
-                else:
-                    # المرحلة المتأخرة: ±1%
-                    if trade.get("phase") != "LATE":
-                        trade["phase"] = "LATE"
-                        send_message(f"⏱️ {symbol.replace('-EUR','')} دخل مرحلة ما بعد 15 دقيقة: قواعد ±1%")
+                # 3) توقّف تقدّم (STALL): ما عمل قمة جديدة فترة طويلة والزخم خفيف/سلبي
+                last_hi = trade.get("last_new_high", trade.get("opened_at", now))
+                stalled = (now - last_hi) >= STALL_SEC
+                if stalled and r30 <= 0.10 and r90 <= 0.10 and pnl_pct > dyn_sl + 0.3:
+                    trade["exit_in_progress"] = True; trade["last_exit_try"] = now
+                    send_message(f"🔔 خروج {market} (توقّف تقدّم {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
+                    sell_trade(trade); trade["exit_in_progress"] = False
+                    continue
 
-                    if pnl_pct >= LATE_TP:
-                        trade["exit_in_progress"] = True
-                        trade["last_exit_try"] = now
-                        send_message(f"🔔 خروج {symbol} (Late TP +{LATE_TP:.2f}% الآن {pnl_pct:.2f}%)")
-                        sell_trade(trade)
-                        trade["exit_in_progress"] = False
-                        continue
-
-                    if pnl_pct <= LATE_SL:
-                        trade["exit_in_progress"] = True
-                        trade["last_exit_try"] = now
-                        send_message(f"🔔 خروج {symbol} (Late SL {pnl_pct:.2f}% ≤ {LATE_SL:.2f}%)")
-                        sell_trade(trade)
-                        trade["exit_in_progress"] = False
-                        continue
+                # 4) الزخم قوي جدًا؟ أعطه مجال يتنفّس (لا نبيع)
+                if r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
+                    pass  # السماح بالتنفس
 
             time.sleep(1)
         except Exception as e:
@@ -519,8 +570,25 @@ def build_summary():
             total_cost  += t.get("cost_eur", entry * amount)
             duration_min = int((now - t.get("opened_at", now)) / 60)
             emoji = "✅" if pnl_pct >= 0 else "❌"
+
+            # قيم ذكية
+            peak_pct   = t.get("peak_pct", 0.0)
+            dyn_sl     = t.get("sl_dyn", DYN_SL_START)   # ستوب سلّمي ديناميكي
+            last_hi_ts = t.get("last_new_high", t.get("opened_at", now))
+            stall_age  = int(now - last_hi_ts)
+
+            try:
+                r30, r90, _ = _mom_metrics(t, current)
+            except Exception:
+                r30 = r90 = 0.0
+
             lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}%")
-            lines.append(f"   • كمية: {amount:.5f} | منذ: {duration_min} د | أعلى: {t.get('peak_pct',0):.2f}% | مرحلة: {t.get('phase','EARLY')}")
+            lines.append(
+                f"   • كمية: {amount:.5f} | منذ: {duration_min}د | أعلى: {peak_pct:.2f}% | SL ديناميكي: {dyn_sl:.2f}%"
+            )
+            lines.append(
+                f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | آخر قمة: {stall_age}s"
+            )
 
         floating_pnl_eur = total_value - total_cost
         floating_pnl_pct = ((total_value / total_cost) - 1.0) * 100 if total_cost > 0 else 0.0
