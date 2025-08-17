@@ -653,7 +653,7 @@ def build_summary():
                     sell_fees += float(t.get("sell_fee_eur", 0))
                 sign = "✅" if float(t["pnl_eur"]) >= 0 else "❌"
                 sym = t["symbol"].replace("-EUR","")
-                lines.append(f"- {sym}: {sign} {float(t['pnl_eur']):+ .2f}€ ({float(t['pnl_pct']):+ .2f}%)")
+                lines.append(f"- {sym}: {sign} {float(t['pnl_eur']):+.2f}€ ({float(t['pnl_pct']):+.2f}%)")
                 shown += 1
                 if shown >= 5:
                     break
