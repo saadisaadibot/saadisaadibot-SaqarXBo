@@ -3,8 +3,8 @@ import hmac
 import hashlib
 import os
 import time
-import requests
 import json
+import requests
 import redis
 from flask import Flask, request
 from threading import Thread, Lock
@@ -24,45 +24,46 @@ LATE_MIN_LOCK        = 0.5       # أقل قفل ربح (+0.5%) لو في ربح
 LATE_WEAK_R          = 0.15      # نعتبر الزخم ضعيف إذا r30/r90 ≤ +0.15%
 
 # —— ستوب سلّمي + خروج ذكي بدون وقت ——
-DYN_SL_START         = -2.0   # الستوب الابتدائي كنسبة % من سعر الدخول
-DYN_SL_STEP          = 1.0    # يرتفع 1% لكل 1% ربح إضافي
+DYN_SL_START         = -2.0      # الستوب الابتدائي كنسبة % من سعر الدخول
+DYN_SL_STEP          = 1.0       # يرتفع 1% لكل 1% ربح إضافي
 
-MOM_LOOKBACK_SEC     = 120    # تاريخ لحظي للزخم (ثواني)
-STALL_SEC            = 90     # يعتبر "توقّف" إذا ما انعملت قمة جديدة خلال هالفترة
-DROP_FROM_PEAK_EXIT  = 0.8    # خروج لو هبط 0.8% عن القمة وكان الزخم سلبي
+MOM_LOOKBACK_SEC     = 120       # تاريخ لحظي للزخم (ثواني)
+STALL_SEC            = 90        # يعتبر "توقّف" إذا ما انعملت قمة جديدة خلال هالفترة
+DROP_FROM_PEAK_EXIT  = 0.8       # خروج لو هبط 0.8% عن القمة وكان الزخم سلبي
 
 # عتبات الزخم (بالمئة %)
-MOM_R30_STRONG       = 0.50   # r30 قوي
-MOM_R90_STRONG       = 0.80   # r90 قوي
-
+MOM_R30_STRONG       = 0.50      # r30 قوي
+MOM_R90_STRONG       = 0.80      # r90 قوي
 
 # نافذة الخروج المبكر (أول 15 دقيقة)
-EARLY_WINDOW_SEC = 15 * 60
-EARLY_TRAIL_ACTIVATE = 3.0       # تفعيل التريلينغ عند +3%
-EARLY_TRAIL_BACKSTEP = 1.0       # يغلق إذا تراجع 1% من القمة
-EARLY_STOP_LOSS = -3.0           # ستوب لوس -3%
+EARLY_WINDOW_SEC       = 15 * 60
+EARLY_TRAIL_ACTIVATE   = 3.0     # تفعيل التريلينغ عند +3%
+EARLY_TRAIL_BACKSTEP   = 1.0     # يغلق إذا تراجع 1% من القمة
+EARLY_STOP_LOSS        = -3.0    # ستوب لوس -3%
 
 # بعد ربع ساعة: إغلاق سريع ±1%
 LATE_TP = 0.5                    # أخذ ربح +1%
 LATE_SL = -0.1                   # وقف خسارة -1%
 
 # إعادة المحاولة عند فشل البيع
-SELL_RETRY_DELAY = 5             # ثوانٍ بين المحاولات
-SELL_MAX_RETRIES = 6             # إجمالي المحاولات (≈ 30ث)
+SELL_RETRY_DELAY   = 5           # ثوانٍ بين المحاولات
+SELL_MAX_RETRIES   = 6           # إجمالي المحاولات (≈ 30ث)
 
 BLACKLIST_EXPIRE_SECONDS = 300   # حظر مؤقت بعد فشل شراء/بيع (ثوانٍ)
-BUY_COOLDOWN_SEC = 600           # كولداون بعد الإغلاق لنفس العملة (10 د)
+BUY_COOLDOWN_SEC         = 600   # كولداون بعد الإغلاق لنفس العملة (10 د)
 
 # =========================
 # 🧠 التهيئة العامة
 # =========================
 load_dotenv()
 app = Flask(__name__)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-BITVAVO_API_KEY = os.getenv("BITVAVO_API_KEY")
+
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+CHAT_ID            = os.getenv("CHAT_ID")
+BITVAVO_API_KEY    = os.getenv("BITVAVO_API_KEY")
 BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET")
-r = redis.from_url(os.getenv("REDIS_URL"))
+r                  = redis.from_url(os.getenv("REDIS_URL"))
+
 lock = Lock()
 enabled = True
 active_trades = []     # صفقات مفتوحة
@@ -70,6 +71,35 @@ executed_trades = []   # سجل جميع الصفقات (نسخة عند الش�
 
 # لحساب “منذ الانسى”
 SINCE_RESET_KEY = "nems:since_reset"
+
+# =========================
+# 🛠️ Utilities
+# =========================
+def _safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _read_since_reset_ts():
+    raw = r.get(SINCE_RESET_KEY)
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode()
+    return _safe_float(raw, 0.0)
+
+def _persist_active_trades():
+    try:
+        r.set("nems:active_trades", json.dumps(active_trades))
+    except Exception:
+        pass
+
+def _persist_executed_trades():
+    try:
+        r.delete("nems:executed_trades")
+        for t in executed_trades:
+            r.rpush("nems:executed_trades", json.dumps(t))
+    except Exception:
+        pass
 
 # =========================
 # 🔔 إرسال (مع منع تكرار)
@@ -102,20 +132,20 @@ def bitvavo_request(method, path, body=None):
         body_str = ""
         signature = create_signature(timestamp, method, f"/v2{path}", body_str)
         headers = {
-            'Bitvavo-Access-Key': BITVAVO_API_KEY,
-            'Bitvavo-Access-Timestamp': timestamp,
-            'Bitvavo-Access-Signature': signature,
-            'Bitvavo-Access-Window': '10000'
+            "Bitvavo-Access-Key": BITVAVO_API_KEY,
+            "Bitvavo-Access-Timestamp": timestamp,
+            "Bitvavo-Access-Signature": signature,
+            "Bitvavo-Access-Window": "10000",
         }
         resp = requests.request(method, url, headers=headers, timeout=8)
     else:
-        body_str = json.dumps(body or {}, separators=(',', ':'))
+        body_str = json.dumps(body or {}, separators=(",", ":"))
         signature = create_signature(timestamp, method, f"/v2{path}", body_str)
         headers = {
-            'Bitvavo-Access-Key': BITVAVO_API_KEY,
-            'Bitvavo-Access-Timestamp': timestamp,
-            'Bitvavo-Access-Signature': signature,
-            'Bitvavo-Access-Window': '10000'
+            "Bitvavo-Access-Key": BITVAVO_API_KEY,
+            "Bitvavo-Access-Timestamp": timestamp,
+            "Bitvavo-Access-Signature": signature,
+            "Bitvavo-Access-Window": "10000",
         }
         resp = requests.request(method, url, headers=headers, json=body or {}, timeout=12)
 
@@ -124,13 +154,15 @@ def bitvavo_request(method, path, body=None):
     except Exception:
         return {"error": "invalid_json", "status_code": resp.status_code, "text": resp.text}
 
-# >>> أضفنا هذه الدالة لحساب رصيد EUR المتاح <<<
+# =========================
+# 💶 الرصيد باليورو
+# =========================
 def get_eur_available():
     try:
         balances = bitvavo_request("GET", "/balance")
         for b in balances:
             if b.get("symbol") == "EUR":
-                return max(0.0, float(b.get("available", 0) or 0))
+                return max(0.0, _safe_float(b.get("available", 0)))
     except Exception:
         pass
     return 0.0
@@ -139,6 +171,7 @@ def get_eur_available():
 # 💶 الأسعار (كاش خفيف)
 # =========================
 _price_cache = {"t": 0, "map": {}}
+
 def fetch_price(market_symbol):
     # كاش 2 ثانية
     now = time.time()
@@ -149,7 +182,7 @@ def fetch_price(market_symbol):
         return _price_cache["map"][market_symbol]
     try:
         res = bitvavo_request("GET", f"/ticker/price?market={market_symbol}")
-        price = float(res.get("price", 0) or 0)
+        price = _safe_float(res.get("price", 0))
         if price > 0:
             _price_cache["map"][market_symbol] = price
             return price
@@ -173,7 +206,8 @@ def ensure_symbols_fresh():
         data = res.json()
         SUPPORTED_SYMBOLS = set(
             m["market"].replace("-EUR", "").upper()
-            for m in data if m.get("market", "").endswith("-EUR")
+            for m in data
+            if m.get("market", "").endswith("-EUR")
         )
         _last_sym_refresh = now
     except Exception as e:
@@ -187,9 +221,9 @@ def totals_from_fills_eur(fills):
     total_eur  = 0.0
     fee_eur    = 0.0
     for f in (fills or []):
-        amt   = float(f["amount"])
-        price = float(f["price"])
-        fee   = float(f.get("fee", 0) or 0)
+        amt   = _safe_float(f.get("amount"))
+        price = _safe_float(f.get("price"))
+        fee   = _safe_float(f.get("fee", 0))
         total_base += amt
         total_eur  += amt * price
         fee_eur    += fee  # feeCurrency = EUR
@@ -205,7 +239,7 @@ def place_market_sell(market, amt):
         "orderType": "market",
         "amount": f"{amt:.10f}",
         "clientOrderId": str(uuid4()),
-        "operatorId": ""
+        "operatorId": "",
     }
     return bitvavo_request("POST", "/order", body)
 
@@ -219,13 +253,13 @@ def sell_trade(trade):
     if r.exists(f"blacklist:sell:{market}"):
         return
 
-    amt = float(trade.get("amount", 0) or 0)
+    amt = _safe_float(trade.get("amount"))
     if amt <= 0:
         return
 
     ok = False
     resp = None
-    for attempt in range(1, SELL_MAX_RETRIES + 1):
+    for _ in range(1, SELL_MAX_RETRIES + 1):
         resp = place_market_sell(market, amt)
         if isinstance(resp, dict) and resp.get("status") == "filled":
             ok = True
@@ -244,8 +278,8 @@ def sell_trade(trade):
     proceeds_eur = tq_eur - fee_eur  # عائد صافي €
     sold_amount  = tb
 
-    orig_amt  = float(trade["amount"])
-    orig_cost = float(trade.get("cost_eur", trade["entry"] * trade["amount"]))
+    orig_amt  = _safe_float(trade.get("amount"))
+    orig_cost = _safe_float(trade.get("cost_eur", trade["entry"] * trade["amount"]))
 
     # بيع جزئي؟
     if sold_amount < orig_amt - 1e-10:
@@ -270,14 +304,12 @@ def sell_trade(trade):
             "pnl_pct": pnl_pct,
             "exit_time": time.time(),
             "amount": sold_amount,
-            "cost_eur": attributed_cost
+            "cost_eur": attributed_cost,
         })
         with lock:
             executed_trades.append(closed)
-            r.delete("nems:executed_trades")
-            for t in executed_trades:
-                r.rpush("nems:executed_trades", json.dumps(t))
-            r.set("nems:active_trades", json.dumps(active_trades))
+            _persist_executed_trades()
+            _persist_active_trades()
         return
 
     # بيع كامل
@@ -285,11 +317,11 @@ def sell_trade(trade):
     pnl_pct = (proceeds_eur / orig_cost - 1.0) * 100.0
     send_message(f"💰 بيع {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
-        # إذا الخسارة كبيرة ≤ -3% → حظر شراء العملة 24 ساعة
+    # إذا الخسارة كبيرة ≤ -3% → حظر شراء العملة 24 ساعة
     try:
         if pnl_pct <= -3.0:
             base = market.replace("-EUR", "")
-            r.setex(f"ban24:{base}", 24*3600, 1)
+            r.setex(f"ban24:{base}", 24 * 3600, 1)
             send_message(f"🧊 تم حظر {base} لمدة 24 ساعة (خسارة {pnl_pct:.2f}%).")
     except Exception:
         pass
@@ -299,22 +331,20 @@ def sell_trade(trade):
             active_trades.remove(trade)
         except ValueError:
             pass
-        r.set("nems:active_trades", json.dumps(active_trades))
+        _persist_active_trades()
 
         # حدّث نسخة السجل المطابقة (آخر واحدة بدون exit)
-        for i in range(len(executed_trades)-1, -1, -1):
+        for i in range(len(executed_trades) - 1, -1, -1):
             if executed_trades[i]["symbol"] == market and "exit_eur" not in executed_trades[i]:
                 executed_trades[i].update({
                     "exit_eur": proceeds_eur,
                     "sell_fee_eur": fee_eur,
                     "pnl_eur": pnl_eur,
                     "pnl_pct": pnl_pct,
-                    "exit_time": time.time()
+                    "exit_time": time.time(),
                 })
                 break
-        r.delete("nems:executed_trades")
-        for t in executed_trades:
-            r.rpush("nems:executed_trades", json.dumps(t))
+        _persist_executed_trades()
 
     base = market.replace("-EUR", "")
     r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
@@ -336,7 +366,7 @@ def buy(symbol):
         send_message(f"❌ العملة {symbol} غير مدعومة على Bitvavo.")
         return
 
-        # حظر 24 ساعة بعد خسارة كبيرة
+    # حظر 24 ساعة بعد خسارة كبيرة
     if r.exists(f"ban24:{symbol}"):
         send_message(f"🧊 {symbol} محظورة 24 ساعة بسبب خسارة سابقة. تجاهلت الإشارة.")
         return
@@ -386,7 +416,7 @@ def buy(symbol):
         "orderType": "market",
         "amountQuote": f"{amount_quote:.2f}",
         "clientOrderId": str(uuid4()),
-        "operatorId": ""
+        "operatorId": "",
     }
     res = bitvavo_request("POST", "/order", body)
 
@@ -417,21 +447,26 @@ def buy(symbol):
             # أعلام الخروج
             "exit_in_progress": False,
             "last_profit": 0.0,
-            "last_exit_try": 0.0
+            "last_exit_try": 0.0,
         }
 
         with lock:
             active_trades.append(trade)
             executed_trades.append(trade.copy())
-            r.set("nems:active_trades", json.dumps(active_trades))
-            r.rpush("nems:executed_trades", json.dumps(trade))
+            _persist_active_trades()
+            _persist_executed_trades()
 
         slot_idx = len(active_trades)  # بعد الإضافة
-        send_message(f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | كمية: {amount_net:.5f}")
+        send_message(
+            f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | كمية: {amount_net:.5f}"
+        )
     else:
         r.setex(f"blacklist:buy:{symbol}", BLACKLIST_EXPIRE_SECONDS, 1)
         send_message(f"❌ فشل شراء {symbol}")
 
+# =========================
+# 🔎 تاريخ السعر/الزخم المحلي
+# =========================
 def _init_hist(trade):
     if "hist" not in trade:
         trade["hist"] = deque(maxlen=600)  # ~ دقيقتين
@@ -457,14 +492,17 @@ def _mom_metrics(trade, price_now):
     p30 = p90 = None
     hi = lo = price_now
     for ts, p in trade["hist"]:
-        hi = max(hi, p); lo = min(lo, p)
+        hi = max(hi, p)
+        lo = min(lo, p)
         age = now_ts - ts
         if p30 is None and age >= 30:
             p30 = p
         if p90 is None and age >= 90:
             p90 = p
-    if p30 is None: p30 = trade["hist"][0][1]
-    if p90 is None: p90 = trade["hist"][0][1]
+    if p30 is None:
+        p30 = trade["hist"][0][1]
+    if p90 is None:
+        p90 = trade["hist"][0][1]
 
     r30 = (price_now / p30 - 1.0) * 100.0 if p30 > 0 else 0.0
     r90 = (price_now / p90 - 1.0) * 100.0 if p90 > 0 else 0.0
@@ -486,8 +524,8 @@ def monitor_loop():
 
             now = time.time()
             for trade in snapshot:
-                market = trade["symbol"]
-                entry  = float(trade["entry"])
+                market  = trade["symbol"]
+                entry   = _safe_float(trade["entry"])
                 current = fetch_price(market)
                 if not current:
                     continue
@@ -497,7 +535,7 @@ def monitor_loop():
                 r30, r90, _ = _mom_metrics(trade, current)
 
                 pnl_pct = ((current - entry) / entry) * 100.0
-                trade["peak_pct"] = max(trade.get("peak_pct", 0.0), pnl_pct)
+                trade["peak_pct"] = max(_safe_float(trade.get("peak_pct")), pnl_pct)
 
                 # ستوب لوس سلّمي: -2% + (1% لكل 1% ربح)
                 inc = int(max(0.0, pnl_pct) // 1)  # درجات صحيحة
@@ -517,14 +555,20 @@ def monitor_loop():
                         prev_lock = trade["sl_dyn"]
                         trade["sl_dyn"] = desired_lock
                         if (desired_lock - prev_lock) >= 0.4 and not trade.get("late_lock_notified"):
-                            send_message(f"🔒 تفعيل قفل ربح {market}: SL ⇧ إلى {desired_lock:.2f}% (قمة {peak:.2f}%)")
+                            send_message(
+                                f"🔒 تفعيل قفل ربح {market}: SL ⇧ إلى {desired_lock:.2f}% (قمة {peak:.2f}%)"
+                            )
                             trade["late_lock_notified"] = True
 
                     # زخم ضعيف وكسر القفل بهامش بسيط → خروج
                     if r30 <= LATE_WEAK_R and r90 <= LATE_WEAK_R and pnl_pct <= trade["sl_dyn"] + 0.10:
-                        trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                        send_message(f"🔔 خروج {market} (زخم ضعيف بعد 15د | r30 {r30:.2f}% r90 {r90:.2f}% | قفل {trade['sl_dyn']:.2f}%)")
-                        sell_trade(trade); trade["exit_in_progress"] = False
+                        trade["exit_in_progress"] = True
+                        trade["last_exit_try"] = now
+                        send_message(
+                            f"🔔 خروج {market} (زخم ضعيف بعد 15د | r30 {r30:.2f}% r90 {r90:.2f}% | قفل {trade['sl_dyn']:.2f}%)"
+                        )
+                        sell_trade(trade)
+                        trade["exit_in_progress"] = False
                         continue
 
                 # منع تكرار محاولات الخروج
@@ -534,17 +578,23 @@ def monitor_loop():
 
                 # 1) SL سلّمي — حماية أساسية
                 if pnl_pct <= trade["sl_dyn"]:
-                    trade["exit_in_progress"] = True; trade["last_exit_try"] = now
+                    trade["exit_in_progress"] = True
+                    trade["last_exit_try"] = now
                     send_message(f"🔔 خروج {market} (SL سلّمي {trade['sl_dyn']:.2f}% | الآن {pnl_pct:.2f}%)")
-                    sell_trade(trade); trade["exit_in_progress"] = False
+                    sell_trade(trade)
+                    trade["exit_in_progress"] = False
                     continue
 
-                # 2) انعكاس زخم بعد قمة: هبوط واضح من القمة + r30 & r90 سلبيين
+                # 2) انعكاس زخم بعد قمة
                 drop_from_peak = trade["peak_pct"] - pnl_pct
                 if trade["peak_pct"] >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 <= -0.15 and r90 <= 0.0:
-                    trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (انعكاس زخم: من قمة {trade['peak_pct']:.2f}% هبوط {drop_from_peak:.2f}%)")
-                    sell_trade(trade); trade["exit_in_progress"] = False
+                    trade["exit_in_progress"] = True
+                    trade["last_exit_try"] = now
+                    send_message(
+                        f"🔔 خروج {market} (انعكاس زخم: من قمة {trade['peak_pct']:.2f}% هبوط {drop_from_peak:.2f}%)"
+                    )
+                    sell_trade(trade)
+                    trade["exit_in_progress"] = False
                     continue
 
                 # 3) توقّف تقدّم (STALL) — أهدأ: 90ث وزخم سلبي فعلي
@@ -552,14 +602,18 @@ def monitor_loop():
                 required_stall_sec = 90 if STALL_SEC < 90 else STALL_SEC  # ضمان 90ث حتى لو الإعداد أقدم
                 stalled = (now - last_hi) >= required_stall_sec
                 if stalled and r30 <= -0.10 and r90 <= -0.10 and pnl_pct > trade["sl_dyn"] + 0.3:
-                    trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (توقّف {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
-                    sell_trade(trade); trade["exit_in_progress"] = False
+                    trade["exit_in_progress"] = True
+                    trade["last_exit_try"] = now
+                    send_message(
+                        f"🔔 خروج {market} (توقّف {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)"
+                    )
+                    sell_trade(trade)
+                    trade["exit_in_progress"] = False
                     continue
 
                 # 4) الزخم قوي جدًا؟ أعطه مجال يتنفّس
                 if r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
-                    pass  # السماح بالتنفس
+                    pass
 
             time.sleep(1)
         except Exception as e:
@@ -583,27 +637,28 @@ def build_summary():
         def cur_pnl(t):
             cur = fetch_price(t["symbol"]) or t["entry"]
             return (cur - t["entry"]) / t["entry"]
+
         sorted_trades = sorted(active_copy, key=cur_pnl, reverse=True)
 
         total_value = 0.0
         total_cost  = 0.0
         lines.append(f"📌 الصفقات النشطة ({len(sorted_trades)}):")
         for i, t in enumerate(sorted_trades, 1):
-            symbol = t['symbol'].replace("-EUR", "")
-            entry  = float(t['entry'])
-            amount = float(t['amount'])
-            current = fetch_price(t['symbol']) or entry
+            symbol = t["symbol"].replace("-EUR", "")
+            entry  = _safe_float(t["entry"])
+            amount = _safe_float(t["amount"])
+            current = fetch_price(t["symbol"]) or entry
             pnl_pct = ((current - entry) / entry) * 100.0
             value   = amount * current
             total_value += value
-            total_cost  += float(t.get("cost_eur", entry * amount))
+            total_cost  += _safe_float(t.get("cost_eur", entry * amount))
             duration_min = int((now - t.get("opened_at", now)) / 60)
             emoji = "✅" if pnl_pct >= 0 else "❌"
 
             # قيم ذكية
-            peak_pct   = float(t.get("peak_pct", 0.0))
-            dyn_sl     = float(t.get("sl_dyn", DYN_SL_START))   # SL ديناميكي
-            last_hi_ts = float(t.get("last_new_high", t.get("opened_at", now)))
+            peak_pct   = _safe_float(t.get("peak_pct", 0.0))
+            dyn_sl     = _safe_float(t.get("sl_dyn", DYN_SL_START))   # SL ديناميكي
+            last_hi_ts = _safe_float(t.get("last_new_high", t.get("opened_at", now)))
             stall_age  = int(now - last_hi_ts)
 
             # r30/r90 لحظيًا (مع أمان)
@@ -623,12 +678,8 @@ def build_summary():
                 state = "⏳ مراقبة"
 
             lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}%")
-            lines.append(
-                f"   • كمية: {amount:.5f} | منذ: {duration_min}د | أعلى: {peak_pct:.2f}% | SL ديناميكي: {dyn_sl:.2f}%"
-            )
-            lines.append(
-                f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | آخر قمة: {stall_age}s | حالة: {state}"
-            )
+            lines.append(f"   • كمية: {amount:.5f} | منذ: {duration_min}د | أعلى: {peak_pct:.2f}% | SL ديناميكي: {dyn_sl:.2f}%")
+            lines.append(f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | آخر قمة: {stall_age}s | حالة: {state}")
 
         floating_pnl_eur = total_value - total_cost
         floating_pnl_pct = ((total_value / total_cost) - 1.0) * 100 if total_cost > 0 else 0.0
@@ -642,18 +693,17 @@ def build_summary():
     shown = 0
 
     if exec_copy:
-        raw = r.get(SINCE_RESET_KEY)
-        since_ts = float(raw.decode() if isinstance(raw, (bytes, bytearray)) else (raw or 0))
+        since_ts = _read_since_reset_ts()
         lines.append("\n📊 آخر صفقات منفذة:")
         for t in reversed(exec_copy):
             if "pnl_eur" in t and "exit_time" in t:
-                if float(t["exit_time"]) >= since_ts:
-                    realized_pnl += float(t["pnl_eur"])
-                    buy_fees  += float(t.get("buy_fee_eur", 0))
-                    sell_fees += float(t.get("sell_fee_eur", 0))
-                sign = "✅" if float(t["pnl_eur"]) >= 0 else "❌"
-                sym = t["symbol"].replace("-EUR","")
-                lines.append(f"- {sym}: {sign} {float(t['pnl_eur']):+.2f}€ ({float(t['pnl_pct']):+.2f}%)")
+                if _safe_float(t["exit_time"]) >= since_ts:
+                    realized_pnl += _safe_float(t["pnl_eur"])
+                    buy_fees  += _safe_float(t.get("buy_fee_eur", 0))
+                    sell_fees += _safe_float(t.get("sell_fee_eur", 0))
+                sign = "✅" if _safe_float(t["pnl_eur"]) >= 0 else "❌"
+                sym = t["symbol"].replace("-EUR", "")
+                lines.append(f"- {sym}: {sign} {_safe_float(t['pnl_eur']):+.2f}€ ({_safe_float(t['pnl_pct']):+.2f}%)")
                 shown += 1
                 if shown >= 5:
                     break
@@ -709,7 +759,7 @@ def webhook():
 
     elif "الرصيد" in t_lower:
         balances = bitvavo_request("GET", "/balance")
-        eur = sum(float(b.get("available", 0)) + float(b.get("inOrder", 0)) 
+        eur = sum(_safe_float(b.get("available", 0)) + _safe_float(b.get("inOrder", 0))
                   for b in balances if b.get("symbol") == "EUR")
         total = eur
         winners, losers = [], []
@@ -721,7 +771,7 @@ def webhook():
             sym = b.get("symbol")
             if sym == "EUR":
                 continue
-            qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
+            qty = _safe_float(b.get("available", 0)) + _safe_float(b.get("inOrder", 0))
             if qty < 0.0001:
                 continue
             pair = f"{sym}-EUR"
@@ -762,7 +812,7 @@ def webhook():
         send_message("✅ تم تفعيل الشراء.")
         return "ok"
 
-    elif "قائمة الحظر" in t_lower:
+    elif "قائمة الحظر" في t_lower:
         keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("ban24:*")]
         if not keys:
             send_message("🧊 لا توجد عملات محظورة حالياً.")
@@ -773,7 +823,7 @@ def webhook():
 
     elif t_lower.startswith("الغ حظر"):
         try:
-            coin = text.split("الغ حظر",1)[-1].strip().upper()
+            coin = text.split("الغ حظر", 1)[-1].strip().upper()
             if r.delete(f"ban24:{coin}"):
                 send_message(f"✅ أُلغي حظر {coin}.")
             else:
