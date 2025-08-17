@@ -35,6 +35,8 @@ MOM_R90_STRONG      = 0.80
 SELL_RETRY_DELAY = 5
 SELL_MAX_RETRIES = 6
 
+EARLY_WINDOW_SEC = 15 * 60
+
 BLACKLIST_EXPIRE_SECONDS = 300  # 5 دقائق
 BUY_COOLDOWN_SEC = 600          # 10 دقائق
 
@@ -432,6 +434,12 @@ def _mom_metrics(trade, price_now):
         trade["last_new_high"] = now_ts
     return r30, r90, new_high
 
+def fetch_orderbook(market: str, depth: int = 1):
+    try:
+        return bitvavo_request("GET", f"/orderbook?market={market}&depth={depth}")
+    except Exception:
+        return None
+
 # =========================
 # 👀 حلقة المراقبة (خروج ذكي)
 # =========================
@@ -455,64 +463,78 @@ def monitor_loop():
                 pnl_pct = ((current - entry) / entry) * 100.0
                 trade["peak_pct"] = max(trade.get("peak_pct", 0.0), pnl_pct)
 
-                # ستوب سلّمي: -2% + (1% لكل 1% ربح)
+                # ستوب سلّمي أساسي
                 inc = int(max(0.0, pnl_pct) // 1)
                 dyn_sl = DYN_SL_START + inc * DYN_SL_STEP
                 trade["sl_dyn"] = dyn_sl
 
                 age = now - trade.get("opened_at", now)
 
-                # ===== قفل ربح ذكي بعد 15 دقيقة =====
-                if age >= LATE_FALLBACK_SEC:
-                    peak = trade.get("peak_pct", 0.0)
-                    lock_from_peak = peak - LATE_LOCK_BACKSTEP
-                    desired_lock = max(lock_from_peak, LATE_MIN_LOCK)
-
-                    if desired_lock > trade.get("sl_dyn", DYN_SL_START):
-                        prev_lock = trade["sl_dyn"]
-                        trade["sl_dyn"] = desired_lock
-                        if (desired_lock - prev_lock) >= 0.4 and not trade.get("late_lock_notified"):
-                            send_message(f"🔒 تفعيل قفل ربح {market}: SL ⇧ إلى {desired_lock:.2f}% (قمة {peak:.2f}%)")
-                            trade["late_lock_notified"] = True
-
-                    if r30 <= LATE_WEAK_R and r90 <= LATE_WEAK_R and pnl_pct <= trade["sl_dyn"] + 0.10:
+                # =====================
+                # 🟢 المرحلة 1: أول 15 دقيقة
+                # =====================
+                if age < EARLY_WINDOW_SEC:
+                    if pnl_pct <= dyn_sl:
                         trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                        send_message(f"🔔 خروج {market} (زخم ضعيف بعد 15د | r30 {r30:.2f}% r90 {r90:.2f}% | قفل {trade['sl_dyn']:.2f}%)")
+                        send_message(f"🔔 خروج {market} (نافذة مبكرة: SL سلّمي {dyn_sl:.2f}% | الآن {pnl_pct:.2f}%)")
                         sell_trade(trade); trade["exit_in_progress"] = False
-                        continue
+                    continue  # ما نفحص أي شروط تانية بهالفترة
 
-                # منع تكرار محاولات الخروج
-                in_progress = trade.get("exit_in_progress") and (now - trade.get("last_exit_try", 0)) < 15
-                if in_progress:
+                # =====================
+                # 🔵 المرحلة 2: بعد 15 دقيقة
+                # =====================
+
+                # 1) منع تكرار محاولات الخروج
+                if trade.get("exit_in_progress") and (now - trade.get("last_exit_try", 0)) < 15:
                     continue
 
-                # 1) SL سلّمي — حماية أساسية
+                # 2) قفل ربح متدرّج (late lock)
+                peak = trade.get("peak_pct", 0.0)
+                lock_from_peak = peak - LATE_LOCK_BACKSTEP
+                desired_lock = max(lock_from_peak, LATE_MIN_LOCK)
+                if desired_lock > trade.get("sl_dyn", DYN_SL_START):
+                    prev_lock = trade["sl_dyn"]
+                    trade["sl_dyn"] = desired_lock
+                    if (desired_lock - prev_lock) >= 0.4 and not trade.get("late_lock_notified"):
+                        send_message(f"🔒 تفعيل قفل ربح {market}: SL ⇧ إلى {desired_lock:.2f}% (قمة {peak:.2f}%)")
+                        trade["late_lock_notified"] = True
+
+                # 3) خروج: SL سلّمي
                 if pnl_pct <= trade["sl_dyn"]:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (SL سلّمي {trade['sl_dyn']:.2f}% | الآن {pnl_pct:.2f}%)")
+                    send_message(f"🔔 خروج {market} (SL {trade['sl_dyn']:.2f}% | الآن {pnl_pct:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # 2) انعكاس زخم بعد قمة
+                # 4) خروج: انعكاس زخم بعد قمة
                 drop_from_peak = trade["peak_pct"] - pnl_pct
                 if trade["peak_pct"] >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 <= -0.15 and r90 <= 0.0:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (انعكاس زخم: من قمة {trade['peak_pct']:.2f}% هبوط {drop_from_peak:.2f}%)")
+                    send_message(f"🔔 خروج {market} (انعكاس زخم: قمة {trade['peak_pct']:.2f}% → {pnl_pct:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # 3) توقّف تقدّم (STALL) — 90ث وزخم سلبي
+                # 5) خروج: توقّف تقدم (STALL)
                 last_hi = trade.get("last_new_high", trade.get("opened_at", now))
-                required_stall_sec = 90 if STALL_SEC < 90 else STALL_SEC
-                stalled = (now - last_hi) >= required_stall_sec
+                stalled = (now - last_hi) >= max(90, STALL_SEC)
                 if stalled and r30 <= -0.10 and r90 <= -0.10 and pnl_pct > trade["sl_dyn"] + 0.3:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (توقّف {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
+                    send_message(f"🔔 خروج {market} (STALL {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # 4) زخم قوي جدًا — تنفّس
-                if r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
+                # 6) قراءة دفتر الطلبات (خياري)
+                try:
+                    ob = fetch_orderbook(market)
+                    if ob:
+                        ask_wall = float(ob["asks"][0][1])
+                        bid_wall = float(ob["bids"][0][1])
+                        if ask_wall > bid_wall * 2 and pnl_pct > 0.5:
+                            send_message(f"⚠️ {market} حائط بيع ضخم ({ask_wall:.0f} ضد {bid_wall:.0f}) → خروج حذر")
+                            trade["exit_in_progress"] = True; trade["last_exit_try"] = now
+                            sell_trade(trade); trade["exit_in_progress"] = False
+                            continue
+                except Exception:
                     pass
 
             time.sleep(1)
@@ -533,56 +555,96 @@ def build_summary():
         active_copy = list(active_trades)
         exec_copy = list(executed_trades)
 
+    # ===== الصفقات النشطة =====
     if active_copy:
         def cur_pnl(t):
             cur = fetch_price(t["symbol"]) or t["entry"]
             return (cur - t["entry"]) / t["entry"]
+
         sorted_trades = sorted(active_copy, key=cur_pnl, reverse=True)
 
         total_value = 0.0
         total_cost  = 0.0
         lines.append(f"📌 الصفقات النشطة ({len(sorted_trades)}):")
+
         for i, t in enumerate(sorted_trades, 1):
-            symbol = t['symbol'].replace("-EUR", "")
-            entry  = float(t['entry'])
-            amount = float(t['amount'])
-            current = fetch_price(t['symbol']) or entry
+            symbol = t["symbol"].replace("-EUR", "")
+            entry  = float(t["entry"])
+            amount = float(t["amount"])
+            opened = float(t.get("opened_at", now))
+            age_sec = int(now - opened)
+            age_min = age_sec // 60
+
+            current = fetch_price(t["symbol"]) or entry
             pnl_pct = ((current - entry) / entry) * 100.0
             value   = amount * current
             total_value += value
             total_cost  += float(t.get("cost_eur", entry * amount))
-            duration_min = int((now - t.get("opened_at", now)) / 60)
-            emoji = "✅" if pnl_pct >= 0 else "❌"
 
+            # قيَم ذكية/مشتقة
             peak_pct   = float(t.get("peak_pct", 0.0))
-            dyn_sl     = float(t.get("sl_dyn", DYN_SL_START))
-            last_hi_ts = float(t.get("last_new_high", t.get("opened_at", now)))
-            stall_age  = int(now - last_hi_ts)
+            dyn_sl     = float(t.get("sl_dyn", DYN_SL_START))  # SL ديناميكي الحالي
+            last_hi_ts = float(t.get("last_new_high", opened))
+            since_last_hi = int(now - last_hi_ts)
+            drop_from_peak = max(0.0, peak_pct - pnl_pct)
 
+            # الزخم اللحظي (آمن)
             try:
                 r30, r90, _ = _mom_metrics(t, current)
             except Exception:
                 r30 = r90 = 0.0
 
-            if r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
-                state = "🚀 زخم قوي — استمرار"
-            elif pnl_pct <= dyn_sl:
-                state = "🛑 ضرب SL"
-            elif stall_age >= max(90, STALL_SEC) and r30 <= -0.10 and r90 <= -0.10:
-                state = "⚠️ توقّف وضعف زخم"
+            # المرحلة: أول 15د أو بعد 15د
+            early_phase = age_sec < LATE_FALLBACK_SEC
+
+            # منطق حالة مفهومة ومتطابقة مع حلقة المراقبة
+            if early_phase:
+                # أول 15 دقيقة: فقط SL السلّمي (-2% + 1% لكل +1% ربح)، من غير تريلينغ من القمة
+                if pnl_pct <= dyn_sl:
+                    state = "🛑 قريب/ضرب SL المبكر"
+                elif r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
+                    state = "🚀 زخم قوي — استمرار (مرحلة مبكرة)"
+                else:
+                    state = "⏳ مراقبة (مرحلة مبكرة)"
+                lock_hint = f"SL المبكر: {dyn_sl:.2f}% (−2% +1 لكل +1 ربح)"
             else:
-                state = "⏳ مراقبة"
+                # بعد 15 دقيقة: قفل ربح ذكي من القمة
+                lock_from_peak = peak_pct - LATE_LOCK_BACKSTEP
+                desired_lock = max(lock_from_peak, LATE_MIN_LOCK)
+                lock_hint = f"قفل مقترح ≥ {desired_lock:.2f}% (قمة {peak_pct:.2f}%)"
 
-            lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}%")
-            lines.append(f"   • كمية: {amount:.5f} | منذ: {duration_min}د | أعلى: {peak_pct:.2f}% | SL ديناميكي: {dyn_sl:.2f}%")
-            lines.append(f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | آخر قمة: {stall_age}s | حالة: {state}")
+                if pnl_pct <= dyn_sl + 0.10 and r30 <= LATE_WEAK_R and r90 <= LATE_WEAK_R:
+                    state = "🔔 خروج مرجّح: زخم ضعيف وكسر القفل"
+                elif (peak_pct >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 <= -0.15 and r90 <= 0.0):
+                    state = "🔔 خروج مرجّح: انعكاس بعد قمة"
+                elif (since_last_hi >= max(90, STALL_SEC) and r30 <= -0.10 and r90 <= -0.10 and pnl_pct > dyn_sl + 0.3):
+                    state = "🔔 خروج مرجّح: توقّف تقدّم + زخم سلبي"
+                elif r30 >= MOM_R30_STRONG and r90 >= MOM_R90_STRONG:
+                    state = "🚀 زخم قوي — استمرار"
+                else:
+                    state = "⏳ مراقبة (مع قفل ربح)"
 
+            emoji = "✅" if pnl_pct >= 0 else "❌"
+
+            # سطر العنوان
+            lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}% | منذ {age_min}د")
+
+            # تفاصيل الصفقة
+            lines.append(
+                f"   • كمية: {amount:.5f} | أعلى: {peak_pct:.2f}% | SL ديناميكي: {dyn_sl:.2f}% | من آخر قمة: {since_last_hi}s"
+            )
+            lines.append(
+                f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | {lock_hint} | حالة: {state}"
+            )
+
+        # ملخص إجمالي عائم
         floating_pnl_eur = total_value - total_cost
         floating_pnl_pct = ((total_value / total_cost) - 1.0) * 100 if total_cost > 0 else 0.0
         lines.append(f"💼 قيمة الصفقات: €{total_value:.2f} | عائم: {floating_pnl_eur:+.2f}€ ({floating_pnl_pct:+.2f}%)")
     else:
         lines.append("📌 لا توجد صفقات نشطة.")
 
+    # ===== صفقات منفذة/رسوم منذ آخر «انسى» =====
     realized_pnl = 0.0
     buy_fees = 0.0
     sell_fees = 0.0
@@ -591,6 +653,7 @@ def build_summary():
     if exec_copy:
         raw = r.get(SINCE_RESET_KEY)
         since_ts = float(raw.decode() if isinstance(raw, (bytes, bytearray)) else (raw or 0))
+
         lines.append("\n📊 آخر صفقات منفذة:")
         for t in reversed(exec_copy):
             if "pnl_eur" in t and "exit_time" in t:
@@ -605,11 +668,11 @@ def build_summary():
                 if shown >= 5:
                     break
 
-    total_fees = buy_fees + sell_fees
-    if exec_copy:
+        total_fees = buy_fees + sell_fees
         lines.append(f"\n🧮 منذ آخر انسى:")
         lines.append(f"• أرباح/خسائر محققة: {realized_pnl:+.2f}€")
         if active_copy:
+            # نعيد استخدام آخر قيم محسوبة فوق لو في صفقات نشطة
             lines.append(f"• أرباح/خسائر عائمة حاليًا: {floating_pnl_eur:+.2f}€")
         lines.append(f"• الرسوم المدفوعة: {total_fees:.2f}€ (شراء: {buy_fees:.2f}€ / بيع: {sell_fees:.2f}€)")
     else:
