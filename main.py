@@ -266,6 +266,15 @@ def sell_trade(trade):
     pnl_pct = (proceeds_eur / orig_cost - 1.0) * 100.0
     send_message(f"💰 بيع {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
+        # إذا الخسارة كبيرة ≤ -3% → حظر شراء العملة 24 ساعة
+    try:
+        if pnl_pct <= -3.0:
+            base = market.replace("-EUR", "")
+            r.setex(f"ban24:{base}", 24*3600, 1)
+            send_message(f"🧊 تم حظر {base} لمدة 24 ساعة (خسارة {pnl_pct:.2f}%).")
+    except Exception:
+        pass
+
     with lock:
         try:
             active_trades.remove(trade)
@@ -306,6 +315,11 @@ def buy(symbol):
     symbol = symbol.upper().strip()
     if symbol not in SUPPORTED_SYMBOLS:
         send_message(f"❌ العملة {symbol} غير مدعومة على Bitvavo.")
+        return
+
+        # حظر 24 ساعة بعد خسارة كبيرة
+    if r.exists(f"ban24:{symbol}"):
+        send_message(f"🧊 {symbol} محظورة 24 ساعة بسبب خسارة سابقة. تجاهلت الإشارة.")
         return
 
     if r.exists(f"cooldown:{symbol}"):
@@ -637,6 +651,26 @@ def webhook():
     elif "ابدأ" in t_lower:
         enabled = True
         send_message("✅ تم تفعيل الشراء.")
+        return "ok"
+
+    elif "قائمة الحظر" in t_lower:
+        keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("ban24:*")]
+        if not keys:
+            send_message("🧊 لا توجد عملات محظورة حالياً.")
+        else:
+            names = [k.split("ban24:")[-1] for k in keys]
+            send_message("🧊 العملات المحظورة 24h:\n- " + "\n- ".join(sorted(names)))
+        return "ok"
+
+    elif t_lower.startswith("الغ حظر"):
+        try:
+            coin = text.split("الغ حظر",1)[-1].strip().upper()
+            if r.delete(f"ban24:{coin}"):
+                send_message(f"✅ أُلغي حظر {coin}.")
+            else:
+                send_message(f"ℹ️ لا يوجد حظر على {coin}.")
+        except Exception:
+            send_message("❌ الصيغة: الغ حظر ADA")
         return "ok"
 
     elif "انسى" in t_lower:
