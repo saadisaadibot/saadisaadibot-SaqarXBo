@@ -541,7 +541,7 @@ def monitor_loop():
 
                 # 2) انعكاس زخم بعد قمة: هبوط واضح من القمة + r30 & r90 سلبيين
                 drop_from_peak = trade["peak_pct"] - pnl_pct
-                if trade["peak_pct"] >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 < 0 and r90 < 0:
+                if trade["peak_pct"] >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 <= -0.15 and r90 <= 0.0:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
                     send_message(f"🔔 خروج {market} (انعكاس زخم: من قمة {trade['peak_pct']:.2f}% هبوط {drop_from_peak:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
