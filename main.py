@@ -18,6 +18,11 @@ from collections import deque
 BUY_AMOUNT_EUR = 22.0            # لم نعد نستخدمه للشراء (أبقيناه فقط للانسجام)
 MAX_TRADES = 2                   # الحد الأقصى للصفقات النشطة = 2 دائمًا
 
+LATE_FALLBACK_SEC    = 15 * 60   # بعد 15 دقيقة نفعل قفل ربح ذكي
+LATE_LOCK_BACKSTEP   = 0.6       # نقفل الربح على القمة ناقص 0.6%
+LATE_MIN_LOCK        = 0.5       # أقل قفل ربح (+0.5%) لو في ربح بسيط
+LATE_WEAK_R          = 0.15      # نعتبر الزخم ضعيف إذا r30/r90 ≤ +0.15%
+
 # —— ستوب سلّمي + خروج ذكي بدون وقت ——
 DYN_SL_START         = -2.0   # الستوب الابتدائي كنسبة % من سعر الدخول
 DYN_SL_STEP          = 1.0    # يرتفع 1% لكل 1% ربح إضافي
@@ -499,15 +504,39 @@ def monitor_loop():
                 dyn_sl = DYN_SL_START + inc * DYN_SL_STEP
                 trade["sl_dyn"] = dyn_sl  # للعرض في الملخص
 
+                age = now - trade.get("opened_at", now)
+
+                # ===== قفل ربح ذكي بعد 15 دقيقة =====
+                if age >= LATE_FALLBACK_SEC:
+                    peak = trade.get("peak_pct", 0.0)
+                    # قفل الربح بناءً على القمة
+                    lock_from_peak = peak - LATE_LOCK_BACKSTEP
+                    desired_lock = max(lock_from_peak, LATE_MIN_LOCK)
+
+                    # شدّ الستوب السلّمي ليصبح على الأقل desired_lock
+                    if desired_lock > trade.get("sl_dyn", DYN_SL_START):
+                        prev_lock = trade["sl_dyn"]
+                        trade["sl_dyn"] = desired_lock
+                        # إشعار مرّة واحدة إذا كان التشديد كبير
+                        if (desired_lock - prev_lock) >= 0.4 and not trade.get("late_lock_notified"):
+                            send_message(f"🔒 تفعيل قفل ربح {market}: SL ⇧ إلى {desired_lock:.2f}% (قمة {peak:.2f}%)")
+                            trade["late_lock_notified"] = True
+                    # لو الزخم ضعيف وكسر القفل بهامش بسيط → خروج
+                    if r30 <= LATE_WEAK_R and r90 <= LATE_WEAK_R and pnl_pct <= trade["sl_dyn"] + 0.10:
+                        trade["exit_in_progress"] = True; trade["last_exit_try"] = now
+                        send_message(f"🔔 خروج {market} (زخم ضعيف بعد 15د | r30 {r30:.2f}% r90 {r90:.2f}% | قفل {trade['sl_dyn']:.2f}%)")
+                        sell_trade(trade); trade["exit_in_progress"] = False
+                        continue
+
                 # منع تكرار محاولات الخروج
                 in_progress = trade.get("exit_in_progress") and (now - trade.get("last_exit_try", 0)) < 15
                 if in_progress:
                     continue
 
                 # 1) SL سلّمي — حماية أساسية
-                if pnl_pct <= dyn_sl:
+                if pnl_pct <= trade["sl_dyn"]:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
-                    send_message(f"🔔 خروج {market} (SL سلّمي {dyn_sl:.2f}% | الآن {pnl_pct:.2f}%)")
+                    send_message(f"🔔 خروج {market} (SL سلّمي {trade['sl_dyn']:.2f}% | الآن {pnl_pct:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
@@ -522,7 +551,7 @@ def monitor_loop():
                 # 3) توقّف تقدّم (STALL): ما عمل قمة جديدة فترة طويلة والزخم خفيف/سلبي
                 last_hi = trade.get("last_new_high", trade.get("opened_at", now))
                 stalled = (now - last_hi) >= STALL_SEC
-                if stalled and r30 <= 0.10 and r90 <= 0.10 and pnl_pct > dyn_sl + 0.3:
+                if stalled and r30 <= 0.10 and r90 <= 0.10 and pnl_pct > trade["sl_dyn"] + 0.3:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
                     send_message(f"🔔 خروج {market} (توقّف تقدّم {int(now-last_hi)}ث | r30 {r30:.2f}% r90 {r90:.2f}%)")
                     sell_trade(trade); trade["exit_in_progress"] = False
