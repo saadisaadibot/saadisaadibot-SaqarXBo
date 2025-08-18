@@ -365,10 +365,12 @@ def momentum_guard(market: str, r30=None, r90=None):
         first_px = last_px = None
         for t in (trades or []):
             ts = int(t.get("timestamp", 0))
-            if ts < t60: continue
+            if ts < t60: 
+                continue
             px = float(t["price"]); amt = float(t["amount"])
             side = (t.get("side") or "").lower()
-            if first_px is None: first_px = px
+            if first_px is None: 
+                first_px = px
             last_px = px
             v_eur = px * amt
             if side == "buy":
@@ -378,8 +380,42 @@ def momentum_guard(market: str, r30=None, r90=None):
 
         total = buy_vol + sell_vol
         if total <= 0:
+            # 🛡 fallback: orderbook check قبل ما نرفض
+            book1 = fetch_orderbook(market, depth=5) or {}
+            bids1, asks1 = book1.get("bids") or [], book1.get("asks") or []
+            if bids1 and asks1:
+                bid1 = float(bids1[0][0]); ask1 = float(asks1[0][0]); mid = 0.5*(bid1+ask1)
+                spread_bps = (ask1 - bid1)/mid * 10000.0
+
+                bid_notional = sum(float(p)*float(q) for p,q,*_ in bids1[:5])
+                ask_notional = sum(float(p)*float(q) for p,q,*_ in asks1[:5])
+                imb = bid_notional / max(ask_notional, 1e-9)
+
+                # لقطة ثانية لمنع spoofing
+                time.sleep(0.20)
+                book2 = fetch_orderbook(market, depth=5) or {}
+                bids2, asks2 = book2.get("bids") or [], book2.get("asks") or []
+                stable = False
+                if bids2 and asks2:
+                    bid_notional2 = sum(float(p)*float(q) for p,q,*_ in bids2[:5])
+                    if bid_notional > 0 and abs(bid_notional2 - bid_notional)/bid_notional <= 0.15:
+                        stable = True
+
+                MIN_BID_EUR   = 1500.0   # حد أدنى للسيولة
+                REQ_IMB       = 2.0      # تفوق واضح للـ bids
+                MAX_SPREAD_BP = 15.0     # سبريد مقبول
+
+                if (spread_bps <= MAX_SPREAD_BP and imb >= REQ_IMB and
+                    bid_notional >= MIN_BID_EUR and stable):
+                    return True, "book-only-pass", {
+                        "imb": round(imb,2),
+                        "spr": round(spread_bps,1),
+                        "bid€": int(bid_notional)
+                    }
+
             return False, "noRecentVol", {}
 
+        # ---- لو في تداول حديث نكمل ----
         tbr = buy_vol / total
         cvd = (buy_vol - sell_vol) / total
         dpct_60 = (last_px/first_px - 1.0)*100.0 if first_px else 0.0
@@ -404,8 +440,12 @@ def momentum_guard(market: str, r30=None, r90=None):
             accel = r30 - 0.5*r90
 
         # Fast-lane
-        if tbr >= GUARD_TBR_FAST and cvd >= GUARD_CVD_FAST and imb >= GUARD_IMB_FAST and spread_bps <= GUARD_SPREAD_FAST:
-            return True, "fastlane", {"tbr":round(tbr,3),"cvd":round(cvd,3),"imb":round(imb,2),"spr":round(spread_bps,1)}
+        if (tbr >= GUARD_TBR_FAST and cvd >= GUARD_CVD_FAST 
+            and imb >= GUARD_IMB_FAST and spread_bps <= GUARD_SPREAD_FAST):
+            return True, "fastlane", {
+                "tbr":round(tbr,3),"cvd":round(cvd,3),
+                "imb":round(imb,2),"spr":round(spread_bps,1)
+            }
 
         # Score
         score = 0
@@ -413,14 +453,18 @@ def momentum_guard(market: str, r30=None, r90=None):
         score += 1 if cvd >= GUARD_CVD_MIN else 0
         score += 1 if imb >= GUARD_IMB_MIN else 0
         score += 1 if spread_bps <= GUARD_SPREAD_MAX else 0
-        if accel is not None and accel >= 0.15: score += 1
+        if accel is not None and accel >= 0.15: 
+            score += 1
         score += 1 if lam <= 1e-4 else 0  # مضخات هشة
 
         if spread_bps > 25 or (sell_vol > buy_vol and tbr < 0.45):
-            return False, "killswitch", {"tbr":round(tbr,3), "spr":round(spread_bps,1)}
+            return False, "killswitch", {
+                "tbr":round(tbr,3), "spr":round(spread_bps,1)
+            }
 
         return (score >= GUARD_SCORE_NEED), f"score={score}", {
-            "tbr":round(tbr,3),"cvd":round(cvd,3),"imb":round(imb,2),"spr":round(spread_bps,1),
+            "tbr":round(tbr,3),"cvd":round(cvd,3),
+            "imb":round(imb,2),"spr":round(spread_bps,1),
             "accel": None if accel is None else round(accel,2)
         }
     except Exception as e:
