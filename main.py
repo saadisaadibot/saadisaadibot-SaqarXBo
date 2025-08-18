@@ -401,7 +401,7 @@ def momentum_guard(market: str, r30=None, r90=None):
                     if bid_notional > 0 and abs(bid_notional2 - bid_notional)/bid_notional <= 0.15:
                         stable = True
 
-                MIN_BID_EUR   = 1500.0   # حد أدنى للسيولة
+                MIN_BID_EUR   = 1000.0   # حد أدنى للسيولة
                 REQ_IMB       = 2.0      # تفوق واضح للـ bids
                 MAX_SPREAD_BP = 15.0     # سبريد مقبول
 
