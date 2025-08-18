@@ -402,7 +402,7 @@ def momentum_guard(market: str, r30=None, r90=None):
                         stable = True
 
                 MIN_BID_EUR   = 1000.0   # حد أدنى للسيولة
-                REQ_IMB       = 2.0      # تفوق واضح للـ bids
+                REQ_IMB       = 1.5      # تفوق واضح للـ bids
                 MAX_SPREAD_BP = 15.0     # سبريد مقبول
 
                 if (spread_bps <= MAX_SPREAD_BP and imb >= REQ_IMB and
