@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import hmac, hashlib, os, time, requests, json, redis
+import re
 from flask import Flask, request
 from threading import Thread, Lock
 from uuid import uuid4
@@ -341,12 +342,15 @@ def buy(symbol: str):
         "sl_breach_at": 0.0
     }
 
-    with lock:
-        active_trades.append(trade)
-        executed_trades.append(trade.copy())
-        r.set("nems:active_trades", json.dumps(active_trades))
-        r.rpush("nems:executed_trades", json.dumps(trade))
-
+    try:
+        with lock:
+            active_trades.append(trade)
+            executed_trades.append(trade.copy())
+            r.set("nems:active_trades", json.dumps(active_trades))
+            r.rpush("nems:executed_trades", json.dumps(trade))
+    except Exception as e:
+        # ما نخرب العملية: الطلب صار Filled أصلاً، بس ندوّن ونكمل
+        print("state persist error:", e)
     slot_idx = len(active_trades)
     send_message(f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | كمية: {amount_net:.5f}")
 
@@ -639,61 +643,101 @@ def webhook():
     global enabled
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or (data.get("message", {}) or {}).get("text") or "").strip()
-    if not text: return "ok"
-    t_lower = text.lower()
-
-    if "اشتري" in t_lower:
-        if not enabled:
-            send_message("🚫 البوت متوقف عن الشراء."); return "ok"
-        try:
-            symbol = text.split("اشتري", 1)[-1].strip().upper()
-            if not symbol: raise ValueError("no symbol")
-            buy(symbol)
-        except Exception:
-            send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
+    if not text:
         return "ok"
 
-    elif "الملخص" in t_lower:
-        send_message(build_summary()); return "ok"
+    t_lower = text.lower()
 
+    # --- اشتري ---
+    if "اشتري" in t_lower:
+        if not enabled:
+            send_message("🚫 البوت متوقف عن الشراء.")
+            return "ok"
+
+        # استخراج الرمز بشكل صلب (يدعم مسافات متعددة)
+        m = re.search(r"اشتري\s+([A-Za-z0-9]+)", text)
+        if not m:
+            send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
+            return "ok"
+
+        symbol = m.group(1).upper()
+        try:
+            buy(symbol)
+        except Exception as e:
+            print("buy() error:", e)
+            send_message("⚠️ حصل خطأ داخلي بعد إرسال أمر الشراء. قد يكون الطلب أُرسل للمنصة. افحص 'الملخص'.")
+        return "ok"
+
+    # --- الملخص ---
+    elif "الملخص" in t_lower:
+        send_message(build_summary())
+        return "ok"
+
+    # --- الرصيد ---
     elif "الرصيد" in t_lower:
         balances = bitvavo_request("GET", "/balance")
         eur = sum(float(b.get("available", 0)) + float(b.get("inOrder", 0))
                   for b in balances if b.get("symbol") == "EUR")
-        total = eur; winners, losers = [], []
-        with lock: exec_copy = list(executed_trades)
+        total = eur
+        winners, losers = [], []
+
+        with lock:
+            exec_copy = list(executed_trades)
+
         for b in balances:
             sym = b.get("symbol")
-            if sym == "EUR": continue
+            if sym == "EUR":
+                continue
             qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
-            if qty < 0.0001: continue
-            pair = f"{sym}-EUR"; price = fetch_price(pair)
-            if not price: continue
-            value = qty * price; total += value
+            if qty < 0.0001:
+                continue
+            pair = f"{sym}-EUR"
+            price = fetch_price(pair)
+            if not price:
+                continue
+            value = qty * price
+            total += value
+
             entry = None
             for t in reversed(exec_copy):
-                if t["symbol"] == pair: entry = t.get("entry"); break
+                if t["symbol"] == pair:
+                    entry = t.get("entry")
+                    break
+
             if entry:
                 pnl = ((price - entry) / entry) * 100
                 line = f"{sym}: {qty:.4f} @ €{price:.4f} → {pnl:+.2f}%"
                 (winners if pnl >= 0 else losers).append(line)
+
         lines = [f"💰 الرصيد الكلي: €{total:.2f}"]
-        if winners: lines.append("\n📈 رابحين:\n" + "\n".join(winners))
-        if losers:  lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
-        if not winners and not losers: lines.append("\n🚫 لا توجد عملات قيد التداول.")
-        send_message("\n".join(lines)); return "ok"
+        if winners:
+            lines.append("\n📈 رابحين:\n" + "\n".join(winners))
+        if losers:
+            lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
+        if not winners and not losers:
+            lines.append("\n🚫 لا توجد عملات قيد التداول.")
+        send_message("\n".join(lines))
+        return "ok"
 
     elif "قف" in t_lower:
-        enabled = False; send_message("🛑 تم إيقاف الشراء."); return "ok"
+        enabled = False
+        send_message("🛑 تم إيقاف الشراء.")
+        return "ok"
+
     elif "ابدأ" in t_lower:
-        enabled = True;  send_message("✅ تم تفعيل الشراء."); return "ok"
+        enabled = True
+        send_message("✅ تم تفعيل الشراء.")
+        return "ok"
+
     elif "قائمة الحظر" in t_lower:
         keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("ban24:*")]
-        if not keys: send_message("🧊 لا توجد عملات محظورة حالياً.")
+        if not keys:
+            send_message("🧊 لا توجد عملات محظورة حالياً.")
         else:
             names = [k.split("ban24:")[-1] for k in keys]
             send_message("🧊 العملات المحظورة 24h:\n- " + "\n- ".join(sorted(names)))
         return "ok"
+
     elif t_lower.startswith("الغ حظر"):
         try:
             coin = text.split("الغ حظر", 1)[-1].strip().upper()
@@ -704,14 +748,21 @@ def webhook():
         except Exception:
             send_message("❌ الصيغة: الغ حظر ADA")
         return "ok"
+
     elif "انسى" in t_lower:
         with lock:
-            active_trades.clear(); executed_trades.clear()
-            r.delete("nems:active_trades"); r.delete("nems:executed_trades")
+            active_trades.clear()
+            executed_trades.clear()
+            r.delete("nems:active_trades")
+            r.delete("nems:executed_trades")
             r.set(SINCE_RESET_KEY, time.time())
-        send_message("🧠 تم نسيان كل شيء! بدأنا عد جديد للإحصائيات 🤖"); return "ok"
+        send_message("🧠 تم نسيان كل شيء! بدأنا عد جديد للإحصائيات 🤖")
+        return "ok"
+
     elif "عدد الصفقات" in t_lower or "عدل الصفقات" in t_lower:
-        send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال)."); return "ok"
+        send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال).")
+        return "ok"
+
     return "ok"
 
 # =========================
