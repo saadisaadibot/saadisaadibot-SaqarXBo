@@ -355,26 +355,27 @@ def fetch_orderbook(market: str, depth: int = 1):
 def momentum_guard(market: str, r30=None, r90=None):
     """
     فحص زخم سريع قبل الشراء:
-      - Recent trades (نافذة مرنة)
-      - Orderbook fallback للأزواج الخفيفة
-      - Fastlane عادي
+    - Recent trades (نافذة مرنة)
+    - Orderbook fallback للأزواج الخفيفة
+    - Fastlane عادي + Turbo Fastlane للانفجارات السريعة
     يرجع (ok, why, feats)
-    env:
-      GUARD_TRADES_WINDOW_SEC (default 180)
-      GUARD_TRADES_LIMIT      (default 250)
-      GUARD_MIN_BID_EUR       (default 150.0)
-      GUARD_REQ_IMB           (default 1.05)
-      GUARD_MAX_SPREAD_BP     (default 25.0)
-      GUARD_BOOK_STAB         (default 0.25)
     """
     try:
-        # ===== إعدادات مرنة من البيئة =====
-        win_sec     = int(os.getenv("GUARD_TRADES_WINDOW_SEC", 180))
-        t_limit     = int(os.getenv("GUARD_TRADES_LIMIT", 250))
-        min_bid_eur = float(os.getenv("GUARD_MIN_BID_EUR", 150.0))
-        req_imb     = float(os.getenv("GUARD_REQ_IMB", 1.05))
-        max_sprbp   = float(os.getenv("GUARD_MAX_SPREAD_BP", 25.0))
-        stab_tol    = float(os.getenv("GUARD_BOOK_STAB", 0.25))
+        # ===== إعدادات من env =====
+        win_sec   = int(os.getenv("GUARD_TRADES_WINDOW_SEC", 180))
+        t_limit   = int(os.getenv("GUARD_TRADES_LIMIT", 250))
+        min_bid€  = float(os.getenv("GUARD_MIN_BID_EUR", 150.0))
+        req_imb   = float(os.getenv("GUARD_REQ_IMB", 1.05))
+        max_sprbp = float(os.getenv("GUARD_MAX_SPREAD_BP", 25.0))
+        stab_tol  = float(os.getenv("GUARD_BOOK_STAB", 0.25))
+
+        # Turbo fastlane thresholds (قابلة للتعديل)
+        TURBO_R20S      = int(os.getenv("TURBO_R20S", 25))      # نافذة تغير سريع ~20–30s
+        TURBO_MIN_PCT   = float(os.getenv("TURBO_MIN_PCT", 1.5)) # %↑ خلال TURBO_R20S
+        TURBO_TBR_MIN   = float(os.getenv("TURBO_TBR_MIN", 0.55))
+        TURBO_IMB_MIN   = float(os.getenv("TURBO_IMB_MIN", 1.20))
+        TURBO_SPREAD_BP = float(os.getenv("TURBO_SPREAD_BP", 18.0))
+        TURBO_BID_EUR   = float(os.getenv("TURBO_BID_EUR", 250.0))
 
         # ===== Recent trades =====
         trades = bitvavo_request("GET", f"/trades?market={market}&limit={t_limit}")
@@ -384,97 +385,107 @@ def momentum_guard(market: str, r30=None, r90=None):
         buy_vol = sell_vol = signed_vol = 0.0
         first_px = last_px = None
 
+        # للتحقق السريع (dpct_20s)
+        t_from_turbo = now_ms - TURBO_R20S * 1000
+        first_px_turbo = None
+
         for t in (trades or []):
             ts = int(t.get("timestamp", 0))
-            if ts < t_from:
-                continue
-            px  = float(t.get("price", 0) or 0.0)
-            amt = float(t.get("amount", 0) or 0.0)
+            px  = float((t.get("price") or 0))
+            amt = float((t.get("amount") or 0))
             if px <= 0 or amt <= 0:
                 continue
 
-            side = (t.get("side") or "").lower()
-            if first_px is None:
-                first_px = px
-            last_px = px
+            # نافذة عامة
+            if ts >= t_from:
+                side = (t.get("side") or "").lower()
+                if first_px is None:
+                    first_px = px
+                last_px = px
+                v_eur = px * amt
+                if side == "buy":
+                    buy_vol += v_eur; signed_vol += v_eur
+                elif side == "sell":
+                    sell_vol += v_eur; signed_vol -= v_eur
+                else:
+                    buy_vol += v_eur * 0.5; sell_vol += v_eur * 0.5
 
-            v_eur = px * amt
-            if side == "buy":
-                buy_vol  += v_eur
-                signed_vol += v_eur
-            elif side == "sell":
-                sell_vol += v_eur
-                signed_vol -= v_eur
-            else:
-                # trades بلا side → محايدة
-                buy_vol  += v_eur * 0.5
-                sell_vol += v_eur * 0.5
+            # نافذة التيربو
+            if ts >= t_from_turbo:
+                if first_px_turbo is None:
+                    first_px_turbo = px
 
         total = buy_vol + sell_vol
 
-        # ===== Fallback: orderbook فقط للأزواج الخفيفة =====
+        # ===== Fallback: orderbook فقط =====
         if total <= 0:
             book1 = fetch_orderbook(market, depth=5) or {}
             bids1, asks1 = book1.get("bids") or [], book1.get("asks") or []
             if bids1 and asks1:
                 bid1 = float(bids1[0][0]); ask1 = float(asks1[0][0])
-                mid  = max(1e-12, 0.5 * (bid1 + ask1))
-                spr_bp = (ask1 - bid1) / mid * 10000.0
-
-                bid_notional = sum(float(p) * float(q) for p, q, *_ in bids1[:5])
-                ask_notional = sum(float(p) * float(q) for p, q, *_ in asks1[:5])
+                mid  = max(1e-12, 0.5*(bid1+ask1))
+                spr_bp = (ask1 - bid1)/mid * 10000.0
+                bid_notional = sum(float(p)*float(q) for p,q,*_ in bids1[:5])
+                ask_notional = sum(float(p)*float(q) for p,q,*_ in asks1[:5])
                 imb = bid_notional / max(ask_notional, 1e-9)
 
-                # لقطة ثانية لتقليل spoofing
                 time.sleep(0.20)
                 book2 = fetch_orderbook(market, depth=5) or {}
                 bids2 = book2.get("bids") or []
                 stable = False
                 if bids2:
-                    bid_notional2 = sum(float(p) * float(q) for p, q, *_ in bids2[:5])
-                    if bid_notional > 0 and abs(bid_notional2 - bid_notional) / bid_notional <= stab_tol:
+                    bid_notional2 = sum(float(p)*float(q) for p,q,*_ in bids2[:5])
+                    if bid_notional > 0 and abs(bid_notional2 - bid_notional)/bid_notional <= stab_tol:
                         stable = True
 
-                if (spr_bp <= max_sprbp and imb >= req_imb and
-                        bid_notional >= min_bid_eur and stable):
-                    return True, "book-pass", {
-                        "imb": round(imb, 2),
-                        "spr": round(spr_bp, 1),
-                        "bid€": int(bid_notional)
-                    }
-
+                if (spr_bp <= max_sprbp and imb >= req_imb and bid_notional >= min_bid€ and stable):
+                    return True, "book-pass", {"imb":round(imb,2),"spr":round(spr_bp,1),"bid€":int(bid_notional)}
             return False, "noRecentVol", {}
 
         # ===== عند وجود تداولات حديثة =====
-        tbr = buy_vol / max(total, 1e-12)                    # taker buy ratio
-        cvd = (buy_vol - sell_vol) / max(total, 1e-12)       # cumulative volume delta
-        dpct = (last_px / first_px - 1.0) * 100.0 if first_px else 0.0
-        lam  = abs(dpct) / max(abs(signed_vol), 1e-9)        # fragility
+        tbr = buy_vol / max(total, 1e-12)
+        cvd = (buy_vol - sell_vol) / max(total, 1e-12)
+        dpct = (last_px/first_px - 1.0)*100.0 if first_px else 0.0
+        lam  = abs(dpct) / max(abs(signed_vol), 1e-9)
 
-        # ===== Orderbook =====
+        # Orderbook
         book = fetch_orderbook(market, depth=5) or {}
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
+        bids = book.get("bids") or []; asks = book.get("asks") or []
         if not bids or not asks:
             return False, "noBook", {}
-
         bid1 = float(bids[0][0]); ask1 = float(asks[0][0])
-        mid  = max(1e-12, 0.5 * (bid1 + ask1))
-        spr_bp = (ask1 - bid1) / mid * 10000.0
-        sum_bids = sum(float(p) * float(q) for p, q, *_ in bids[:5])
-        sum_asks = sum(float(p) * float(q) for p, q, *_ in asks[:5])
+        mid  = max(1e-12, 0.5*(bid1+ask1))
+        spr_bp = (ask1 - bid1)/mid * 10000.0
+        sum_bids = sum(float(p)*float(q) for p,q,*_ in bids[:5])
+        sum_asks = sum(float(p)*float(q) for p,q,*_ in asks[:5])
         imb = sum_bids / max(sum_asks, 1e-9)
 
+        # لقيمة دفتر أدنى للتيربو
+        bid_notional_5 = sum_bids
+
+        # تسارع سعري من r30/r90 لو متوفر
         accel = None
         if (r30 is not None) and (r90 is not None):
-            accel = r30 - 0.5 * r90
+            accel = r30 - 0.5*r90
 
-        # ===== Fast-lane =====
+        # ===== TURBO FASTLANE (أجرأ للانفجارات المبكرة) =====
+        dpct_20 = 0.0
+        if first_px_turbo:
+            dpct_20 = (last_px/first_px_turbo - 1.0)*100.0
+        if (dpct_20 >= TURBO_MIN_PCT and tbr >= TURBO_TBR_MIN and
+                imb >= TURBO_IMB_MIN and spr_bp <= TURBO_SPREAD_BP and
+                bid_notional_5 >= TURBO_BID_EUR):
+            return True, "fastlane-turbo", {
+                "r20s": TURBO_R20S, "dpct20": round(dpct_20,2),
+                "tbr": round(tbr,3), "imb": round(imb,2), "spr": round(spr_bp,1)
+            }
+
+        # ===== Fast-lane العادي =====
         if (tbr >= GUARD_TBR_FAST and cvd >= GUARD_CVD_FAST
                 and imb >= GUARD_IMB_FAST and spr_bp <= GUARD_SPREAD_FAST):
             return True, "fastlane", {
-                "tbr": round(tbr, 3), "cvd": round(cvd, 3),
-                "imb": round(imb, 2), "spr": round(spr_bp, 1)
+                "tbr":round(tbr,3),"cvd":round(cvd,3),
+                "imb":round(imb,2),"spr":round(spr_bp,1)
             }
 
         # ===== Score =====
@@ -483,19 +494,18 @@ def momentum_guard(market: str, r30=None, r90=None):
         score += 1 if cvd >= GUARD_CVD_MIN else 0
         score += 1 if imb >= GUARD_IMB_MIN else 0
         score += 1 if spr_bp <= GUARD_SPREAD_MAX else 0
-        if accel is not None and accel >= 0.15:
-            score += 1
-        score += 1 if lam <= 1e-4 else 0  # مضخات هشة جدًا
+        if accel is not None and accel >= 0.15: score += 1
+        score += 1 if lam <= 1e-4 else 0
 
         if spr_bp > 25 or (sell_vol > buy_vol and tbr < 0.45):
-            return False, "killswitch", {"tbr": round(tbr, 3), "spr": round(spr_bp, 1)}
+            return False, "killswitch", {"tbr":round(tbr,3), "spr":round(spr_bp,1)}
 
         return (score >= GUARD_SCORE_NEED), f"score={score}", {
-            "tbr": round(tbr, 3), "cvd": round(cvd, 3),
-            "imb": round(imb, 2), "spr": round(spr_bp, 1),
-            "accel": None if accel is None else round(accel, 2)
+            "tbr":round(tbr,3),"cvd":round(cvd,3),
+            "imb":round(imb,2),"spr":round(spr_bp,1),
+            "accel": None if accel is None else round(accel,2),
+            "dpct20": round(dpct_20,2)
         }
-
     except Exception as e:
         return False, f"err:{e}", {}
 # =========================
