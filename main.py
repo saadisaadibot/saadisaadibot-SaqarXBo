@@ -357,21 +357,21 @@ def momentum_guard(market: str, r30=None, r90=None):
     فحص زخم سريع قبل الشراء:
     - Recent trades (نافذة مرنة)
     - Orderbook fallback للأزواج الخفيفة
-    - Fastlane عادي + Turbo Fastlane للانفجارات السريعة
+    - Fastlane عادي + Turbo Fastlane
     يرجع (ok, why, feats)
     """
     try:
         # ===== إعدادات من env =====
-        win_sec   = int(os.getenv("GUARD_TRADES_WINDOW_SEC", 180))
-        t_limit   = int(os.getenv("GUARD_TRADES_LIMIT", 250))
-        min_bid€  = float(os.getenv("GUARD_MIN_BID_EUR", 150.0))
-        req_imb   = float(os.getenv("GUARD_REQ_IMB", 1.05))
-        max_sprbp = float(os.getenv("GUARD_MAX_SPREAD_BP", 25.0))
-        stab_tol  = float(os.getenv("GUARD_BOOK_STAB", 0.25))
+        win_sec     = int(os.getenv("GUARD_TRADES_WINDOW_SEC", 180))
+        t_limit     = int(os.getenv("GUARD_TRADES_LIMIT", 250))
+        min_bid_eur = float(os.getenv("GUARD_MIN_BID_EUR", 150.0))
+        req_imb     = float(os.getenv("GUARD_REQ_IMB", 1.05))
+        max_sprbp   = float(os.getenv("GUARD_MAX_SPREAD_BP", 25.0))
+        stab_tol    = float(os.getenv("GUARD_BOOK_STAB", 0.25))
 
-        # Turbo fastlane thresholds (قابلة للتعديل)
-        TURBO_R20S      = int(os.getenv("TURBO_R20S", 25))      # نافذة تغير سريع ~20–30s
-        TURBO_MIN_PCT   = float(os.getenv("TURBO_MIN_PCT", 1.5)) # %↑ خلال TURBO_R20S
+        # Turbo fastlane thresholds
+        TURBO_R20S      = int(os.getenv("TURBO_R20S", 25))       # ~20–30s
+        TURBO_MIN_PCT   = float(os.getenv("TURBO_MIN_PCT", 1.5)) # % خلال نافذة التيربو
         TURBO_TBR_MIN   = float(os.getenv("TURBO_TBR_MIN", 0.55))
         TURBO_IMB_MIN   = float(os.getenv("TURBO_IMB_MIN", 1.20))
         TURBO_SPREAD_BP = float(os.getenv("TURBO_SPREAD_BP", 18.0))
@@ -390,13 +390,12 @@ def momentum_guard(market: str, r30=None, r90=None):
         first_px_turbo = None
 
         for t in (trades or []):
-            ts = int(t.get("timestamp", 0))
-            px  = float((t.get("price") or 0))
-            amt = float((t.get("amount") or 0))
+            ts  = int(t.get("timestamp", 0))
+            px  = float(t.get("price") or 0)
+            amt = float(t.get("amount") or 0)
             if px <= 0 or amt <= 0:
                 continue
 
-            # نافذة عامة
             if ts >= t_from:
                 side = (t.get("side") or "").lower()
                 if first_px is None:
@@ -410,10 +409,8 @@ def momentum_guard(market: str, r30=None, r90=None):
                 else:
                     buy_vol += v_eur * 0.5; sell_vol += v_eur * 0.5
 
-            # نافذة التيربو
-            if ts >= t_from_turbo:
-                if first_px_turbo is None:
-                    first_px_turbo = px
+            if ts >= t_from_turbo and first_px_turbo is None:
+                first_px_turbo = px
 
         total = buy_vol + sell_vol
 
@@ -423,7 +420,7 @@ def momentum_guard(market: str, r30=None, r90=None):
             bids1, asks1 = book1.get("bids") or [], book1.get("asks") or []
             if bids1 and asks1:
                 bid1 = float(bids1[0][0]); ask1 = float(asks1[0][0])
-                mid  = max(1e-12, 0.5*(bid1+ask1))
+                mid = max(1e-12, 0.5*(bid1+ask1))
                 spr_bp = (ask1 - bid1)/mid * 10000.0
                 bid_notional = sum(float(p)*float(q) for p,q,*_ in bids1[:5])
                 ask_notional = sum(float(p)*float(q) for p,q,*_ in asks1[:5])
@@ -438,13 +435,14 @@ def momentum_guard(market: str, r30=None, r90=None):
                     if bid_notional > 0 and abs(bid_notional2 - bid_notional)/bid_notional <= stab_tol:
                         stable = True
 
-                if (spr_bp <= max_sprbp and imb >= req_imb and bid_notional >= min_bid€ and stable):
-                    return True, "book-pass", {"imb":round(imb,2),"spr":round(spr_bp,1),"bid€":int(bid_notional)}
+                if (spr_bp <= max_sprbp and imb >= req_imb and
+                        bid_notional >= min_bid_eur and stable):
+                    return True, "book-pass", {"imb":round(imb,2),"spr":round(spr_bp,1),"bidEur":int(bid_notional)}
             return False, "noRecentVol", {}
 
         # ===== عند وجود تداولات حديثة =====
-        tbr = buy_vol / max(total, 1e-12)
-        cvd = (buy_vol - sell_vol) / max(total, 1e-12)
+        tbr  = buy_vol / max(total, 1e-12)
+        cvd  = (buy_vol - sell_vol) / max(total, 1e-12)
         dpct = (last_px/first_px - 1.0)*100.0 if first_px else 0.0
         lam  = abs(dpct) / max(abs(signed_vol), 1e-9)
 
@@ -454,21 +452,19 @@ def momentum_guard(market: str, r30=None, r90=None):
         if not bids or not asks:
             return False, "noBook", {}
         bid1 = float(bids[0][0]); ask1 = float(asks[0][0])
-        mid  = max(1e-12, 0.5*(bid1+ask1))
+        mid = max(1e-12, 0.5*(bid1+ask1))
         spr_bp = (ask1 - bid1)/mid * 10000.0
         sum_bids = sum(float(p)*float(q) for p,q,*_ in bids[:5])
         sum_asks = sum(float(p)*float(q) for p,q,*_ in asks[:5])
         imb = sum_bids / max(sum_asks, 1e-9)
 
-        # لقيمة دفتر أدنى للتيربو
         bid_notional_5 = sum_bids
 
-        # تسارع سعري من r30/r90 لو متوفر
         accel = None
         if (r30 is not None) and (r90 is not None):
             accel = r30 - 0.5*r90
 
-        # ===== TURBO FASTLANE (أجرأ للانفجارات المبكرة) =====
+        # ===== TURBO FASTLANE =====
         dpct_20 = 0.0
         if first_px_turbo:
             dpct_20 = (last_px/first_px_turbo - 1.0)*100.0
