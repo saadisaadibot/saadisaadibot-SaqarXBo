@@ -938,8 +938,8 @@ def webhook():
         if not keys:
             send_message("🧊 لا توجد عملات محظورة حالياً.")
         else:
-            names = [k.split("ban24:")[-1] for k in keys]
-            send_message("🧊 العملات المحظورة 24h:\n- " + "\n- ".join(sorted(names)))
+            names = sorted(k.split("ban24:")[-1] for k in keys)
+            send_message("🧊 العملات المحظورة 24h:\n- " + "\n- ".join(names))
         return "ok"
 
     elif t_lower.startswith("الغ حظر"):
