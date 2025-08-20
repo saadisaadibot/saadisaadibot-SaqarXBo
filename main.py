@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import os
 import time
+import math
 import requests
 import json
 import redis
@@ -40,7 +41,7 @@ EARLY_WINDOW_SEC = 15 * 60
 BLACKLIST_EXPIRE_SECONDS = 300  # 5 دقائق
 BUY_COOLDOWN_SEC = 600          # 10 دقائق
 
-# ===== إضافات حماية سريعة وربح ذكي (لا تمس البيع/الشراء) =====
+# ===== إضافات حماية سريعة وربح ذكي =====
 GRACE_SEC         = 45           # يصبر أول 45s (ما يبيع إلا عند كراش)
 EARLY_CRASH_SL    = -3.2         # SL خاص خلال الـ grace
 FAST_DROP_WINDOW  = 20           # ثواني
@@ -60,6 +61,15 @@ PEAK_TRIGGER      = 10.0         # تفعيل القفل الذكي عندما �
 # زخم سلبي قوي يسرّع الخروج
 FAST_DROP_R30     = -1.2         # r30 ≤ -1.2%
 FAST_DROP_R90     = -3.0         # r90 ≤ -3.0%
+
+# ===== حدود إيقاف نزيف =====
+DAILY_STOP_EUR     = -5.0        # حدّ المحصلة المحققة اليوم
+CONSEC_LOSS_BAN    = 2           # حظر العملة عند خسارتين متتاليتين/24h
+
+# ===== حارس دفتر الأوامر (فلتر دخول) =====
+OB_MIN_BID_EUR   = 1500.0        # سيولة على أفضل Bid
+OB_REQ_IMB       = 1.8           # تفوق bids/asks
+OB_MAX_SPREAD_BP = 18.0          # أقصى سبريد 0.18%
 
 # =========================
 # 🧠 التهيئة العامة
@@ -178,6 +188,49 @@ def ensure_symbols_fresh():
         print("refresh symbols error:", e)
 
 # =========================
+# 🧾 دفتر أوامر + فلتر
+# =========================
+def fetch_orderbook(market: str, depth: int = 1):
+    try:
+        url = f"https://api.bitvavo.com/v2/book?market={market}&depth={depth}"
+        resp = requests.get(url, timeout=6)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+def orderbook_guard(market: str,
+                    min_bid_eur: float = OB_MIN_BID_EUR,
+                    req_imb: float = OB_REQ_IMB,
+                    max_spread_bp: float = OB_MAX_SPREAD_BP):
+    """
+    يرجّع (ok, why, feats) لفحص سريع قبل الدخول/الإشعار.
+    feats: dict يحتوي سبريد، أحجام، الخ..
+    """
+    ob = fetch_orderbook(market)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return False, "no_orderbook", {}
+    try:
+        bid_p, bid_q = float(ob["bids"][0][0]), float(ob["bids"][0][1])
+        ask_p, ask_q = float(ob["asks"][0][0]), float(ob["asks"][0][1])
+    except Exception:
+        return False, "bad_book", {}
+
+    spread_bp = (ask_p - bid_p) / ((ask_p + bid_p)/2.0) * 10000.0
+    bid_eur   = bid_p * bid_q
+    imb       = (bid_q / max(1e-9, ask_q))
+
+    if bid_eur < min_bid_eur:
+        return False, f"low_liquidity:{bid_eur:.0f}", {"spread_bp":spread_bp,"bid_eur":bid_eur,"imb":imb}
+    if spread_bp > max_spread_bp:
+        return False, f"wide_spread:{spread_bp:.1f}bp", {"spread_bp":spread_bp,"bid_eur":bid_eur,"imb":imb}
+    if imb < req_imb:
+        return False, f"weak_bid_imb:{imb:.2f}", {"spread_bp":spread_bp,"bid_eur":bid_eur,"imb":imb}
+
+    return True, "ok", {"spread_bp":spread_bp,"bid_eur":bid_eur,"imb":imb}
+
+# =========================
 # 🧮 تجميع fills باليورو
 # =========================
 def totals_from_fills_eur(fills):
@@ -194,7 +247,7 @@ def totals_from_fills_eur(fills):
     return total_base, total_eur, fee_eur
 
 # =========================
-# 💱 البيع (مع إعادة المحاولة) — لم يتم تعديلها
+# 💱 البيع (مع إعادة المحاولة) — صيغة البيع كما طلبت
 # =========================
 def place_market_sell(market, amt):
     body = {
@@ -206,6 +259,23 @@ def place_market_sell(market, amt):
         "operatorId": ""
     }
     return bitvavo_request("POST", "/order", body)
+
+def _today_key():
+    # حسب توقيت UTC لتبسيط التخزين
+    return time.strftime("pnl:%Y%m%d", time.gmtime())
+
+def _accum_realized(pnl):
+    try:
+        r.incrbyfloat(_today_key(), float(pnl))
+        r.expire(_today_key(), 3*24*3600)
+    except Exception:
+        pass
+
+def _today_pnl():
+    try:
+        return float(r.get(_today_key()) or 0.0)
+    except Exception:
+        return 0.0
 
 def sell_trade(trade: dict):
     market = trade["symbol"]
@@ -254,6 +324,8 @@ def sell_trade(trade: dict):
             trade["amount"]   = remaining_amt
             trade["cost_eur"] = remaining_cost
 
+        _accum_realized(pnl_eur)
+
         send_message(f"💰 بيع جزئي {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
         closed = trade.copy()
@@ -277,14 +349,25 @@ def sell_trade(trade: dict):
     # بيع كامل
     pnl_eur = proceeds_eur - orig_cost
     pnl_pct = (proceeds_eur / orig_cost - 1.0) * 100.0
+    _accum_realized(pnl_eur)
     send_message(f"💰 بيع {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
     # حظر 24سا عند خسارة كبيرة
     try:
+        base = market.replace("-EUR", "")
         if pnl_pct <= -3.0:
-            base = market.replace("-EUR", "")
             r.setex(f"ban24:{base}", 24*3600, 1)
             send_message(f"🧊 تم حظر {base} لمدة 24 ساعة (خسارة {pnl_pct:.2f}%).")
+        # خسارتين متتاليتين لنفس العملة → حظر 24h
+        if pnl_eur < 0:
+            k = f"lossstreak:{base}"
+            streak = int(r.incr(k))
+            r.expire(k, 24*3600)
+            if streak >= CONSEC_LOSS_BAN:
+                r.setex(f"ban24:{base}", 24*3600, 1)
+                send_message(f"🧊 حظر {base} 24h (خسارتين متتاليتين).")
+        else:
+            r.delete(f"lossstreak:{base}")
     except Exception:
         pass
 
@@ -314,7 +397,7 @@ def sell_trade(trade: dict):
     r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
 
 # =========================
-# 🛒 الشراء (1/2 الرصيد ثم الباقي) — لم يتم تعديلها
+# 🛒 الشراء (1/2 الرصيد ثم الباقي)
 # =========================
 def buy(symbol: str):
     ensure_symbols_fresh()
@@ -323,8 +406,13 @@ def buy(symbol: str):
         send_message(f"❌ العملة {symbol} غير مدعومة على Bitvavo.")
         return
 
+    # حدّ خسارة يومي
+    if _today_pnl() <= DAILY_STOP_EUR:
+        send_message("⛔ تم إيقاف الشراء لباقي اليوم (تجاوز حد الخسارة اليومي).")
+        return
+
     if r.exists(f"ban24:{symbol}"):
-        send_message(f"🧊 {symbol} محظورة 24 ساعة بسبب خسارة سابقة. تجاهلت الإشارة.")
+        send_message(f"🧊 {symbol} محظورة 24 ساعة بسبب خسارة سابقة/متتالية. تجاهلت الإشارة.")
         return
 
     if r.exists(f"cooldown:{symbol}"):
@@ -342,6 +430,13 @@ def buy(symbol: str):
             return
 
     if r.exists(f"blacklist:buy:{symbol}"):
+        return
+
+    # فلتر دفتر الأوامر
+    ok, why, feats = orderbook_guard(market)
+    if not ok:
+        send_message(f"⛔ رفض الشراء {symbol} ({why}). سبريد/سيولة غير مناسبة.")
+        r.setex(f"cooldown:{symbol}", 180, 1)  # تهدئة قصيرة
         return
 
     eur_avail = get_eur_available()
@@ -411,7 +506,10 @@ def buy(symbol: str):
         r.rpush("nems:executed_trades", json.dumps(trade))
 
     slot_idx = len(active_trades)
-    send_message(f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | كمية: {amount_net:.5f}")
+    send_message(
+        f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | "
+        f"SL مبكر مفعّل | سيولة مقبولة (spread≤{OB_MAX_SPREAD_BP}bp)"
+    )
 
 # =========================
 # 📈 تاريخ لحظي + مؤشرات زخم
@@ -502,6 +600,14 @@ def monitor_loop():
                 dyn_sl_base = DYN_SL_START + inc * DYN_SL_STEP
                 trade["sl_dyn"] = max(trade.get("sl_dyn", DYN_SL_START), dyn_sl_base)
 
+                # ===== قفل ربحي مبكّر متدرّج (جديد) =====
+                if pnl_pct >= 3.0:
+                    trade["sl_dyn"] = max(trade["sl_dyn"], 1.6)
+                elif pnl_pct >= 2.0:
+                    trade["sl_dyn"] = max(trade["sl_dyn"], 0.8)
+                elif pnl_pct >= 1.2:
+                    trade["sl_dyn"] = max(trade["sl_dyn"], 0.1)
+
                 age = now - trade.get("opened_at", now)
                 if "grace_until" not in trade:
                     trade["grace_until"] = trade.get("opened_at", now) + GRACE_SEC
@@ -511,16 +617,15 @@ def monitor_loop():
                 # ===== Trailing من القمة دائماً (يحافظ على أعلى نسبة) =====
                 peak = trade.get("peak_pct", 0.0)
                 if peak >= PEAK_TRIGGER:
-                    giveback = _peak_giveback(peak)            # مثلاً عند 18% ⇒ 4.5% (مقيدة بـ6%)
-                    min_lock = peak - giveback                  # لا نسمح يرجع أكثر من giveback
+                    giveback = _peak_giveback(peak)
+                    min_lock = peak - giveback
                     if min_lock > trade["sl_dyn"]:
+                        prev = trade["sl_dyn"]
                         trade["sl_dyn"] = min_lock
-                        # إشعار مرة واحدة عند قفزة كبيرة بالقفل
-                        if not trade.get("boost_lock_notified"):
+                        if (not trade.get("boost_lock_notified")) and (trade["sl_dyn"] - prev >= 0.4):
                             send_message(f"🔒 تعزيز SL {market}: {trade['sl_dyn']:.2f}% (قمة {peak:.2f}%)")
                             trade["boost_lock_notified"] = True
 
-                    # خروج سريع إذا رجع عن القمّة أكثر من المسموح والزخم سيء
                     drop_from_peak = peak - pnl_pct
                     if drop_from_peak >= giveback and (r30 <= -0.40 or r90 <= 0.0):
                         trade["exit_in_progress"] = True; trade["last_exit_try"] = now
@@ -530,7 +635,6 @@ def monitor_loop():
 
                 # ===== المرحلة المبكرة =====
                 if age < EARLY_WINDOW_SEC:
-                    # داخل المهلة: فقط كراش
                     if now < trade["grace_until"]:
                         crash_fast, d20 = _fast_drop_detect(trade, now, current)
                         if pnl_pct <= EARLY_CRASH_SL or (crash_fast and pnl_pct < -1.5):
@@ -539,7 +643,6 @@ def monitor_loop():
                             sell_trade(trade); trade["exit_in_progress"] = False
                         continue
 
-                    # حماية ربح صغير من الانقلاب السريع
                     crash_fast, d20 = _fast_drop_detect(trade, now, current)
                     if MICRO_PROFIT_MIN <= pnl_pct <= MICRO_PROFIT_MAX and (crash_fast and d20 <= -MICRO_FAST_DROP or r30 <= -0.7):
                         trade["exit_in_progress"] = True; trade["last_exit_try"] = now
@@ -547,7 +650,6 @@ def monitor_loop():
                         sell_trade(trade); trade["exit_in_progress"] = False
                         continue
 
-                    # تأكيد كسر SL المبكر (retouch)
                     if pnl_pct <= trade["sl_dyn"]:
                         prev = trade.get("sl_breach_at", 0.0)
                         if prev and (now - prev) >= 2.0:
@@ -566,7 +668,6 @@ def monitor_loop():
                 if trade.get("exit_in_progress") and (now - trade.get("last_exit_try", 0)) < 15:
                     continue
 
-                # قفل ربح متدرّج أساسي (المنطق القديم)
                 peak = trade.get("peak_pct", 0.0)
                 lock_from_peak = peak - LATE_LOCK_BACKSTEP
                 desired_lock = max(lock_from_peak, LATE_MIN_LOCK)
@@ -584,7 +685,7 @@ def monitor_loop():
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # خروج: انعكاس زخم بعد قمة (المنطق القديم)
+                # خروج: انعكاس زخم بعد قمة
                 drop_from_peak = trade["peak_pct"] - pnl_pct
                 if trade["peak_pct"] >= 1.0 and drop_from_peak >= DROP_FROM_PEAK_EXIT and r30 <= -0.15 and r90 <= 0.0:
                     trade["exit_in_progress"] = True; trade["last_exit_try"] = now
@@ -601,7 +702,7 @@ def monitor_loop():
                     sell_trade(trade); trade["exit_in_progress"] = False
                     continue
 
-                # قراءة دفتر الطلبات (اختياري)
+                # قراءة دفتر الطلبات (اختياري – إبقيناها)
                 try:
                     ob = fetch_orderbook(market)
                     if ob:
@@ -734,6 +835,7 @@ def build_summary():
         if active_copy:
             lines.append(f"• أرباح/خسائر عائمة حاليًا: {floating_pnl_eur:+.2f}€")
         lines.append(f"• الرسوم المدفوعة: {total_fees:.2f}€ (شراء: {buy_fees:.2f}€ / بيع: {sell_fees:.2f}€)")
+        lines.append(f"\n⛔ حد اليوم: {_today_pnl():+.2f}€ / {DAILY_STOP_EUR:+.2f}€")
     else:
         lines.append("\n📊 لا توجد صفقات سابقة.")
 
@@ -831,7 +933,7 @@ def webhook():
         send_message("✅ تم تفعيل الشراء.")
         return "ok"
 
-    elif "قائمة الحظر" in t_lower:
+    elif "قائمة الحظر" في t_lower if False else "قائمة الحظر" in t_lower:
         keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("ban24:*")]
         if not keys:
             send_message("🧊 لا توجد عملات محظورة حالياً.")
