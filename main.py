@@ -192,10 +192,13 @@ def ensure_symbols_fresh():
 # =========================
 def fetch_orderbook(market: str, depth: int = 1):
     try:
-        url = f"https://api.bitvavo.com/v2/book?market={market}&depth={depth}"
+        url = f"https://api.bitvavo.com/v2/{market}/book"  # <-- هذا هو الصحيح
         resp = requests.get(url, timeout=6)
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            # لازم يحتوي قوائم bids/asks
+            if data and data.get("bids") and data.get("asks"):
+                return data
     except Exception:
         pass
     return None
