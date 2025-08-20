@@ -933,7 +933,7 @@ def webhook():
         send_message("✅ تم تفعيل الشراء.")
         return "ok"
 
-    elif "قائمة الحظر" في t_lower if False else "قائمة الحظر" in t_lower:
+    elif "قائمة الحظر" in t_lower:
         keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("ban24:*")]
         if not keys:
             send_message("🧊 لا توجد عملات محظورة حالياً.")
