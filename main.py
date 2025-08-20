@@ -438,7 +438,8 @@ def buy(symbol: str):
     # فلتر دفتر الأوامر
     ok, why, feats = orderbook_guard(market)
     if not ok:
-        send_message(f"⛔ رفض الشراء {symbol} ({why}). سبريد/سيولة غير مناسبة.")
+        send_message(f"⛔ رفض الشراء {symbol} ({why}). "
+             f"spread={feats.get('spread_bp',0):.1f}bp | bid€={feats.get('bid_eur',0):.0f} | imb={feats.get('imb',0):.2f}")
         r.setex(f"cooldown:{symbol}", 180, 1)  # تهدئة قصيرة
         return
 
