@@ -793,14 +793,9 @@ def build_summary():
                     state = "⏳ مراقبة/تريلينغ"
 
             emoji = "✅" if pnl_pct >= 0 else "❌"
-
             lines.append(f"{i}. {symbol}: €{entry:.6f} → €{current:.6f} {emoji} {pnl_pct:+.2f}% | منذ {age_min}د")
-            lines.append(
-                f"   • كمية: {amount:.5f} | أعلى: {peak_pct:.2f}% | SL: {dyn_sl:.2f}% | من آخر قمة: {since_last_hi}s"
-            )
-            lines.append(
-                f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | {lock_hint} | حالة: {state}"
-            )
+            lines.append(f"   • كمية: {amount:.5f} | أعلى: {peak_pct:.2f}% | SL: {dyn_sl:.2f}% | من آخر قمة: {since_last_hi}s")
+            lines.append(f"   • زخم: r30 {r30:+.2f}% / r90 {r90:+.2f}% | {lock_hint} | حالة: {state}")
 
         floating_pnl_eur = total_value - total_cost
         floating_pnl_pct = ((total_value / total_cost) - 1.0) * 100 if total_cost > 0 else 0.0
@@ -808,39 +803,93 @@ def build_summary():
     else:
         lines.append("📌 لا توجد صفقات نشطة.")
 
-    # ===== صفقات منفذة/رسوم منذ آخر «انسى» =====
-    realized_pnl = 0.0
+    # ===== صفقات مكتملة بعد «انسى» — تحليل كامل + سرد كامل =====
+    realized_pnl_eur = 0.0
+    realized_pnl_pct_sum = 0.0
+    realized_count = 0
+    wins = 0
+    losses = 0
     buy_fees = 0.0
     sell_fees = 0.0
-    shown = 0
+    best_trade = None  # (pnl_eur, pnl_pct, sym)
+    worst_trade = None
+    max_win_streak = 0
+    max_loss_streak = 0
+    cur_win_streak = 0
+    cur_loss_streak = 0
 
-    if exec_copy:
-        raw = r.get(SINCE_RESET_KEY)
-        since_ts = float(raw.decode() if isinstance(raw, (bytes, bytearray)) else (raw or 0))
+    since_ts = 0.0
+    raw = r.get(SINCE_RESET_KEY)
+    if raw:
+        since_ts = float(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
 
-        lines.append("\n📊 آخر صفقات منفذة:")
-        for t in reversed(exec_copy):
-            if "pnl_eur" in t and "exit_time" in t:
-                if float(t["exit_time"]) >= since_ts:
-                    realized_pnl += float(t["pnl_eur"])
-                    buy_fees  += float(t.get("buy_fee_eur", 0))
-                    sell_fees += float(t.get("sell_fee_eur", 0))
-                sign = "✅" if float(t["pnl_eur"]) >= 0 else "❌"
-                sym = t["symbol"].replace("-EUR","")
-                lines.append(f"- {sym}: {sign} {float(t['pnl_eur']):+.2f}€ ({float(t['pnl_pct']):+.2f}%)")
-                shown += 1
-                if shown >= 5:
-                    break
+    # نمرّ من الأقدم للأحدث لحساب السلاسل (streaks) صح
+    closed_since = []
+    for t in exec_copy:
+        if "pnl_eur" in t and "exit_time" in t and float(t["exit_time"]) >= since_ts:
+            closed_since.append(t)
 
-        total_fees = buy_fees + sell_fees
-        lines.append(f"\n🧮 منذ آخر انسى:")
-        lines.append(f"• أرباح/خسائر محققة: {realized_pnl:+.2f}€")
-        if active_copy:
-            lines.append(f"• أرباح/خسائر عائمة حاليًا: {floating_pnl_eur:+.2f}€")
-        lines.append(f"• الرسوم المدفوعة: {total_fees:.2f}€ (شراء: {buy_fees:.2f}€ / بيع: {sell_fees:.2f}€)")
-        lines.append(f"\n⛔ حد اليوم: {_today_pnl():+.2f}€ / {DAILY_STOP_EUR:+.2f}€")
+    closed_since.sort(key=lambda x: float(x["exit_time"]))  # من الأقدم للأحدث
+
+    for t in closed_since:
+        pnl_eur = float(t["pnl_eur"])
+        pnl_pct = float(t.get("pnl_pct", 0.0))
+        sym = t["symbol"].replace("-EUR","")
+        buy_fees += float(t.get("buy_fee_eur", 0))
+        sell_fees += float(t.get("sell_fee_eur", 0))
+
+        realized_pnl_eur += pnl_eur
+        realized_pnl_pct_sum += pnl_pct
+        realized_count += 1
+
+        # streaks
+        if pnl_eur >= 0:
+            wins += 1
+            cur_win_streak += 1
+            max_win_streak = max(max_win_streak, cur_win_streak)
+            cur_loss_streak = 0
+        else:
+            losses += 1
+            cur_loss_streak += 1
+            max_loss_streak = max(max_loss_streak, cur_loss_streak)
+            cur_win_streak = 0
+
+        # best / worst
+        if best_trade is None or pnl_eur > best_trade[0]:
+            best_trade = (pnl_eur, pnl_pct, sym)
+        if worst_trade is None or pnl_eur < worst_trade[0]:
+            worst_trade = (pnl_eur, pnl_pct, sym)
+
+    total_fees = buy_fees + sell_fees
+    win_rate = (wins / realized_count * 100.0) if realized_count else 0.0
+    avg_pnl_eur = (realized_pnl_eur / realized_count) if realized_count else 0.0
+    avg_pnl_pct = (realized_pnl_pct_sum / realized_count) if realized_count else 0.0
+
+    lines.append("\n📊 الصفقات المكتملة منذ آخر «انسى»:")
+    if realized_count == 0:
+        lines.append("• لا توجد صفقات مكتملة بعد آخر «انسى».")
     else:
-        lines.append("\n📊 لا توجد صفقات سابقة.")
+        lines.append(f"• العدد: {realized_count} | ربح/خسارة محققة: {realized_pnl_eur:+.2f}€ | متوسط/صفقة: {avg_pnl_eur:+.2f}€ ({avg_pnl_pct:+.2f}%)")
+        lines.append(f"• فوز/خسارة: {wins}/{losses} | نسبة الفوز: {win_rate:.1f}%")
+        if best_trade:
+            lines.append(f"• أفضل صفقة: {best_trade[2]} → {best_trade[0]:+.2f}€ ({best_trade[1]:+.2f}%)")
+        if worst_trade:
+            lines.append(f"• أسوأ صفقة: {worst_trade[2]} → {worst_trade[0]:+.2f}€ ({worst_trade[1]:+.2f}%)")
+        lines.append(f"• سلاسل: أطول رابحة = {max_win_streak} | أطول خاسرة = {max_loss_streak}")
+        lines.append(f"• الرسوم: المجموع {total_fees:.2f}€ (شراء: {buy_fees:.2f}€ / بيع: {sell_fees:.2f}€)")
+        lines.append("\n🧾 كل الصفقات (من الأحدث للأقدم):")
+
+        # نسرد من الأحدث للأقدم لقراءة أسهل
+        for t in sorted(closed_since, key=lambda x: float(x["exit_time"]), reverse=True):
+            sym = t["symbol"].replace("-EUR","")
+            pnl_eur = float(t["pnl_eur"])
+            pnl_pct = float(t.get("pnl_pct", 0.0))
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(t["exit_time"])))
+            mark = "✅" if pnl_eur >= 0 else "❌"
+            lines.append(f"- {ts} | {sym}: {mark} {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
+
+    # حد اليوم (مباشر من التخزين)
+    lines.append(f"\n⛔ حد اليوم: {_today_pnl():+.2f}€ / {DAILY_STOP_EUR:+.2f}€")
 
     return "\n".join(lines)
 
@@ -878,7 +927,7 @@ def webhook():
         return "ok"
 
     elif "الملخص" in t_lower:
-        send_message(build_summary())
+        send_text_chunks(build_summary())
         return "ok"
 
     elif "الرصيد" in t_lower:
