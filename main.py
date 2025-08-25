@@ -53,8 +53,8 @@ MICRO_PROFIT_MAX  = 1.3
 MICRO_FAST_DROP   = 1.1
 
 # Trailing من القمة
-GIVEBACK_RATIO    = 0.30       # يسمح بإرجاع أكبر ليمسك +6%+
-GIVEBACK_MIN      = 3.5
+GIVEBACK_RATIO    = 0.32       # يسمح بإرجاع أكبر ليمسك +6%+
+GIVEBACK_MIN      = 3.8
 GIVEBACK_MAX      = 7.0
 PEAK_TRIGGER      = 8.5        # فعّل مبكرًا
 
