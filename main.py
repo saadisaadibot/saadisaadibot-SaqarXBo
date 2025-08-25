@@ -647,7 +647,7 @@ def monitor_loop():
                         continue
 
                     crash_fast, d20 = _fast_drop_detect(trade, now, current)
-                    if MICRO_PROFIT_MIN <= pnl_pct <= MICRO_PROFIT_MAX and (crash_fast and d20 <= -MICRO_FAST_DROP or r30 <= -0.7):
+                    if MICRO_PROFIT_MIN <= pnl_pct <= MICRO_PROFIT_MAX and crash_fast and d20 <= -MICRO_FAST_DROP and r30 <= -0.7:
                         trade["exit_in_progress"] = True; trade["last_exit_try"] = now
                         send_message(f"🔔 خروج {market} (حماية ربح صغير {pnl_pct:.2f}% | d{FAST_DROP_WINDOW}s={d20:.2f}%)")
                         sell_trade(trade); trade["exit_in_progress"] = False
