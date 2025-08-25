@@ -893,6 +893,20 @@ def build_summary():
 
     return "\n".join(lines)
 
+def send_text_chunks(text: str, chunk_size: int = 3800):
+    """
+    يقسم النص الطويل إلى أجزاء ويرسلها تباعًا لتفادي حد 4096 حرف لدى تيليغرام.
+    نترك هامشًا بسيطًا للعناوين والإيموجيز.
+    """
+    if not text:
+        return
+    i = 0
+    n = len(text)
+    while i < n:
+        part = text[i:i+chunk_size]
+        send_message(part)
+        i += chunk_size
+
 # =========================
 # 🤖 Webhook
 # =========================
