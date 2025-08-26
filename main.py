@@ -523,20 +523,21 @@ def buy(symbol: str):
     if r.exists(f"blacklist:buy:{symbol}"):
         return
 
-    # فلتر دفتر الأوامر المتكيّف
-    price_now = fetch_price_ws_first(market) or 0.0
-    if price_now < 0.02:
-        min_bid = max(20.0, price_now * 5000)
-        max_spread = 200.0
-        req_imb = 0.3
-    elif price_now < 0.2:
-        min_bid = max(50.0, price_now * 2000)
-        max_spread = 120.0
-        req_imb = 0.5
-    else:
-        min_bid = max(100.0, price_now * 500)
-        max_spread = 60.0
-        req_imb = 0.6
+    # فلتر دفتر الأوامر المتكيّف# ===== فلتر دفتر الأوامر المتكيّف (نسخة أخف) =====
+    price_now = fetch_price(market) or 0.0
+
+    if price_now < 0.02:                         # micro
+        min_bid   = max(30.0, price_now * 3000)  # كان 5000
+        max_spread = 350.0                        # كان 200bp
+        req_imb    = 0.25                         # كان 0.30
+    elif price_now < 0.2:                         # متوسطة
+        min_bid   = max(60.0, price_now * 1200)  # كان 2000
+        max_spread = 90.0                         # كان 120bp
+        req_imb    = 0.40                         # كان 0.50
+    else:                                         # مرتفعة
+        min_bid   = max(150.0, price_now * 120)   # كان *500 (متشدد)
+        max_spread = 100.0                        # كان 60bp
+        req_imb    = 0.35                         # كان 0.60
 
     ok, why, feats = orderbook_guard(
         market,
