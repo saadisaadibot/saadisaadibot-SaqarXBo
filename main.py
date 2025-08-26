@@ -1094,53 +1094,61 @@ def webhook():
         send_text_chunks(build_summary())
         return "ok"
 
-    # الرصيد
-    if _contains_any(t_lower, ["الرصيد", "رصيد", "balance"]):
-        balances = bitvavo_request("GET", "/balance")
-        eur = sum(
-            float(b.get("available", 0)) + float(b.get("inOrder", 0))
-            for b in balances if b.get("symbol") == "EUR"
-        )
-        total = eur
-        winners, losers = [], []
-
-        with lock:
-            exec_copy = list(executed_trades)
-
-        for b in balances:
-            sym = b.get("symbol")
-            if sym == "EUR":
-                continue
-            qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
-            if qty < 0.0001:
-                continue
-            pair = f"{sym}-EUR"
-            price = fetch_price_ws_first(pair)
-            if not price:
-                continue
-            value = qty * price
-            total += value
-
-            entry = None
-            for t in reversed(exec_copy):
-                if t["symbol"] == pair:
-                    entry = t.get("entry")
-                    break
-
-            if entry:
-                pnl = ((price - entry) / entry) * 100
-                line = f"{sym}: {qty:.4f} @ €{price:.4f} → {pnl:+.2f}%"
-                (winners if pnl >= 0 else losers).append(line)
-
-        lines = [f"💰 الرصيد الكلي: €{total:.2f}"]
-        if winners:
-            lines.append("\n📈 رابحين:\n" + "\n".join(winners))
-        if losers:
-            lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
-        if not winners and not losers:
-            lines.append("\n🚫 لا توجد عملات قيد التداول.")
-        send_message("\n".join(lines))
+    # الرصيد# الرصيد
+if _contains_any(t_lower, ["الرصيد", "رصيد", "balance"]):
+    balances = bitvavo_request("GET", "/balance")
+    if not isinstance(balances, list):
+        send_message("❌ تعذّر جلب الرصيد حالياً.")
         return "ok"
+
+    eur = sum(
+        float(b.get("available", 0)) + float(b.get("inOrder", 0))
+        for b in balances if b.get("symbol") == "EUR"
+    )
+    total = eur
+    winners, losers = [], []
+
+    with lock:
+        exec_copy = list(executed_trades)
+
+    for b in balances:
+        sym = b.get("symbol")
+        if sym == "EUR":
+            continue
+        qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
+        if qty < 0.0001:
+            continue
+        pair = f"{sym}-EUR"
+
+        price = fetch_price_ws_first(pair)
+        if price is None:
+            continue
+
+        value = qty * price
+        total += value
+
+        # آخر دخول معروف لهالزوج
+        entry = None
+        for tr in reversed(exec_copy):
+            if tr.get("symbol") == pair:
+                entry = tr.get("entry")
+                break
+
+        if entry:
+            pnl = ((price - entry) / entry) * 100
+            line = f"{sym}: {qty:.4f} @ €{price:.4f} → {pnl:+.2f}%"
+            (winners if pnl >= 0 else losers).append(line)
+
+    lines = [f"💰 الرصيد الكلي: €{total:.2f}"]
+    if winners:
+        lines.append("\n📈 رابحين:\n" + "\n".join(winners))
+    if losers:
+        lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
+    if not winners and not losers:
+        lines.append("\n🚫 لا توجد عملات قيد التداول.")
+
+    send_message("\n".join(lines))
+    return "ok"
 
     # إيقاف/تشغيل
     if _contains_any(t_lower, ["قف", "ايقاف", "إيقاف", "stop"]):
