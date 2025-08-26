@@ -524,7 +524,7 @@ def buy(symbol: str):
         return
 
     # فلتر دفتر الأوامر المتكيّف# ===== فلتر دفتر الأوامر المتكيّف (نسخة أخف) =====
-    price_now = fetch_price(market) or 0.0
+    price_now = fetch_price_ws_first(market) or 0.0
 
     if price_now < 0.02:                         # micro
         min_bid   = max(30.0, price_now * 3000)  # كان 5000
