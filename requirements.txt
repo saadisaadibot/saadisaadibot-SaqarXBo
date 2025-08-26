@@ -1,7 +1,6 @@
-pytrends
+Flask
 gunicorn
-flask
-python-dotenv
 requests
 redis
+python-dotenv
 websocket-client
