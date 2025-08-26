@@ -598,7 +598,14 @@ def monitor_loop():
 
                 pnl_pct = ((current - entry) / entry) * 100.0
                 trade["peak_pct"] = max(trade.get("peak_pct", 0.0), pnl_pct)
-
+                # خروج فوري عند ربح ثابت
+                if pnl_pct >= TAKE_PROFIT_HARD:
+                    trade["exit_in_progress"] = True
+                    trade["last_exit_try"] = now
+                    send_message(f"🔔 خروج {market} (هدف ثابت {pnl_pct:.2f}%≥{TAKE_PROFIT_HARD:.2f}%)")
+                    sell_trade(trade)
+                    trade["exit_in_progress"] = False
+                    continue
                 # SL سلّمي أساسي
                 inc = int(max(0.0, pnl_pct) // 1)
                 dyn_sl_base = DYN_SL_START + inc * DYN_SL_STEP
