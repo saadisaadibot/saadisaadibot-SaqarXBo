@@ -13,12 +13,10 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from collections import deque
 
-# =========================
-# 📌 إعدادات يدوية
-# =========================
+# ========= إعدادات =========
 MAX_TRADES = 2
 
-TAKE_PROFIT_HARD   = 1.5     # % خروج فوري على الربح
+TAKE_PROFIT_HARD   = 1.5
 LATE_FALLBACK_SEC  = 10 * 60
 LATE_LOCK_BACKSTEP = 0.8
 LATE_MIN_LOCK      = 0.5
@@ -72,9 +70,7 @@ OB_MIN_BID_EUR     = 100.0
 OB_REQ_IMB         = 0.6
 OB_MAX_SPREAD_BP   = 60.0
 
-# =========================
-# 🧠 التهيئة العامة
-# =========================
+# ========= تهيئة عامة =========
 load_dotenv()
 app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -85,13 +81,11 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 lock = Lock()
 enabled = True
 active_trades = []     # صفقات مفتوحة
-executed_trades = []   # نسخ عند الشراء + تُستكمل عند الإغلاق
+executed_trades = []   # يُضاف عند الشراء ويُستكمل عند الإغلاق
 
 SINCE_RESET_KEY = "nems:since_reset"
 
-# =========================
-# 🔔 تلغرام (مع منع تكرار)
-# =========================
+# ========= تلغرام =========
 def send_message(text: str):
     try:
         key = "dedup:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -105,9 +99,7 @@ def send_message(text: str):
     except Exception as e:
         print("Telegram error:", e)
 
-# =========================
-# 🔐 Bitvavo: توقيع + طلب
-# =========================
+# ========= Bitvavo REST =========
 def create_signature(timestamp, method, path, body_str=""):
     msg = f"{timestamp}{method}{path}{body_str}"
     return hmac.new(BITVAVO_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
@@ -125,9 +117,7 @@ def bitvavo_request(method: str, path: str, body=None):
     }
     try:
         resp = requests.request(
-            method,
-            url,
-            headers=headers,
+            method, url, headers=headers,
             json=(body or {}) if method != "GET" else None,
             timeout=12 if method != "GET" else 8
         )
@@ -146,30 +136,146 @@ def get_eur_available() -> float:
         pass
     return 0.0
 
-# =========================
-# 💶 الأسعار (كاش خفيف 2ث)
-# =========================
-_price_cache = {"t": 0, "map": {}}
-def fetch_price(market_symbol: str):
+# ========= WebSocket أسعار لحظية =========
+# يعتمد على websocket-client
+import websocket
+import threading
+import traceback
+
+WS_URL = "wss://ws.bitvavo.com/v2/"
+# آخر سعر لكل ماركت + طابع زمني
+_ws_prices = {}     # market -> {"price": float, "ts": epoch}
+_ws_lock = Lock()
+_ws_conn = None
+_ws_running = False
+_ws_subscribed = set()
+_ws_wanted = set()  # الماركتات المطلوب تتبّعها
+
+def _ws_markets_from_active():
+    with lock:
+        return sorted(set(t["symbol"] for t in active_trades))
+
+def _ws_subscribe_payload(markets):
+    # قناة ticker أسرع/أخف من ticker24h
+    chans = [{"name": "ticker", "markets": markets}]
+    return {"action": "subscribe", "channels": chans}
+
+def _ws_on_open(ws):
+    try:
+        mkts = list(_ws_wanted)
+        if mkts:
+            ws.send(json.dumps(_ws_subscribe_payload(mkts)))
+    except Exception:
+        traceback.print_exc()
+
+def _ws_on_message(ws, message):
+    try:
+        msg = json.loads(message)
+    except Exception:
+        return
+    # رسائل heartbeat/confirm
+    if isinstance(msg, dict) and msg.get("event") in ("subscribe", "subscribed"):
+        return
+    # تكرار: ticker 
+    # شكل الرسالة من Bitvavo عادة: {"event":"ticker","market":"ADA-EUR","price":"0.12345",...}
+    if isinstance(msg, dict) and msg.get("event") == "ticker":
+        market = msg.get("market")
+        price  = msg.get("price") or msg.get("lastPrice") or msg.get("open")  # fallback نادر
+        try:
+            p = float(price)
+            if p > 0:
+                with _ws_lock:
+                    _ws_prices[market] = {"price": p, "ts": time.time()}
+        except Exception:
+            pass
+
+def _ws_on_error(ws, err):
+    print("WS error:", err)
+
+def _ws_on_close(ws, code, reason):
+    global _ws_running
+    _ws_running = False
+    print("WS closed:", code, reason)
+
+def _ws_thread():
+    global _ws_conn, _ws_running
+    while True:
+        try:
+            _ws_running = True
+            _ws_conn = websocket.WebSocketApp(
+                WS_URL,
+                on_open=_ws_on_open,
+                on_message=_ws_on_message,
+                on_error=_ws_on_error,
+                on_close=_ws_on_close
+            )
+            _ws_conn.run_forever(ping_interval=25, ping_timeout=10)
+        except Exception as e:
+            print("WS loop exception:", e)
+        finally:
+            _ws_running = False
+            time.sleep(2)  # إعادة اتصال
+
+def _ws_manager_thread():
+    # يدير الاشتراكات حسب الصفقات النشطة
+    last_sent = set()
+    while True:
+        try:
+            wanted = set(_ws_markets_from_active())
+            # إذا في تغيّر بالماركتات المطلوبة
+            added = sorted(list(wanted - last_sent))
+            removed = sorted(list(last_sent - wanted))
+            if _ws_conn and _ws_running:
+                if added:
+                    try:
+                        _ws_conn.send(json.dumps(_ws_subscribe_payload(added)))
+                    except Exception:
+                        pass
+                # Bitvavo يدعم unsubscribe بنفس البنية
+                if removed:
+                    try:
+                        _ws_conn.send(json.dumps({
+                            "action": "unsubscribe",
+                            "channels": [{"name": "ticker", "markets": removed}]
+                        }))
+                    except Exception:
+                        pass
+            # حدّث الحالة
+            last_sent = wanted
+            with _ws_lock:
+                _ws_wanted.clear()
+                _ws_wanted.update(wanted)
+        except Exception as e:
+            print("ws_manager error:", e)
+        time.sleep(1)
+
+# شغّل خيط WS
+Thread(target=_ws_thread, daemon=True).start()
+Thread(target=_ws_manager_thread, daemon=True).start()
+
+def fetch_price_ws_first(market_symbol: str, staleness_sec: float = 2.0):
+    """
+    يرجّع آخر سعر من WS إن كان حديثًا (≤ staleness_sec).
+    غير هيك: يجيب من REST فورًا ويحدّث الكاش.
+    """
     now = time.time()
-    if now - _price_cache["t"] > 2:
-        _price_cache["map"].clear()
-        _price_cache["t"] = now
-    if market_symbol in _price_cache["map"]:
-        return _price_cache["map"][market_symbol]
+    with _ws_lock:
+        rec = _ws_prices.get(market_symbol)
+    if rec and now - rec["ts"] <= staleness_sec:
+        return rec["price"]
+    # Fallback سريع عبر REST
     try:
         res = bitvavo_request("GET", f"/ticker/price?market={market_symbol}")
         price = float(res.get("price", 0) or 0)
         if price > 0:
-            _price_cache["map"][market_symbol] = price
+            with _ws_lock:
+                _ws_prices[market_symbol] = {"price": price, "ts": now}
             return price
     except Exception:
         pass
     return None
 
-# =========================
-# ✅ رموز مدعومة (تحديث كل 10د)
-# =========================
+# ========= رموز مدعومة =========
 SUPPORTED_SYMBOLS = set()
 _last_sym_refresh = 0
 def ensure_symbols_fresh():
@@ -188,9 +294,7 @@ def ensure_symbols_fresh():
     except Exception as e:
         print("refresh symbols error:", e)
 
-# =========================
-# 🧾 دفتر أوامر + فلتر
-# =========================
+# ========= دفتر أوامر + فلتر =========
 def fetch_orderbook(market: str, depth: int = 1):
     try:
         url = f"https://api.bitvavo.com/v2/{market}/book"
@@ -229,9 +333,7 @@ def orderbook_guard(market: str,
 
     return True, "ok", {"spread_bp":spread_bp,"bid_eur":bid_eur,"imb":imb}
 
-# =========================
-# 🧮 تجميع fills باليورو
-# =========================
+# ========= Fills =========
 def totals_from_fills_eur(fills):
     total_base = 0.0
     total_eur  = 0.0
@@ -242,12 +344,10 @@ def totals_from_fills_eur(fills):
         fee   = float(f.get("fee", 0) or 0)
         total_base += amt
         total_eur  += amt * price
-        fee_eur    += fee  # feeCurrency = EUR
+        fee_eur    += fee
     return total_base, total_eur, fee_eur
 
-# =========================
-# 💱 البيع (مع إعادة المحاولة)
-# =========================
+# ========= البيع =========
 def place_market_sell(market, amt):
     body = {
         "market": market,
@@ -323,7 +423,6 @@ def sell_trade(trade: dict):
             trade["cost_eur"] = remaining_cost
 
         _accum_realized(pnl_eur)
-
         send_message(f"💰 بيع جزئي {market} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
         closed = trade.copy()
@@ -391,9 +490,7 @@ def sell_trade(trade: dict):
     base = market.replace("-EUR", "")
     r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
 
-# =========================
-# 🛒 الشراء (متكيّف + حساب دقيق للـfills)
-# =========================
+# ========= الشراء =========
 def buy(symbol: str):
     ensure_symbols_fresh()
     symbol = symbol.upper().strip()
@@ -426,19 +523,19 @@ def buy(symbol: str):
     if r.exists(f"blacklist:buy:{symbol}"):
         return
 
-    # ===== فلتر دفتر الأوامر المتكيّف حسب سعر العملة =====
-    price_now = fetch_price(market) or 0.0
-    if price_now < 0.02:                      # micro
-        min_bid = max(20.0, price_now * 5000) # بدنا bid يغطي ~5000 قطعة
-        max_spread = 200.0                    # 2.0%
+    # فلتر دفتر الأوامر المتكيّف
+    price_now = fetch_price_ws_first(market) or 0.0
+    if price_now < 0.02:
+        min_bid = max(20.0, price_now * 5000)
+        max_spread = 200.0
         req_imb = 0.3
-    elif price_now < 0.2:                     # متوسطة
+    elif price_now < 0.2:
         min_bid = max(50.0, price_now * 2000)
-        max_spread = 120.0                    # 1.2%
+        max_spread = 120.0
         req_imb = 0.5
-    else:                                     # غالية
+    else:
         min_bid = max(100.0, price_now * 500)
-        max_spread = 60.0                     # 0.6%
+        max_spread = 60.0
         req_imb = 0.6
 
     ok, why, feats = orderbook_guard(
@@ -522,15 +619,17 @@ def buy(symbol: str):
         r.set("nems:active_trades", json.dumps(active_trades))
         r.rpush("nems:executed_trades", json.dumps(trade))
 
+    # أضف الماركت للمطلوب من WS فورًا
+    with _ws_lock:
+        _ws_wanted.add(market)
+
     slot_idx = len(active_trades)
     send_message(
         f"✅ شراء {symbol} | صفقة #{slot_idx}/2 | {tranche} | قيمة: €{amount_quote:.2f} | "
         f"SL مبكر مفعّل | سيولة/سبريد متوافقين (adapted: spread≤{max_spread:.0f}bp)"
     )
 
-# =========================
-# 📈 تاريخ لحظي + مؤشرات زخم
-# =========================
+# ========= تاريخ لحظي + مؤشرات =========
 def _init_hist(trade):
     if "hist" not in trade:
         trade["hist"] = deque(maxlen=600)
@@ -548,7 +647,6 @@ def _mom_metrics(trade, price_now):
     _init_hist(trade)
     if not trade["hist"]:
         return 0.0, 0.0, False
-
     now_ts = trade["hist"][-1][0]
     p30 = p90 = None
     hi = lo = price_now
@@ -561,7 +659,6 @@ def _mom_metrics(trade, price_now):
             p90 = p
     if p30 is None: p30 = trade["hist"][0][1]
     if p90 is None: p90 = trade["hist"][0][1]
-
     r30 = (price_now / p30 - 1.0) * 100.0 if p30 > 0 else 0.0
     r90 = (price_now / p90 - 1.0) * 100.0 if p90 > 0 else 0.0
     new_high = price_now >= hi * 0.999
@@ -588,20 +685,17 @@ def _fast_drop_detect(trade, now_ts, price_now):
 def _peak_giveback(peak):
     return max(GIVEBACK_MIN, min(GIVEBACK_MAX, GIVEBACK_RATIO * peak))
 
-# =========================
-# 👀 حلقة المراقبة (خروج ذكي)
-# =========================
+# ========= حلقة المراقبة =========
 def monitor_loop():
     while True:
         try:
             with lock:
                 snapshot = list(active_trades)
-
             now = time.time()
             for trade in snapshot:
                 market = trade["symbol"]
                 entry  = float(trade["entry"])
-                current = fetch_price(market)
+                current = fetch_price_ws_first(market)
                 if not current:
                     continue
 
@@ -738,16 +832,14 @@ def monitor_loop():
                 except Exception:
                     pass
 
-            time.sleep(1)
+            time.sleep(0.25)  # أسرع من 1 ثانية مع WS
         except Exception as e:
             print("خطأ في المراقبة:", e)
-            time.sleep(5)
+            time.sleep(1)
 
 Thread(target=monitor_loop, daemon=True).start()
 
-# =========================
-# 🧾 ملخص ذكي
-# =========================
+# ========= ملخص =========
 def build_summary():
     lines = []
     now = time.time()
@@ -758,7 +850,7 @@ def build_summary():
 
     if active_copy:
         def cur_pnl(t):
-            cur = fetch_price(t["symbol"]) or t["entry"]
+            cur = fetch_price_ws_first(t["symbol"]) or t["entry"]
             return (cur - t["entry"]) / t["entry"]
 
         sorted_trades = sorted(active_copy, key=cur_pnl, reverse=True)
@@ -775,7 +867,7 @@ def build_summary():
             age_sec = int(now - opened)
             age_min = age_sec // 60
 
-            current = fetch_price(t["symbol"]) or entry
+            current = fetch_price_ws_first(t["symbol"]) or entry
             pnl_pct = ((current - entry) / entry) * 100.0
             value   = amount * current
             total_value += value
@@ -927,9 +1019,7 @@ def send_text_chunks(text: str, chunk_size: int = 3800):
     if buf:
         send_message("".join(buf))
 
-# =========================
-# 🤖 Webhook
-# =========================
+# ========= Webhook =========
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled
@@ -963,7 +1053,7 @@ def webhook():
         send_text_chunks(build_summary())
         return "ok"
 
-    elif "الرصيد" في t_lower or "الرصيد" in t_lower:
+    elif ("الرصيد" in t_lower):
         balances = bitvavo_request("GET", "/balance")
         eur = sum(float(b.get("available", 0)) + float(b.get("inOrder", 0))
                   for b in balances if b.get("symbol") == "EUR")
@@ -981,7 +1071,7 @@ def webhook():
             if qty < 0.0001:
                 continue
             pair = f"{sym}-EUR"
-            price = fetch_price(pair)
+            price = fetch_price_ws_first(pair)
             if not price:
                 continue
             value = qty * price
@@ -1054,9 +1144,7 @@ def webhook():
 
     return "ok"
 
-# =========================
-# 🔁 تحميل الحالة من Redis عند الإقلاع
-# =========================
+# ========= تحميل الحالة =========
 try:
     at = r.get("nems:active_trades")
     if at:
@@ -1068,8 +1156,6 @@ try:
 except Exception as e:
     print("state load error:", e)
 
-# =========================
-# 🚀 التشغيل المحلي (Railway يستخدم gunicorn)
-# =========================
+# ========= تشغيل محلي =========
 if __name__ == "__main__" and os.getenv("RUN_LOCAL") == "1":
     app.run(host="0.0.0.0", port=5000)
