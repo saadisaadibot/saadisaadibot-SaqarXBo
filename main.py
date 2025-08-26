@@ -1028,15 +1028,13 @@ def webhook():
 
     # --- استخراج النص بأمان من التلغرام (يدعم message/text وأي payload شبيه) ---
     data = request.get_json(silent=True) or {}
-    text = (data.get("message", {}).get("text")
-            or data.get("text")
-            or "").strip()
+    text = (data.get("message", {}).get("text") or data.get("text") or "").strip()
     if not text:
         return "ok"
 
     t_lower = text.lower()
 
-    # --- أدوات مساعدة بسيطة ---
+    # --- أدوات مساعدة بسيطة (محلية للدالة) ---
     def _starts_with(s, prefixes):
         return any(s.startswith(p) for p in prefixes)
 
@@ -1048,29 +1046,22 @@ def webhook():
         يأخذ أوّل توكن أحرف/أرقام بعد الكلمة الآمرة (اشتري/إشتري/buy)،
         ويتحمّل وجود إيموجي/مسافات/شرطات مثل ADA-EUR أو ADAEUR.
         """
-        pos = -1
-        used = None
+        pos, used = -1, None
         for c in cmds:
             p = t_lower.find(c.lower())
             if p != -1:
                 pos, used = p, c
                 break
         tail = text[pos + len(used):] if pos != -1 else ""
-        # أول سلسلة A-Z0-9
         m = re.search(r"[A-Za-z0-9\-]+", tail)
         if not m:
             return ""
         sym = m.group(0).upper().strip()
-
-        # دعم ADA-EUR -> ADA
-        if "-" in sym:
+        if "-" in sym:               # ADA-EUR -> ADA
             sym = sym.split("-")[0]
-        # دعم ADAEUR -> ADA
-        if sym.endswith("EUR") and len(sym) > 3:
+        if sym.endswith("EUR") and len(sym) > 3:  # ADAEUR -> ADA
             sym = sym[:-3]
-
-        # أبقِ الرمز أحرف/أرقام فقط
-        sym = re.sub(r"[^A-Z0-9]", "", sym)
+        sym = re.sub(r"[^A-Z0-9]", "", sym)      # أحرف/أرقام فقط
         return sym
 
     # ============= الأوامر =============
@@ -1094,61 +1085,59 @@ def webhook():
         send_text_chunks(build_summary())
         return "ok"
 
-    # الرصيد# الرصيد
-if _contains_any(t_lower, ["الرصيد", "رصيد", "balance"]):
-    balances = bitvavo_request("GET", "/balance")
-    if not isinstance(balances, list):
-        send_message("❌ تعذّر جلب الرصيد حالياً.")
+    # الرصيد
+    if _contains_any(t_lower, ["الرصيد", "رصيد", "balance"]):
+        balances = bitvavo_request("GET", "/balance")
+        if not isinstance(balances, list):
+            send_message("❌ تعذّر جلب الرصيد حالياً.")
+            return "ok"
+
+        eur = sum(
+            float(b.get("available", 0)) + float(b.get("inOrder", 0))
+            for b in balances if b.get("symbol") == "EUR"
+        )
+        total = eur
+        winners, losers = [], []
+
+        with lock:
+            exec_copy = list(executed_trades)
+
+        for b in balances:
+            sym = b.get("symbol")
+            if sym == "EUR":
+                continue
+            qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
+            if qty < 0.0001:
+                continue
+
+            pair = f"{sym}-EUR"
+            price = fetch_price_ws_first(pair)
+            if price is None:
+                continue
+
+            total += qty * price
+
+            # آخر دخول معروف لهالزوج
+            entry = None
+            for tr in reversed(exec_copy):
+                if tr.get("symbol") == pair:
+                    entry = tr.get("entry")
+                    break
+
+            if entry:
+                pnl = ((price - entry) / entry) * 100
+                line = f"{sym}: {qty:.4f} @ €{price:.4f} → {pnl:+.2f}%"
+                (winners if pnl >= 0 else losers).append(line)
+
+        lines = [f"💰 الرصيد الكلي: €{total:.2f}"]
+        if winners:
+            lines.append("\n📈 رابحين:\n" + "\n".join(winners))
+        if losers:
+            lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
+        if not winners and not losers:
+            lines.append("\n🚫 لا توجد عملات قيد التداول.")
+        send_message("\n".join(lines))
         return "ok"
-
-    eur = sum(
-        float(b.get("available", 0)) + float(b.get("inOrder", 0))
-        for b in balances if b.get("symbol") == "EUR"
-    )
-    total = eur
-    winners, losers = [], []
-
-    with lock:
-        exec_copy = list(executed_trades)
-
-    for b in balances:
-        sym = b.get("symbol")
-        if sym == "EUR":
-            continue
-        qty = float(b.get("available", 0)) + float(b.get("inOrder", 0))
-        if qty < 0.0001:
-            continue
-        pair = f"{sym}-EUR"
-
-        price = fetch_price_ws_first(pair)
-        if price is None:
-            continue
-
-        value = qty * price
-        total += value
-
-        # آخر دخول معروف لهالزوج
-        entry = None
-        for tr in reversed(exec_copy):
-            if tr.get("symbol") == pair:
-                entry = tr.get("entry")
-                break
-
-        if entry:
-            pnl = ((price - entry) / entry) * 100
-            line = f"{sym}: {qty:.4f} @ €{price:.4f} → {pnl:+.2f}%"
-            (winners if pnl >= 0 else losers).append(line)
-
-    lines = [f"💰 الرصيد الكلي: €{total:.2f}"]
-    if winners:
-        lines.append("\n📈 رابحين:\n" + "\n".join(winners))
-    if losers:
-        lines.append("\n📉 خاسرين:\n" + "\n".join(losers))
-    if not winners and not losers:
-        lines.append("\n🚫 لا توجد عملات قيد التداول.")
-
-    send_message("\n".join(lines))
-    return "ok"
 
     # إيقاف/تشغيل
     if _contains_any(t_lower, ["قف", "ايقاف", "إيقاف", "stop"]):
@@ -1174,7 +1163,6 @@ if _contains_any(t_lower, ["الرصيد", "رصيد", "balance"]):
     # إلغاء الحظر لعملة
     if _starts_with(t_lower, ("الغ حظر", "الغاء حظر", "إلغاء حظر")):
         try:
-            # التقط كل ما بعد عبارة «الغ(اء) حظر»
             coin = re.split(r"(?:الغ(?:اء)?\s+حظر)", text, flags=re.IGNORECASE, maxsplit=1)[-1].strip().upper()
             coin = re.sub(r"[^A-Z0-9]", "", coin)
             if not coin:
