@@ -67,9 +67,9 @@ DAILY_STOP_EUR     = -8.0
 CONSEC_LOSS_BAN    = 2
 
 # دفتر الأوامر (قيم مرجعية فقط — الفعلي متكيّف)
-OB_MIN_BID_EUR     = 100.0
-OB_REQ_IMB         = 0.6
-OB_MAX_SPREAD_BP   = 60.0
+OB_MIN_BID_EUR     = 50.0
+OB_REQ_IMB         = 0.4
+OB_MAX_SPREAD_BP   = 150.0
 
 # ========= تهيئة عامة =========
 load_dotenv()
