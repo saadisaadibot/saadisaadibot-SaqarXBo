@@ -1025,33 +1025,63 @@ def send_text_chunks(text: str, chunk_size: int = 3800):
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled
+
+    # --- استخراج النص بأمان من التلغرام (يدعم message/text وأي payload شبيه) ---
     data = request.get_json(silent=True) or {}
-    text = (data.get("message", {}).get("text") or data.get("text") or "").strip()
+    text = (data.get("message", {}).get("text")
+            or data.get("text")
+            or "").strip()
     if not text:
         return "ok"
 
     t_lower = text.lower()
 
+    # --- أدوات مساعدة بسيطة ---
+    def _starts_with(s, prefixes):
+        return any(s.startswith(p) for p in prefixes)
+
+    def _contains_any(s, needles):
+        return any(n in s for n in needles)
+
+    def _parse_symbol_after(cmds):
+        """
+        يأخذ أوّل توكن أحرف/أرقام بعد الكلمة الآمرة (اشتري/إشتري/buy)،
+        ويتحمّل وجود إيموجي/مسافات/شرطات مثل ADA-EUR أو ADAEUR.
+        """
+        pos = -1
+        used = None
+        for c in cmds:
+            p = t_lower.find(c.lower())
+            if p != -1:
+                pos, used = p, c
+                break
+        tail = text[pos + len(used):] if pos != -1 else ""
+        # أول سلسلة A-Z0-9
+        m = re.search(r"[A-Za-z0-9\-]+", tail)
+        if not m:
+            return ""
+        sym = m.group(0).upper().strip()
+
+        # دعم ADA-EUR -> ADA
+        if "-" in sym:
+            sym = sym.split("-")[0]
+        # دعم ADAEUR -> ADA
+        if sym.endswith("EUR") and len(sym) > 3:
+            sym = sym[:-3]
+
+        # أبقِ الرمز أحرف/أرقام فقط
+        sym = re.sub(r"[^A-Z0-9]", "", sym)
+        return sym
+
+    # ============= الأوامر =============
+
     # شراء
-    if "اشتري" in t_lower or "إشتري" in t_lower or "buy" in t_lower:
+    if _contains_any(t_lower, ["اشتري", "إشتري", "buy"]):
         if not enabled:
             send_message("🚫 البوت متوقف عن الشراء.")
             return "ok"
 
-        # التعرّف على الكلمة الآمرة واستخراج الرمز بشكل متحمّل للمسافات/الإيموجي
-        commands = ["اشتري", "إشتري", "buy"]
-        cmd_used, pos = None, -1
-        for c in commands:
-            p = t_lower.find(c.lower())
-            if p != -1:
-                cmd_used, pos = c, p
-                break
-
-        tail = text[pos + len(cmd_used):] if pos != -1 else ""
-        # أول توكن أحرف/أرقام فقط
-        m = re.search(r"[A-Za-z0-9]+", tail)
-        symbol = m.group(0).upper() if m else ""
-
+        symbol = _parse_symbol_after(["اشتري", "إشتري", "buy"])
         if not symbol:
             send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
             return "ok"
@@ -1059,14 +1089,18 @@ def webhook():
         buy(symbol)
         return "ok"
 
-    elif "الملخص" in t_lower:
+    # الملخص
+    if _contains_any(t_lower, ["الملخص", "ملخص", "summary"]):
         send_text_chunks(build_summary())
         return "ok"
 
-    elif ("الرصيد" in t_lower):
+    # الرصيد
+    if _contains_any(t_lower, ["الرصيد", "رصيد", "balance"]):
         balances = bitvavo_request("GET", "/balance")
-        eur = sum(float(b.get("available", 0)) + float(b.get("inOrder", 0))
-                  for b in balances if b.get("symbol") == "EUR")
+        eur = sum(
+            float(b.get("available", 0)) + float(b.get("inOrder", 0))
+            for b in balances if b.get("symbol") == "EUR"
+        )
         total = eur
         winners, losers = [], []
 
@@ -1108,17 +1142,19 @@ def webhook():
         send_message("\n".join(lines))
         return "ok"
 
-    elif "قف" in t_lower:
+    # إيقاف/تشغيل
+    if _contains_any(t_lower, ["قف", "ايقاف", "إيقاف", "stop"]):
         enabled = False
         send_message("🛑 تم إيقاف الشراء.")
         return "ok"
 
-    elif "ابدأ" in t_lower:
+    if _contains_any(t_lower, ["ابدأ", "تشغيل", "start"]):
         enabled = True
         send_message("✅ تم تفعيل الشراء.")
         return "ok"
 
-    elif "قائمة الحظر" in t_lower:
+    # قائمة الحظر
+    if _contains_any(t_lower, ["قائمة الحظر", "ban list"]):
         keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("ban24:*")]
         if not keys:
             send_message("🧊 لا توجد عملات محظورة حالياً.")
@@ -1127,9 +1163,14 @@ def webhook():
             send_message("🧊 العملات المحظورة 24h:\n- " + "\n- ".join(names))
         return "ok"
 
-    elif t_lower.startswith("الغ حظر"):
+    # إلغاء الحظر لعملة
+    if _starts_with(t_lower, ("الغ حظر", "الغاء حظر", "إلغاء حظر")):
         try:
-            coin = text.split("الغ حظر", 1)[-1].strip().upper()
+            # التقط كل ما بعد عبارة «الغ(اء) حظر»
+            coin = re.split(r"(?:الغ(?:اء)?\s+حظر)", text, flags=re.IGNORECASE, maxsplit=1)[-1].strip().upper()
+            coin = re.sub(r"[^A-Z0-9]", "", coin)
+            if not coin:
+                raise ValueError
             if r.delete(f"ban24:{coin}"):
                 send_message(f"✅ أُلغي حظر {coin}.")
             else:
@@ -1138,7 +1179,8 @@ def webhook():
             send_message("❌ الصيغة: الغ حظر ADA")
         return "ok"
 
-    elif "انسى" in t_lower:
+    # نسيان/تصفيير الإحصائيات
+    if _contains_any(t_lower, ["انسى", "أنسى", "reset stats"]):
         with lock:
             active_trades.clear()
             executed_trades.clear()
@@ -1148,10 +1190,12 @@ def webhook():
         send_message("🧠 تم نسيان كل شيء! بدأنا عد جديد للإحصائيات 🤖")
         return "ok"
 
-    elif "عدد الصفقات" in t_lower or "عدل الصفقات" in t_lower:
+    # عدد الصفقات
+    if _contains_any(t_lower, ["عدد الصفقات", "عدل الصفقات", "trades count"]):
         send_message("ℹ️ عدد الصفقات ثابت: 2 (بدون استبدال).")
         return "ok"
 
+    # افتراضي
     return "ok"
 
 # ========= تحميل الحالة =========
