@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import re
 import hmac
 import hashlib
 import os
@@ -1033,26 +1034,26 @@ def webhook():
 
     # شراء
     if "اشتري" in t_lower or "إشتري" in t_lower or "buy" in t_lower:
-        if "buy" in t_lower:
-            symbol = text.split("buy", 1)[-1].strip().upper()
-        elif "إشتري" in t_lower:
-            symbol = text.split("إشتري", 1)[-1].strip().upper()
-        else:
-            symbol = text.split("اشتري", 1)[-1].strip().upper()
+        # التعرّف على الكلمة الآمرة واستخراج الرمز بشكل متحمّل للمسافات/الإيموجي
+        commands = ["اشتري", "إشتري", "buy"]
+        cmd_used, pos = None, -1
+        for c in commands:
+            p = t_lower.find(c.lower())
+            if p != -1:
+                cmd_used, pos = c, p
+                break
+
+        tail = text[pos + len(cmd_used):] if pos != -1 else ""
+        # أول توكن أحرف/أرقام فقط
+        import re
+        m = re.search(r"[A-Za-z0-9]+", tail)
+        symbol = m.group(0).upper() if m else ""
 
         if not symbol:
             send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
             return "ok"
 
         buy(symbol)
-        return "ok"
-        try:
-            symbol = text.split("اشتري", 1)[-1].strip().upper()
-            if not symbol:
-                raise ValueError("no symbol")
-            buy(symbol)
-        except Exception:
-            send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
         return "ok"
 
     elif "الملخص" in t_lower:
