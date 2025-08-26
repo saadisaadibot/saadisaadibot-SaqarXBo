@@ -18,6 +18,7 @@ from collections import deque
 # =========================
 MAX_TRADES = 2
 
+TAKE_PROFIT_HARD = 1.5   # % خروج فوري على الربح
 LATE_FALLBACK_SEC   = 10 * 60
 LATE_LOCK_BACKSTEP  = 0.8       # قفل أرخى بعد 10د ليسمح للموجة تمتد
 LATE_MIN_LOCK       = 0.5
