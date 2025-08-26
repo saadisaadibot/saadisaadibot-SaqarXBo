@@ -1024,23 +1024,28 @@ def send_text_chunks(text: str, chunk_size: int = 3800):
 @app.route("/", methods=["POST"])
 def webhook():
     global enabled
-
     data = request.get_json(silent=True) or {}
-
-    if "message" in data and isinstance(data["message"], dict):
-        text = (data["message"].get("text") or "").strip()
-    else:
-        text = (data.get("text") or "").strip()
-
+    text = (data.get("message", {}).get("text") or data.get("text") or "").strip()
     if not text:
         return "ok"
 
     t_lower = text.lower()
 
-    if "اشتري" in t_lower:
-        if not enabled:
-            send_message("🚫 البوت متوقف عن الشراء.")
+    # شراء
+    if "اشتري" in t_lower or "إشتري" in t_lower or "buy" in t_lower:
+        if "buy" in t_lower:
+            symbol = text.split("buy", 1)[-1].strip().upper()
+        elif "إشتري" in t_lower:
+            symbol = text.split("إشتري", 1)[-1].strip().upper()
+        else:
+            symbol = text.split("اشتري", 1)[-1].strip().upper()
+
+        if not symbol:
+            send_message("❌ الصيغة غير صحيحة. مثال: اشتري ADA")
             return "ok"
+
+        buy(symbol)
+        return "ok"
         try:
             symbol = text.split("اشتري", 1)[-1].strip().upper()
             if not symbol:
