@@ -1034,6 +1034,10 @@ def webhook():
 
     # شراء
     if "اشتري" in t_lower or "إشتري" in t_lower or "buy" in t_lower:
+        if not enabled:
+            send_message("🚫 البوت متوقف عن الشراء.")
+            return "ok"
+
         # التعرّف على الكلمة الآمرة واستخراج الرمز بشكل متحمّل للمسافات/الإيموجي
         commands = ["اشتري", "إشتري", "buy"]
         cmd_used, pos = None, -1
@@ -1045,7 +1049,6 @@ def webhook():
 
         tail = text[pos + len(cmd_used):] if pos != -1 else ""
         # أول توكن أحرف/أرقام فقط
-        import re
         m = re.search(r"[A-Za-z0-9]+", tail)
         symbol = m.group(0).upper() if m else ""
 
