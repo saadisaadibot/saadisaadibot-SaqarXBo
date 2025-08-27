@@ -17,18 +17,18 @@ from collections import deque
 # ========= إعدادات =========
 MAX_TRADES = 2
 
-TAKE_PROFIT_HARD   = 1.5
+TAKE_PROFIT_HARD   = 1.2
 LATE_FALLBACK_SEC  = 10 * 60
-LATE_LOCK_BACKSTEP = 0.8
-LATE_MIN_LOCK      = 0.5
+LATE_LOCK_BACKSTEP = 0.6
+LATE_MIN_LOCK      = 0.8
 LATE_WEAK_R        = 0.10
 
 DYN_SL_START       = -1.0
-DYN_SL_STEP        = 1.0
+DYN_SL_STEP        = 0.8
 
 MOM_LOOKBACK_SEC   = 120
-STALL_SEC          = 150
-DROP_FROM_PEAK_EXIT= 1.2
+STALL_SEC          = 120
+DROP_FROM_PEAK_EXIT= 0.9
 
 MOM_R30_STRONG     = 0.50
 MOM_R90_STRONG     = 0.80
@@ -42,21 +42,21 @@ BLACKLIST_EXPIRE_SECONDS = 300
 BUY_COOLDOWN_SEC   = 180  # غير مستخدم عمليًا هنا
 
 # حماية سريعة
-GRACE_SEC          = 45
-EARLY_CRASH_SL     = -3.4
-FAST_DROP_WINDOW   = 20
-FAST_DROP_PCT      = 1.3
+GRACE_SEC          = 25
+EARLY_CRASH_SL     = -2.2
+FAST_DROP_WINDOW   = 15
+FAST_DROP_PCT      = 1.0
 
 # ربح صغير
-MICRO_PROFIT_MIN   = 0.7
-MICRO_PROFIT_MAX   = 1.3
-MICRO_FAST_DROP    = 1.1
+MICRO_PROFIT_MIN   = 0.6
+MICRO_PROFIT_MAX   = 1.2
+MICRO_FAST_DROP    = 0.9
 
 # Trailing من القمة
-GIVEBACK_RATIO     = 0.32
-GIVEBACK_MIN       = 3.8
+GIVEBACK_RATIO     = 0.28
+GIVEBACK_MIN       = 3.2
 GIVEBACK_MAX       = 7.0
-PEAK_TRIGGER       = 8.5
+PEAK_TRIGGER       = 6.5
 
 # زخم سلبي قوي
 FAST_DROP_R30      = -1.3
