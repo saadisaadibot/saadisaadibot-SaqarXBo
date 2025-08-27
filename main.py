@@ -690,23 +690,51 @@ def monitor_loop():
 
 Thread(target=monitor_loop, daemon=True).start()
 
-# ========= Endpoint بسيط لإشارات الشراء =========
+# ========= Endpoints لاستقبال الإشارة =========
+def _extract_symbol_from_payload(data: dict) -> str:
+    # يدعم:
+    # {"message":{"text":"اشتري ADA"}}
+    # {"text":"اشتري ADA"}
+    # {"text":"BUY ADA"}
+    # {"symbol":"ADA"} / {"coin":"ADA"} / {"ticker":"ADA"}
+    txt = (data.get("message", {}) or {}).get("text") or data.get("text") or ""
+    txt = (txt or "").strip().upper()
+
+    # حقول مباشرة
+    for k in ("symbol", "coin", "ticker"):
+        v = (data.get(k) or "").strip().upper()
+        if v:
+            return v
+
+    # من النص: "اشتري ADA" أو "BUY ADA"
+    for kw in ("اشتري", "BUY"):
+        if kw in txt:
+            parts = txt.split(kw, 1)[1].strip().split()
+            if parts:
+                return parts[0]
+
+    # إذا النص هو الرمز نفسه (مثلاً "ADA")
+    if txt and len(txt) <= 6 and txt.isalpha():
+        return txt
+
+    return ""
+
+# اقبل نفس الدالة على / و /bridge و /signal
+@app.route("/", methods=["POST"])
 @app.route("/bridge", methods=["POST"])
+@app.route("/signal", methods=["POST"])
 def bridge_in():
     data = request.get_json(silent=True) or {}
-    # يدعم {"message":{"text":"اشتري ADA"}} أو {"text":"اشتري ADA"}
-    txt = (data.get("message", {}) or {}).get("text") or data.get("text") or ""
-    txt = txt.strip().upper()
-    # استخرج الرمز بعد كلمة "اشتري"
-    sym = ""
-    if "اشتري" in txt:
-        parts = txt.split("اشتري", 1)[1].strip().split()
-        if parts:
-            sym = parts[0]
+    sym = _extract_symbol_from_payload(data)
     if not sym:
         return "bad payload", 400
     Thread(target=buy, args=(sym,), daemon=True).start()
     return "ok", 200
+
+# صحّة السيرفر
+@app.route("/", methods=["GET"])
+def health_root():
+    return "SaqAR bridge alive ✅", 200
 
 # ========= تحميل الحالة =========
 try:
