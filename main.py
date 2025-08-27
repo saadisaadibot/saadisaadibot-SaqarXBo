@@ -23,7 +23,7 @@ LATE_LOCK_BACKSTEP = 0.8
 LATE_MIN_LOCK      = 0.5
 LATE_WEAK_R        = 0.10
 
-DYN_SL_START       = -2.0
+DYN_SL_START       = -1.0
 DYN_SL_STEP        = 1.0
 
 MOM_LOOKBACK_SEC   = 120
