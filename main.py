@@ -691,14 +691,22 @@ def monitor_loop():
 Thread(target=monitor_loop, daemon=True).start()
 
 # ========= Endpoint بسيط لإشارات الشراء =========
-@app.route("/signal", methods=["POST"])
-def signal_in():
+@app.route("/bridge", methods=["POST"])
+def bridge_in():
     data = request.get_json(silent=True) or {}
-    sym = (data.get("symbol") or data.get("coin") or "").upper().strip()
+    # يدعم {"message":{"text":"اشتري ADA"}} أو {"text":"اشتري ADA"}
+    txt = (data.get("message", {}) or {}).get("text") or data.get("text") or ""
+    txt = txt.strip().upper()
+    # استخرج الرمز بعد كلمة "اشتري"
+    sym = ""
+    if "اشتري" in txt:
+        parts = txt.split("اشتري", 1)[1].strip().split()
+        if parts:
+            sym = parts[0]
     if not sym:
-        return "no symbol", 400
+        return "bad payload", 400
     Thread(target=buy, args=(sym,), daemon=True).start()
-    return "ok"
+    return "ok", 200
 
 # ========= تحميل الحالة =========
 try:
