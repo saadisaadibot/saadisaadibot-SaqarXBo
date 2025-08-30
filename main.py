@@ -16,11 +16,11 @@ from collections import deque
 
 # ========= إعدادات =========
 MAX_TRADES = 2
-
+_OB_CACHE = {}
 # هدف ثابت "ذكي" (كان TAKE_PROFIT_HARD=1.5 لكل الحالات)
 TP_BASE_GOOD       = 2.4   # سوق جيد → اسمح بمزيد
 TP_BASE_WEAK       = 1.4   # سوق ضعيف/سبريد واسع/زخم ضعيف → خذها بدري
-
+PARTIAL_COOLDOWN_SEC = 10
 LATE_FALLBACK_SEC  = 10 * 60
 LATE_LOCK_BACKSTEP = 0.8
 LATE_MIN_LOCK      = 0.5
@@ -283,13 +283,18 @@ def ensure_symbols_fresh():
         print("refresh symbols error:", e)
 
 # ========= دفتر أوامر + فلتر =========
-def fetch_orderbook(market: str, depth: int = 1):
+def fetch_orderbook(market: str, ttl: float = 3.0):
+    now = time.time()
+    rec = _OB_CACHE.get(market)
+    if rec and (now - rec["ts"]) < ttl:
+        return rec["data"]
     try:
         url = f"https://api.bitvavo.com/v2/{market}/book"
         resp = requests.get(url, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
             if data and data.get("bids") and data.get("asks"):
+                _OB_CACHE[market] = {"data": data, "ts": now}
                 return data
     except Exception:
         pass
@@ -298,19 +303,21 @@ def fetch_orderbook(market: str, depth: int = 1):
 def orderbook_guard(market: str,
                     min_bid_eur: float = OB_MIN_BID_EUR,
                     req_imb: float = OB_REQ_IMB,
-                    max_spread_bp: float = OB_MAX_SPREAD_BP):
+                    max_spread_bp: float = OB_MAX_SPREAD_BP,
+                    depth_used: int = 3):
     ob = fetch_orderbook(market)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return False, "no_orderbook", {}
     try:
-        bid_p, bid_q = float(ob["bids"][0][0]), float(ob["bids"][0][1])
-        ask_p, ask_q = float(ob["asks"][0][0]), float(ob["asks"][0][1])
+        bid_p = float(ob["bids"][0][0]); ask_p = float(ob["asks"][0][0])
+        # سيولة تراكميّة لأول N مستويات
+        bid_eur = sum(float(p)*float(q) for p,q,*_ in ob["bids"][:depth_used])
+        ask_eur = sum(float(p)*float(q) for p,q,*_ in ob["asks"][:depth_used])
     except Exception:
         return False, "bad_book", {}
 
     spread_bp = (ask_p - bid_p) / ((ask_p + bid_p)/2.0) * 10000.0
-    bid_eur   = bid_p * bid_q
-    imb       = (bid_q / max(1e-9, ask_q))
+    imb       = bid_eur / max(1e-9, ask_eur)
 
     if bid_eur < min_bid_eur:
         return False, f"low_liquidity:{bid_eur:.0f}", {"spread_bp":spread_bp,"bid_eur":bid_eur,"imb":imb}
@@ -571,10 +578,10 @@ def buy(symbol: str):
         min_bid   = max(60.0, price_now * 1200)
         max_spread = 90.0
         req_imb    = 0.40
-    else:
-        min_bid   = max(150.0, price_now * 120)
-        max_spread = 100.0
-        req_imb    = 0.35
+    else:  # مرتفعة
+        min_bid   = max(100.0, price_now * 80)   # كان 150 و *120
+        max_spread = 120.0                       # كان 100bp
+        req_imb    = 0.30                        # كان 0.35
 
     ok, why, feats = orderbook_guard(
         market,
