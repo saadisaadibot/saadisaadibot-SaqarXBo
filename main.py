@@ -47,7 +47,7 @@ SELL_MAX_RETRIES   = 6
 EARLY_WINDOW_SEC   = 15 * 60
 
 BLACKLIST_EXPIRE_SECONDS = 300
-BUY_COOLDOWN_SEC   = 180
+BUY_COOLDOWN_SEC   = 120
 
 # حماية سريعة
 GRACE_SEC          = 45
@@ -75,9 +75,9 @@ DAILY_STOP_EUR     = -8.0
 CONSEC_LOSS_BAN    = 2
 
 # دفتر الأوامر (مرجعي — الفعلي متكيّف)
-OB_MIN_BID_EUR     = 50.0
-OB_REQ_IMB         = 0.4
-OB_MAX_SPREAD_BP   = 150.0
+OB_MIN_BID_EUR     = 45.0
+OB_REQ_IMB         = 0.30
+OB_MAX_SPREAD_BP   = 180.0
 
 # ========= إعدادات المحرّك الداخلي (Signal Engine) =========
 AUTO_ENABLED          = True   # تشغيل الإشارات الداخلية تلقائياً
