@@ -13,14 +13,18 @@ from threading import Thread, Lock
 from uuid import uuid4
 from dotenv import load_dotenv
 from collections import deque
+load_dotenv()  # ← حطها مباشرة بعد الاستيرادات
 
+# بعدين عرّف الثوابت التي تعتمد على getenv
+PARTIAL_COOLDOWN_SEC = int(os.getenv("PARTIAL_COOLDOWN_SEC", 10))
+MIN_PARTIAL_EUR      = float(os.getenv("MIN_PARTIAL_EUR", 5.0))
 # ========= إعدادات =========
 MAX_TRADES = 2
 _OB_CACHE = {}
 # هدف ثابت "ذكي" (كان TAKE_PROFIT_HARD=1.5 لكل الحالات)
 TP_BASE_GOOD       = 2.4   # سوق جيد → اسمح بمزيد
 TP_BASE_WEAK       = 1.4   # سوق ضعيف/سبريد واسع/زخم ضعيف → خذها بدري
-PARTIAL_COOLDOWN_SEC = 10
+
 LATE_FALLBACK_SEC  = 10 * 60
 LATE_LOCK_BACKSTEP = 0.8
 LATE_MIN_LOCK      = 0.5
@@ -75,7 +79,6 @@ OB_REQ_IMB         = 0.4
 OB_MAX_SPREAD_BP   = 150.0
 
 # ========= تهيئة عامة =========
-load_dotenv()
 app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -370,47 +373,95 @@ def _today_pnl():
     except Exception:
         return 0.0
 
+def _min_sell_ok(market: str, amount_base: float, min_eur: float = MIN_PARTIAL_EUR):
+    """يتأكد أن قيمة الأمر ≥ الحد الأدنى."""
+    p = fetch_price_ws_first(market)
+    return (p is not None) and (amount_base * p >= min_eur)
+    
 # ---- بيع جزئي (جديد) ----
 def sell_partial(trade: dict, frac: float, reason: str = ""):
-    """يبيع جزء من الصفقة ويحافظ على الباقي."""
-    frac = max(0.05, min(0.95, float(frac)))
-    amt = float(trade.get("amount", 0)) * frac
-    if amt <= 0:
-        return
-    send_message(f"💸 بيع جزئي {trade['symbol']} {frac*100:.0f}%{(' — '+reason) if reason else ''}")
-    place_resp = place_market_sell(trade["symbol"], amt)
-    if not (isinstance(place_resp, dict) and place_resp.get("status") == "filled"):
-        return
-    fills = place_resp.get("fills", [])
-    tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
-    proceeds_eur = tq_eur - fee_eur
-    orig_amt  = float(trade["amount"])
-    orig_cost = float(trade.get("cost_eur", trade["entry"]*trade["amount"]))
-    ratio = tb / orig_amt if orig_amt>0 else 1.0
-    attributed_cost = orig_cost * ratio
-    pnl_eur = proceeds_eur - attributed_cost
-    pnl_pct = (proceeds_eur / attributed_cost - 1.0) * 100.0 if attributed_cost>0 else 0.0
-    _accum_realized(pnl_eur)
-    with lock:
-        trade["amount"]   = max(0.0, orig_amt - tb)
-        trade["cost_eur"] = max(0.0, orig_cost - attributed_cost)
-    closed = trade.copy()
-    closed.update({
-        "exit_eur": proceeds_eur,
-        "sell_fee_eur": fee_eur,
-        "pnl_eur": pnl_eur,
-        "pnl_pct": pnl_pct,
-        "exit_time": time.time(),
-        "amount": tb,
-        "cost_eur": attributed_cost
-    })
-    with lock:
-        executed_trades.append(closed)
-        r.delete("nems:executed_trades")
-        for t in executed_trades:
-            r.rpush("nems:executed_trades", json.dumps(t))
-        r.set("nems:active_trades", json.dumps(active_trades))
+    """
+    يبيع جزء من الصفقة ويحافظ على الباقي مع:
+    - تبريد PARTIAL_COOLDOWN_SEC
+    - حد أدنى لقيمة الأمر MIN_PARTIAL_EUR
+    - تحديث executed_trades/active_trades/Redis
+    """
+    try:
+        # 1) تبريد
+        now = time.time()
+        lastp = float(trade.get("last_partial_at", 0))
+        if now - lastp < PARTIAL_COOLDOWN_SEC:
+            return  # تجاهل بهدوء
 
+        # 2) تحجيم النسبة
+        frac = max(0.05, min(0.95, float(frac)))
+        orig_amt  = float(trade.get("amount", 0) or 0)
+        if orig_amt <= 0:
+            return
+        sell_amt = orig_amt * frac
+
+        # 3) حدّ أدنى للقيمة
+        if not _min_sell_ok(trade["symbol"], sell_amt, MIN_PARTIAL_EUR):
+            # ما نرسل رسالة مزعجة — العملية صغيرة جدًا ببساطة
+            return
+
+        # 4) نفّذ أمر السوق
+        send_message(f"💸 بيع جزئي {trade['symbol']} {frac*100:.0f}%"
+                     f"{(' — ' + reason) if reason else ''}")
+        resp = place_market_sell(trade["symbol"], sell_amt)
+        if not (isinstance(resp, dict) and resp.get("status") == "filled"):
+            # ما نعدّها فشل قاتل؛ بس منع تكرار سريع
+            trade["last_partial_at"] = now
+            return
+
+        # 5) حساب النتائج
+        fills = resp.get("fills", [])
+        tb, tq_eur, fee_eur = totals_from_fills_eur(fills)
+        if tb <= 0:
+            trade["last_partial_at"] = now
+            return
+
+        proceeds_eur = tq_eur - fee_eur
+        orig_cost = float(trade.get("cost_eur", trade["entry"] * orig_amt))
+        ratio = tb / orig_amt if orig_amt > 0 else 1.0
+        attributed_cost = orig_cost * ratio
+        pnl_eur = proceeds_eur - attributed_cost
+        pnl_pct = (proceeds_eur / attributed_cost - 1.0) * 100.0 if attributed_cost > 0 else 0.0
+
+        # 6) تحديث حالة الصفقة + سجلات
+        _accum_realized(pnl_eur)
+        with lock:
+            # نزّل الكمية والتكلفة المتبقية
+            trade["amount"]   = max(0.0, orig_amt - tb)
+            trade["cost_eur"] = max(0.0, orig_cost - attributed_cost)
+            trade["last_partial_at"] = now
+
+            # سجل صفقة مُغلقة جزئيًا
+            closed = trade.copy()
+            closed.update({
+                "exit_eur": proceeds_eur,
+                "sell_fee_eur": fee_eur,
+                "pnl_eur": pnl_eur,
+                "pnl_pct": pnl_pct,
+                "exit_time": now,
+                "amount": tb,
+                "cost_eur": attributed_cost
+            })
+            executed_trades.append(closed)
+
+            # مزامنة Redis
+            r.delete("nems:executed_trades")
+            for t in executed_trades:
+                r.rpush("nems:executed_trades", json.dumps(t))
+            r.set("nems:active_trades", json.dumps(active_trades))
+
+        # 7) إشعار مختصر
+        send_message(f"✅ بيع جزئي {trade['symbol']} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
+
+    except Exception as e:
+        print("sell_partial error:", e)
+        # ما منعمل أي شيء آخر؛ الحلقة بتكمل طبيعي
+        return
 def sell_trade(trade: dict):
     market = trade["symbol"]
 
