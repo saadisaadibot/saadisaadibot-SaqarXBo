@@ -81,11 +81,11 @@ OB_MAX_SPREAD_BP   = 180.0
 
 # ========= إعدادات المحرّك الداخلي (Signal Engine) =========
 AUTO_ENABLED          = True   # تشغيل الإشارات الداخلية تلقائياً
-ENGINE_INTERVAL_SEC   = 1.5    # دورة فحص
-TOPN_WATCH            = 60     # عدد أزواج EUR الأعلى سيولة للمراقبة
-AUTO_THRESHOLD        = 55.0   # العتبة الأساسية للإشارة
-THRESH_SPREAD_BP_MAX  = 120.0  # أقصى سبريد مقبول
-THRESH_IMB_MIN        = 0.90   # أقل Imbalance مقبول
+ENGINE_INTERVAL_SEC   = 1.2    # دورة فحص
+TOPN_WATCH            = 80     # عدد أزواج EUR الأعلى سيولة للمراقبة
+AUTO_THRESHOLD        = 45.0   # العتبة الأساسية للإشارة
+THRESH_SPREAD_BP_MAX  = 150.0  # أقصى سبريد مقبول
+THRESH_IMB_MIN        = 0.80   # أقل Imbalance مقبول
 PARTIAL_SELL_ENABLED  = False  # بيع جزئي (مطفأ افتراضياً للمبلغ الصغير)
 
 # ========= من البيئة =========
@@ -630,8 +630,8 @@ def buy(symbol: str):
         req_imb    = 0.25
     elif price_now < 0.2:
         min_bid   = max(60.0, price_now * 1200)
-        max_spread = 90.0
-        req_imb    = 0.40
+        max_spread = 110.0
+        req_imb    = 0.38
     else:
         min_bid   = max(100.0, price_now * 80)
         max_spread = 120.0
