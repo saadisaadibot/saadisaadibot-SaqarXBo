@@ -22,61 +22,61 @@ MIN_PARTIAL_EUR      = float(os.getenv("MIN_PARTIAL_EUR", 5.0))
 MAX_TRADES = 2
 _OB_CACHE = {}
 # هدف ثابت "ذكي" (كان TAKE_PROFIT_HARD=1.5 لكل الحالات)
-TP_BASE_GOOD       = 2.4   # سوق جيد → اسمح بمزيد
-TP_BASE_WEAK       = 1.4   # سوق ضعيف/سبريد واسع/زخم ضعيف → خذها بدري
+TP_BASE_GOOD       = 2.6   # سوق جيد → اسمح بمزيد
+TP_BASE_WEAK       = 1.2   # سوق ضعيف/سبريد واسع/زخم ضعيف → خذها بدري
 
 LATE_FALLBACK_SEC  = 10 * 60
-LATE_LOCK_BACKSTEP = 0.8
-LATE_MIN_LOCK      = 0.5
-LATE_WEAK_R        = 0.10
+LATE_LOCK_BACKSTEP = 0.6
+LATE_MIN_LOCK      = 0.8
+LATE_WEAK_R        = 0.12
 
-DYN_SL_START       = -2.0
-DYN_SL_STEP        = 1.0
+DYN_SL_START       = -1.6
+DYN_SL_STEP        = 0.9
 
 MOM_LOOKBACK_SEC   = 120
 STALL_SEC          = 150
-DROP_FROM_PEAK_EXIT= 1.2
+DROP_FROM_PEAK_EXIT= 1.0
 
-MOM_R30_STRONG     = 0.50
-MOM_R90_STRONG     = 0.80
+MOM_R30_STRONG     = 0.60
+MOM_R90_STRONG     = 0.90
 
 SELL_RETRY_DELAY   = 5
 SELL_MAX_RETRIES   = 6
 
-EARLY_WINDOW_SEC   = 15 * 60
+EARLY_WINDOW_SEC   = 12 * 60
 
 BLACKLIST_EXPIRE_SECONDS = 300
-BUY_COOLDOWN_SEC   = 180
+BUY_COOLDOWN_SEC   = 240
 
 # حماية سريعة
-GRACE_SEC          = 45
-EARLY_CRASH_SL     = -3.4
-FAST_DROP_WINDOW   = 20
-FAST_DROP_PCT      = 1.3
+GRACE_SEC          = 35
+EARLY_CRASH_SL     = -3.0
+FAST_DROP_WINDOW   = 18
+FAST_DROP_PCT      = 1.2
 
 # ربح صغير
-MICRO_PROFIT_MIN   = 0.7
-MICRO_PROFIT_MAX   = 1.3
-MICRO_FAST_DROP    = 1.1
+MICRO_PROFIT_MIN   = 0.6
+MICRO_PROFIT_MAX   = 1.2
+MICRO_FAST_DROP    = 1.0
 
 # Trailing من القمة (تم تفعيل مبكّرًا للموجات 4–6%)
-GIVEBACK_RATIO     = 0.35
-GIVEBACK_MIN       = 1.5
-GIVEBACK_MAX       = 6.0
-PEAK_TRIGGER       = 4.0
+GIVEBACK_RATIO     = 0.32
+GIVEBACK_MIN       = 1.2
+GIVEBACK_MAX       = 5.0
+PEAK_TRIGGER       = 3.6
 
 # زخم سلبي قوي
-FAST_DROP_R30      = -1.3
-FAST_DROP_R90      = -3.2
+FAST_DROP_R30      = -1.0
+FAST_DROP_R90      = -3.0
 
 # حدود نزيف
-DAILY_STOP_EUR     = -8.0
+DAILY_STOP_EUR     = -6.0
 CONSEC_LOSS_BAN    = 2
 
 # دفتر الأوامر (قيم مرجعية فقط — الفعلي متكيّف)
-OB_MIN_BID_EUR     = 50.0
-OB_REQ_IMB         = 0.4
-OB_MAX_SPREAD_BP   = 150.0
+OB_MIN_BID_EUR     = 80.0
+OB_REQ_IMB         = 0.50
+OB_MAX_SPREAD_BP   = 120.0
 
 # ========= تهيئة عامة =========
 app = Flask(__name__)
