@@ -1013,52 +1013,70 @@ def engine_loop():
     global WATCHLIST_MARKETS
     while True:
         try:
+            # مفعّل تلقائيًا؟ والبوت عم يسمح بالشراء؟
             if not AUTO_ENABLED or not enabled:
-                time.sleep(1.0); continue
-            # حد الصفقات
+                time.sleep(1.0)
+                continue
+
+            # حدّ أقصى للصفقات المفتوحة
             with lock:
                 if len(active_trades) >= MAX_TRADES:
-                    time.sleep(0.8); continue
+                    time.sleep(0.8)
+                    continue
 
-            # حد خسارة اليوم
+            # حدّ الخسارة اليومي
             if _today_pnl() <= DAILY_STOP_EUR:
-                time.sleep(3.0); continue
+                time.sleep(3.0)
+                continue
 
-            # حدّث قائمة المراقبة حسب السيولة (كل ~60 ثانية عبر كاش)
+            # حدّث قائمة المراقبة (TopN حسب سيولة EUR)
             watch = top_eur_markets_by_volume(TOPN_WATCH)
             with _ws_lock:
                 WATCHLIST_MARKETS = set(watch)
+
+            # إذا القائمة فاضية، انتظر وارجع
             if not watch:
-                send_message("🔎 لا توجد أسواق في watchlist (ticker24h فاضي؟)")
+                # ما منبعت سبام؛ بنكتفي بالنوم والمتابعة
+                time.sleep(1.0)
+                continue
+
             now = time.time()
             best = None
-            # راقب الأسواق المختارة
+
+            # راقب الأسواق المختارة وحسب أفضل Score
             for market in watch:
                 price = fetch_price_ws_first(market)
                 if not price:
                     continue
+
                 _update_hist(market, now, price, is_trade=False)
                 score, r15, r30, r60, accel, spread, imb = _score_exploder(market, price)
-                # شروط إضافية بسيطة
+
+                # فلاتر إضافية سريعة
                 if spread > THRESH_SPREAD_BP_MAX or imb < THRESH_IMB_MIN:
                     continue
-                base = market.replace("-EUR","")
+
+                base = market.replace("-EUR", "")
                 if r.exists(f"ban24:{base}") or r.exists(f"cooldown:{base}"):
                     continue
-                # سجّل الأفضل
+
+                # انتقِ الأعلى Score
                 if (best is None) or (score > best[0]):
                     best = (score, market, r15, r30, r60, accel, spread, imb)
 
-            # نفّذ إذا فيه فرصة
+            # نفّذ شراء إذا تعدّى العتبة
             if best and best[0] >= AUTO_THRESHOLD:
                 score, market, r15, r30, r60, accel, spread, imb = best
-                base = market.replace("-EUR","")
+                base = market.replace("-EUR", "")
                 send_message(
-                    f"📡 إشارة داخلية {market} | score={score:.1f} | r15={r15:+.2f}% r30={r30:+.2f}% r60={r60:+.2f}% | "
+                    f"📡 إشارة داخلية {market} | score={score:.1f} | "
+                    f"r15={r15:+.2f}% r30={r30:+.2f}% r60={r60:+.2f}% | "
                     f"acc={accel:+.2f}% | spread={spread:.0f}bp | imb={imb:.2f}"
                 )
                 buy(base)
+
             time.sleep(ENGINE_INTERVAL_SEC)
+
         except Exception as e:
             print("engine error:", e)
             time.sleep(1.0)
