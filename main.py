@@ -153,7 +153,6 @@ _ws_prices = {}     # market -> {"price": float, "ts": epoch}
 _ws_lock = Lock()
 _ws_conn = None
 _ws_running = False
-_ws_subscribed = set()
 _ws_wanted = set()  # الماركتات المطلوب تتبّعها
 
 def _ws_markets_from_active():
