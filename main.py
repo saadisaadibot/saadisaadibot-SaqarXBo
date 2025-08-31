@@ -1028,7 +1028,8 @@ def engine_loop():
             watch = top_eur_markets_by_volume(TOPN_WATCH)
             with _ws_lock:
                 WATCHLIST_MARKETS = set(watch)
-
+            if not watch:
+                send_message("🔎 لا توجد أسواق في watchlist (ticker24h فاضي؟)")
             now = time.time()
             best = None
             # راقب الأسواق المختارة
