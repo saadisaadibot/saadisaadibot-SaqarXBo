@@ -4,7 +4,7 @@ Nems — ULTRA NITRO (Bitvavo EUR)
 - Ultra-aggressive momentum+accel scalper + orderbook sanity
 - 1m backfill for instant metrics, widened sniper/thresholds
 - Aggressive replacement and quick TP / soft giveback / short time-stop
-- Position sizing for small bankrolls: 50% → 30% → 20% (configurable)
+- Position sizing: 50% → 50% (صغيرة الرصيد)
 
 تنبيه: مخاطرة عالية. عدّل DAILY_STOP/TP/SL حسب رسومك وقدرتك على تحمل المخاطر.
 """
@@ -37,7 +37,7 @@ WS_URL      = "wss://ws.bitvavo.com/v2/"
 
 # ===== ULTRA Settings =====
 MAX_TRADES              = 2
-BUY_FRACTIONS           = [0.50, 0.50]   # يقسّم الرصيد الحر لحظة الدخول حسب عدد الصفقات المفتوحة
+BUY_FRACTIONS           = [0.50, 0.50]   # تقسيم الرصيد الحر لحظة الدخول: 50% ثم 50%
 ENGINE_INTERVAL_SEC     = 0.25
 TOPN_WATCH              = 80
 
@@ -348,7 +348,7 @@ def _next_fraction():
         k=len(active_trades)
     if k < len(BUY_FRACTIONS):
         return BUY_FRACTIONS[k]
-    return max(0.1, 1.0 - sum(BUY_FRACTIONS))  # احتياطي لو عدّل أحد الإعدادات
+    return max(0.1, 1.0 - sum(BUY_FRACTIONS))  # احتياطي لو تغيّر الإعداد
 
 def buy(base_symbol):
     base=base_symbol.upper().strip()
@@ -362,6 +362,11 @@ def buy(base_symbol):
     min_bid,max_spread,req_imb=_adaptive_ob_requirements(price_now)
     ok,why,feats=orderbook_guard(market, min_bid_eur=min_bid, req_imb=req_imb, max_spread_bp=max_spread)
     if not ok:
+        # توضيح سبب الرفض لسهولة الديبغ
+        send_message(
+            f"⛔ رفض {base}: {why} | spread={feats.get('spread_bp',0):.0f}bp, "
+            f"imb={feats.get('imb',0):.2f}, bid€={feats.get('bid_eur',0):.0f}"
+        )
         r.setex(f"cooldown:{base}", 90, 1)
         return
 
@@ -558,7 +563,6 @@ def engine_loop():
 
             with lk:
                 full=len(active_trades)>=MAX_TRADES
-            if full: time.sleep(ENGINE_INTERVAL_SEC); continue
 
             refresh_watchlist()
             watch=list(WATCHLIST_MARKETS)
@@ -566,7 +570,8 @@ def engine_loop():
 
             now=time.time(); best=None
             regime=btc_regime_boost()
-            thr=AUTO_THRESHOLD - regime
+            # Clamp للعَتبة كي لا تصبح أوفر-أجريسف في الهدوء
+            thr=max(8.0, AUTO_THRESHOLD - regime)
 
             for m in watch:
                 p=fetch_price_ws_first(m)
@@ -674,11 +679,14 @@ def webhook():
         return "ok"
     if starts("buy","اشتري","إشتري"):
         try:
-            sym=re.search(r"[A-Za-z0-9\-]+", text).group(0).upper()
-            if "-" in sym: sym=sym.split("-")[0]
+            parts = re.split(r"\s+", text.strip(), maxsplit=1)
+            sym = parts[1].upper() if len(parts) > 1 else ""
+            if "-" in sym: sym = sym.split("-")[0]
             if sym.endswith("EUR") and len(sym)>3: sym=sym[:-3]
-            sym=re.sub(r"[^A-Z0-9]","", sym)
+            sym = re.sub(r"[^A-Z0-9]", "", sym)
         except Exception:
+            send_message("❌ الصيغة: buy ADA"); return "ok"
+        if not sym:
             send_message("❌ الصيغة: buy ADA"); return "ok"
         buy(sym); return "ok"
     if has("balance","الرصيد","رصيد"):
@@ -718,6 +726,11 @@ try:
     executed_trades=[json.loads(t) for t in et]
     if not r.exists(SINCE_RESET_KEY): r.set(SINCE_RESET_KEY, 0)
 except Exception as e: print("state load err:", e)
+
+# تأكيد اشتراك WS بالأسواق المفتوحة بعد تحميل الحالة
+with _ws_lock:
+    for t in active_trades:
+        WATCHLIST_MARKETS.add(t["symbol"])
 
 if __name__=="__main__" and RUN_LOCAL:
     app.run(host="0.0.0.0", port=5000)
