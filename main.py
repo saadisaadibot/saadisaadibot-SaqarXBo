@@ -18,21 +18,20 @@ from collections import deque
 load_dotenv()
 
 # ========= إعدادات أساسية/سلوك البوت =========
-# (نفس أسلوبنا القديم للشراء: صفقتان كحد أقصى، 50% + 50%)# ========= إعدادات أساسية/سلوك البوت =========
-MAX_TRADES = 2
+# (نفس أسلوبنا القديم للشراء: صفقتان كحد أقصى، 50% + 50%)# ========= إعدادات أساسية/سلوك البوت =========MAX_TRADES = 2
 _OB_CACHE = {}
 
-# هدف ثابت "ذكي" (خروج أسرع شوي لتفادي ارتداد من القمة)
-TP_BASE_GOOD       = 2.2     # كان 2.4
-TP_BASE_WEAK       = 1.2     # كان 1.4
+# هدف ثابت "ذكي" (أسرع خروج لالتقاط الربح بسرعة)
+TP_BASE_GOOD       = 1.8     # كان 2.2
+TP_BASE_WEAK       = 1.0     # كان 1.2
 
 LATE_FALLBACK_SEC  = 10 * 60
 LATE_LOCK_BACKSTEP = 0.8
 LATE_MIN_LOCK      = 0.5
 LATE_WEAK_R        = 0.10
 
-# قصّ الخسارة أبكر نصف درجة
-DYN_SL_START       = -1.8    # كان -2.0
+# اسمح بتذبذب أكبر (مخاطرة أعلى)
+DYN_SL_START       = -2.2    # كان -1.8
 DYN_SL_STEP        = 1.0
 
 MOM_LOOKBACK_SEC   = 120
@@ -48,13 +47,13 @@ SELL_MAX_RETRIES   = 6
 EARLY_WINDOW_SEC   = 15 * 60
 
 BLACKLIST_EXPIRE_SECONDS = 300
-BUY_COOLDOWN_SEC   = 120     # خليه نفسه حالياً
+BUY_COOLDOWN_SEC   = 75      # كان 120 → فرص أكثر
 
-# حماية سريعة (استجابة أسرع لهبوط مفاجئ)
-GRACE_SEC          = 30      # كان 45
+# حماية سريعة (تبقى يقِظة لكن أقل تشددًا)
+GRACE_SEC          = 25      # كان 30
 EARLY_CRASH_SL     = -3.4
-FAST_DROP_WINDOW   = 18      # كان 20
-FAST_DROP_PCT      = 1.2     # كان 1.3
+FAST_DROP_WINDOW   = 15      # كان 18
+FAST_DROP_PCT      = 1.2
 
 # ربح صغير
 MICRO_PROFIT_MIN   = 0.7
@@ -75,23 +74,23 @@ FAST_DROP_R90      = -3.2
 DAILY_STOP_EUR     = -8.0
 CONSEC_LOSS_BAN    = 2
 
-# دفتر الأوامر (مرجعي — الفعلي متكيّف)
+# دفتر الأوامر (أوسع قليلًا لالتقاط فرص أكثر)
 OB_MIN_BID_EUR     = 45.0
-OB_REQ_IMB         = 0.30
-OB_MAX_SPREAD_BP   = 180.0
+OB_REQ_IMB         = 0.28    # كان 0.30
+OB_MAX_SPREAD_BP   = 200.0   # كان 180.0
 
 # ========= إعدادات المحرّك الداخلي (Signal Engine) =========
 AUTO_ENABLED          = True
-ENGINE_INTERVAL_SEC   = 1.0     # كان 1.2 → مراقبة أسرع بقليل
-TOPN_WATCH            = 60      # كان 80 → ركّز أكثر على الأعلى سيولة
-AUTO_THRESHOLD        = 55.0    # كان 45.0 → لا تشتري أي دفعة ضعيفة/متأخرة
-THRESH_SPREAD_BP_MAX  = 110.0   # كان 150.0 → لا نطارد القمم بسبريد واسع
-THRESH_IMB_MIN        = 1.05    # كان 0.80 → لازم يكون الطّلب غالب وقت الدخول
+ENGINE_INTERVAL_SEC   = 0.8     # كان 1.0 → أسرع
+TOPN_WATCH            = 100     # كان 60 → مراقبة أوسع
+AUTO_THRESHOLD        = 48.0    # كان 55.0 → يلتقط دفعات أكثر
+THRESH_SPREAD_BP_MAX  = 150.0   # كان 110.0
+THRESH_IMB_MIN        = 0.90    # كان 1.05
 PARTIAL_SELL_ENABLED  = False
+
 # ========= من البيئة =========
 PARTIAL_COOLDOWN_SEC  = int(os.getenv("PARTIAL_COOLDOWN_SEC", 10))
 MIN_PARTIAL_EUR       = float(os.getenv("MIN_PARTIAL_EUR", 5.0))
-
 # ========= تهيئة عامة =========
 app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
