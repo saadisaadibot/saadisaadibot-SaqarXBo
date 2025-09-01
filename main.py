@@ -18,20 +18,21 @@ from collections import deque
 load_dotenv()
 
 # ========= إعدادات أساسية/سلوك البوت =========
-# (نفس أسلوبنا القديم للشراء: صفقتان كحد أقصى، 50% + 50%)
+# (نفس أسلوبنا القديم للشراء: صفقتان كحد أقصى، 50% + 50%)# ========= إعدادات أساسية/سلوك البوت =========
 MAX_TRADES = 2
 _OB_CACHE = {}
 
-# هدف ثابت "ذكي"
-TP_BASE_GOOD       = 2.4
-TP_BASE_WEAK       = 1.4
+# هدف ثابت "ذكي" (خروج أسرع شوي لتفادي ارتداد من القمة)
+TP_BASE_GOOD       = 2.2     # كان 2.4
+TP_BASE_WEAK       = 1.2     # كان 1.4
 
 LATE_FALLBACK_SEC  = 10 * 60
 LATE_LOCK_BACKSTEP = 0.8
 LATE_MIN_LOCK      = 0.5
 LATE_WEAK_R        = 0.10
 
-DYN_SL_START       = -2.0
+# قصّ الخسارة أبكر نصف درجة
+DYN_SL_START       = -1.8    # كان -2.0
 DYN_SL_STEP        = 1.0
 
 MOM_LOOKBACK_SEC   = 120
@@ -47,13 +48,13 @@ SELL_MAX_RETRIES   = 6
 EARLY_WINDOW_SEC   = 15 * 60
 
 BLACKLIST_EXPIRE_SECONDS = 300
-BUY_COOLDOWN_SEC   = 120
+BUY_COOLDOWN_SEC   = 120     # خليه نفسه حالياً
 
-# حماية سريعة
-GRACE_SEC          = 45
+# حماية سريعة (استجابة أسرع لهبوط مفاجئ)
+GRACE_SEC          = 30      # كان 45
 EARLY_CRASH_SL     = -3.4
-FAST_DROP_WINDOW   = 20
-FAST_DROP_PCT      = 1.3
+FAST_DROP_WINDOW   = 18      # كان 20
+FAST_DROP_PCT      = 1.2     # كان 1.3
 
 # ربح صغير
 MICRO_PROFIT_MIN   = 0.7
@@ -80,14 +81,13 @@ OB_REQ_IMB         = 0.30
 OB_MAX_SPREAD_BP   = 180.0
 
 # ========= إعدادات المحرّك الداخلي (Signal Engine) =========
-AUTO_ENABLED          = True   # تشغيل الإشارات الداخلية تلقائياً
-ENGINE_INTERVAL_SEC   = 1.2    # دورة فحص
-TOPN_WATCH            = 80     # عدد أزواج EUR الأعلى سيولة للمراقبة
-AUTO_THRESHOLD        = 45.0   # العتبة الأساسية للإشارة
-THRESH_SPREAD_BP_MAX  = 150.0  # أقصى سبريد مقبول
-THRESH_IMB_MIN        = 0.80   # أقل Imbalance مقبول
-PARTIAL_SELL_ENABLED  = False  # بيع جزئي (مطفأ افتراضياً للمبلغ الصغير)
-
+AUTO_ENABLED          = True
+ENGINE_INTERVAL_SEC   = 1.0     # كان 1.2 → مراقبة أسرع بقليل
+TOPN_WATCH            = 60      # كان 80 → ركّز أكثر على الأعلى سيولة
+AUTO_THRESHOLD        = 58.0    # كان 45.0 → لا تشتري أي دفعة ضعيفة/متأخرة
+THRESH_SPREAD_BP_MAX  = 110.0   # كان 150.0 → لا نطارد القمم بسبريد واسع
+THRESH_IMB_MIN        = 1.05    # كان 0.80 → لازم يكون الطّلب غالب وقت الدخول
+PARTIAL_SELL_ENABLED  = False
 # ========= من البيئة =========
 PARTIAL_COOLDOWN_SEC  = int(os.getenv("PARTIAL_COOLDOWN_SEC", 10))
 MIN_PARTIAL_EUR       = float(os.getenv("MIN_PARTIAL_EUR", 5.0))
@@ -630,12 +630,12 @@ def buy(symbol: str):
         req_imb    = 0.25
     elif price_now < 0.2:
         min_bid   = max(60.0, price_now * 1200)
-        max_spread = 110.0
-        req_imb    = 0.38
+        max_spread = 90.0
+        req_imb    = 0.45
     else:
         min_bid   = max(100.0, price_now * 80)
-        max_spread = 120.0
-        req_imb    = 0.30
+        max_spread = 110.0
+        req_imb    = 0.35
     ok, why, feats = orderbook_guard(
         market,
         min_bid_eur=min_bid,
