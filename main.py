@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Nems — ULTRA NITRO v2 (Bitvavo EUR)
-Aggressive momentum+accel scalper مع حراسة دفتر أوامر مشددة وتقليل churn.
+Nems — ULTRA ONE-SHOT (Bitvavo EUR)
+• صفقة واحدة فقط – شراء بكل الرصيد.
+• لا بيع إذا الصفقة غير خسرانة إلا لو ظهرت فرصة أقوى (Replacement ذكي).
+• مخارج أمان فقط: SL ديناميكي + Crash + حد يومي.
 """
 
 import os, re, time, json, traceback, statistics as st
@@ -13,74 +15,52 @@ from flask import Flask, request
 from dotenv import load_dotenv
 import websocket
 
-# ===== Boot / ENV =====
 load_dotenv()
 app = Flask(__name__)
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
-API_KEY     = os.getenv("BITVAVO_API_KEY")
-API_SECRET  = os.getenv("BITVAVO_API_SECRET")
-REDIS_URL   = os.getenv("REDIS_URL")
-RUN_LOCAL   = os.getenv("RUN_LOCAL","0")=="1"
+BOT_TOKEN   = os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
+API_KEY     = os.getenv("BITVAVO_API_KEY"); API_SECRET=os.getenv("BITVAVO_API_SECRET")
+REDIS_URL   = os.getenv("REDIS_URL"); RUN_LOCAL=os.getenv("RUN_LOCAL","0")=="1"
 
 r  = redis.from_url(REDIS_URL) if REDIS_URL else redis.Redis()
 lk = Lock()
 
-BASE_URL    = "https://api.bitvavo.com/v2"
-WS_URL      = "wss://ws.bitvavo.com/v2/"
+BASE_URL = "https://api.bitvavo.com/v2"
+WS_URL   = "wss://ws.bitvavo.com/v2/"
 
-# ===== Settings (مشددّة لتقليل النزيف) =====
-MAX_TRADES              = 1
-BUY_FRACTIONS           = [100]      # 50% ثم 50%
-
+# ===== Settings =====
+MAX_TRADES              = 1                 # صفقة واحدة
 ENGINE_INTERVAL_SEC     = 0.25
 TOPN_WATCH              = 80
 
-AUTO_THRESHOLD          = 18.0              # عتبة عامة
-THRESH_SPREAD_BP_MAX    = 160.0             # سقف سبريد عام أشد
-THRESH_IMB_MIN          = 0.95              # حد أدنى ميل عروض/طلبات
+AUTO_THRESHOLD          = 18.0
+THRESH_SPREAD_BP_MAX    = 140.0
+THRESH_IMB_MIN          = 1.00
 
 DAILY_STOP_EUR          = -30.0
-BUY_COOLDOWN_SEC        = 90                # تبريد أعلى
-BAN_LOSS_PCT            = -5.0
+BUY_COOLDOWN_SEC        = 90
+BAN_LOSS_PCT            = -6.0
 CONSEC_LOSS_BAN         = 3
 BLACKLIST_EXPIRE_SECONDS= 180
 
-EARLY_WINDOW_SEC        = 5*60
+# SL/Crash فقط (لا TP ولا TimeStop ولا Giveback)
 DYN_SL_START            = -3.6
 DYN_SL_STEP             = 0.8
-DROP_FROM_PEAK_EXIT     = 0.9
-PEAK_TRIGGER            = 1.5
-GIVEBACK_RATIO          = 0.55
-GIVEBACK_CAP            = 1.6
-TP_WEAK                 = 0.9               # رفعت الهدف الضعيف قليلاً
-TP_GOOD                 = 1.1
-TIME_STOP_MIN           = 8*60              # أطول
-TIME_STOP_PNL_LO        = -0.6
-TIME_STOP_PNL_HI        = 0.9
+CRASH_DROP_PCT          = 1.2              # هبوط سريع خلال 12s + خاسرة أقل من -1.6%
+CRASH_WINDOW_SEC        = 12
+CRASH_EXTRA_PNL         = -1.6
 
-# منع اللف بعد الشراء + حماية قرب نقطة التعادل
-NO_CHURN_WINDOW_S       = 90
-BE_PROTECT              = -0.20             # لا نخرج بالتايم/الاستبدال إذا pnl أفضل من -0.2%
+# Replacement: فقط إن كانت الصفقة الحالية غير خاسرة تقريبًا
+NO_CHURN_WINDOW_S       = 90               # لا تبديل قبل 90s
+REPL_BETTER_DELTA       = 8.0              # لازم المرشح يتفوّق على الحالي بهذا الهامش
+REPL_ALLOW_IF_PNL_GE    = -0.10            # نعتبرها غير خسرانة لو ≥ -0.10%
+REPL_MIN_AGE_S          = 90
 
-# استبدال أهدى
-MIN_REPL_AGE_S          = 180               # 3 دقائق
-REPL_EXTRA_SCORE        = 6.0               # الجديد لازم يتفوّق
-REPL_MAX_LOSS           = -0.30             # ما نستبدل إلا إذا الأضعف ≤ -0.30%
-
-# ===== WS & caches =====
-_ws_lock = Lock()
-_ws_prices = {}    # market -> {price,ts}
-_ws_conn=None; _ws_running=False
-
-WATCHLIST_MARKETS=set()
-_prev_watch=set()
-HISTS={}
-OB_CACHE={}
-VOL_CACHE={}
-WATCH_REFRESH_SEC=150
-_last_watch=0
+# ===== Caches/State =====
+_ws_lock=Lock(); _ws_prices={}; _ws_conn=None; _ws_running=False
+WATCHLIST_MARKETS=set(); _prev_watch=set()
+HISTS={}; OB_CACHE={}; VOL_CACHE={}
+WATCH_REFRESH_SEC=150; _last_watch=0
 
 enabled=True; auto_enabled=True
 active_trades=[]; executed_trades=[]
@@ -89,8 +69,7 @@ SINCE_RESET_KEY="nems:since_reset"
 # ===== Utils =====
 def send_message(text):
     try:
-        if not (BOT_TOKEN and CHAT_ID):
-            print("TG:", text); return
+        if not (BOT_TOKEN and CHAT_ID): print("TG:", text); return
         key="dedup:"+str(abs(hash(text))%(10**12))
         if r.setnx(key,1):
             r.expire(key,60)
@@ -104,20 +83,14 @@ def create_sig(ts, method, path, body_str=""):
     return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def bv_request(method, path, body=None, timeout=10):
-    url=f"{BASE_URL}{path}"
-    ts=str(int(time.time()*1000))
+    url=f"{BASE_URL}{path}"; ts=str(int(time.time()*1000))
     body_str="" if method=="GET" else json.dumps(body or {}, separators=(',',':'))
     sig=create_sig(ts,method,f"/v2{path}",body_str)
-    headers={
-        'Bitvavo-Access-Key':API_KEY,
-        'Bitvavo-Access-Timestamp':ts,
-        'Bitvavo-Access-Signature':sig,
-        'Bitvavo-Access-Window':'10000'
-    }
+    headers={'Bitvavo-Access-Key':API_KEY,'Bitvavo-Access-Timestamp':ts,
+             'Bitvavo-Access-Signature':sig,'Bitvavo-Access-Window':'10000'}
     try:
         resp=requests.request(method,url,headers=headers,
-                              json=(body or {}) if method!="GET" else None,
-                              timeout=timeout)
+                              json=(body or {}) if method!="GET" else None, timeout=timeout)
         return resp.json()
     except Exception as e:
         print("bv_request err:", e); return {"error":"request_failed"}
@@ -127,15 +100,13 @@ def get_eur_available()->float:
         bals=bv_request("GET","/balance")
         if isinstance(bals,list):
             for b in bals:
-                if b.get("symbol")=="EUR":
-                    return max(0.0, float(b.get("available",0) or 0))
+                if b.get("symbol")=="EUR": return max(0.0, float(b.get("available",0) or 0))
     except Exception: pass
     return 0.0
 
 def fetch_price_ws_first(market, staleness=2.0):
     now=time.time()
-    with _ws_lock:
-        rec=_ws_prices.get(market)
+    with _ws_lock: rec=_ws_prices.get(market)
     if rec and (now-rec["ts"])<=staleness: return rec["price"]
     try:
         j=requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=5).json()
@@ -167,7 +138,7 @@ def _ws_on_message(ws,msg):
     if isinstance(d,dict) and d.get("event")=="ticker":
         m=d.get("market"); price=d.get("price") or d.get("lastPrice") or d.get("open")
         try:
-            p=float(price); 
+            p=float(price)
             if p>0:
                 with _ws_lock: _ws_prices[m]={"price":p,"ts":time.time()}
         except Exception: pass
@@ -195,8 +166,7 @@ def _init_hist(m):
 def _update_hist(m,ts,price):
     _init_hist(m); HISTS[m]["hist"].append((ts,price))
     cutoff=ts-300
-    while HISTS[m]["hist"] and HISTS[m]["hist"][0][0]<cutoff:
-        HISTS[m]["hist"].popleft()
+    while HISTS[m]["hist"] and HISTS[m]["hist"][0][0]<cutoff: HISTS[m]["hist"].popleft()
 
 def _mom_metrics_symbol(m, price_now):
     _init_hist(m); hist=HISTS[m]["hist"]
@@ -236,8 +206,7 @@ def fetch_orderbook(m, ttl=1.6):
     except Exception: pass
     return None
 
-def orderbook_guard(market, min_bid_eur=60.0, req_imb=THRESH_IMB_MIN, max_spread_bp=THRESH_SPREAD_BP_MAX, depth_used=3):
-    """فلتر دفتر أوامر أشد + حد أدنى EUR أعلى لالتقاط تعبئة أفضل."""
+def orderbook_guard(market, min_bid_eur=120.0, req_imb=THRESH_IMB_MIN, max_spread_bp=THRESH_SPREAD_BP_MAX, depth_used=3):
     ob=fetch_orderbook(market)
     if not ob or not ob.get("bids") or not ob.get("asks"): return False,"no_book",{}
     try:
@@ -318,7 +287,7 @@ def score_exploder(market, price_now):
     acc_pts = max(0.0, min(24.0, 10.0*max(0.0, accel)))
     ob_pts  = 0.0
     if ok:
-        if spread <= 140.0: ob_pts += max(0.0, min(10.0, (140.0-spread)*0.10))
+        if spread <= 120.0: ob_pts += max(0.0, min(10.0, (120.0-spread)*0.12))
         if imb >= 1.00:     ob_pts += max(0.0, min(10.0, (imb-1.00)*12.0))
         if spread <= 80.0:  ob_pts += 3.0
         if imb >= 1.20:     ob_pts += 4.0
@@ -342,32 +311,20 @@ def place_order(side, market, amount=None, amount_quote=None):
     return bv_request("POST","/order", body)
 
 def _adaptive_ob_requirements(price_now):
-    """فلتر تكيفي أشد حسب السعر."""
-    if price_now < 0.02:
-        return max(30.0, price_now*800), 260.0, 0.90
-    elif price_now < 0.2:
-        return max(60.0, price_now*300), 200.0, 0.95
-    else:
-        return max(120.0, price_now*80), 160.0, 1.00
-
-def _next_fraction():
-    with lk: k=len(active_trades)
-    return BUY_FRACTIONS[k] if k < len(BUY_FRACTIONS) else max(0.1, 1.0 - sum(BUY_FRACTIONS))
+    if price_now < 0.02:  return max(60.0, price_now*1200), 220.0, 1.00
+    elif price_now < 0.2: return max(100.0, price_now*400), 160.0, 1.00
+    else:                 return max(150.0, price_now*80), 140.0, 1.00
 
 def buy(base_symbol):
     base=base_symbol.upper().strip()
-    if _today_pnl() <= DAILY_STOP_EUR:
-        send_message("⛔ توقف شراء لباقي اليوم."); return
-    if r.exists(f"ban24:{base}") or r.exists(f"cooldown:{base}"):
-        return
+    if _today_pnl() <= DAILY_STOP_EUR: send_message("⛔ توقف شراء لباقي اليوم."); return
+    if r.exists(f"ban24:{base}") or r.exists(f"cooldown:{base}"): return
     market=f"{base}-EUR"
 
     price_now=fetch_price_ws_first(market) or 0.0
     min_bid,max_spread,req_imb=_adaptive_ob_requirements(price_now)
-    ok,_,_ = orderbook_guard(market, min_bid_eur=min_bid, req_imb=req_imb, max_spread_bp=max_spread)
-    if not ok:
-        r.setex(f"cooldown:{base}", 90, 1)
-        return
+    ok,_,_=orderbook_guard(market, min_bid_eur=min_bid, req_imb=req_imb, max_spread_bp=max_spread)
+    if not ok: r.setex(f"cooldown:{base}", 90, 1); return
 
     with lk:
         if any(t["symbol"]==market for t in active_trades): return
@@ -375,10 +332,7 @@ def buy(base_symbol):
 
     eur=get_eur_available()
     if eur<5.0: return
-    frac=_next_fraction()
-    amt_quote=round(max(5.0, eur*frac), 2)
-    if amt_quote<5.0: return
-
+    amt_quote=round(max(5.0, eur*0.98), 2)   # 98% لتفادي خطأ الرسوم
     res=place_order("buy", market, amount_quote=amt_quote)
     if not (isinstance(res,dict) and res.get("status")=="filled"):
         r.setex(f"blacklist:buy:{base}", BLACKLIST_EXPIRE_SECONDS, 1); return
@@ -394,7 +348,7 @@ def buy(base_symbol):
         r.set("nems:active_trades", json.dumps(active_trades))
         r.rpush("nems:executed_trades", json.dumps(tr))
     with _ws_lock: WATCHLIST_MARKETS.add(market)
-    send_message(f"✅ شراء {base} | €{amt_quote:.2f} ({frac*100:.0f}%) | SL {DYN_SL_START:.1f}%")
+    send_message(f"✅ شراء {base} | €{amt_quote:.2f} (100%) | SL {DYN_SL_START:.1f}%")
 
 def sell_trade(tr):
     market=tr["symbol"]; base=market.replace("-EUR","")
@@ -435,11 +389,10 @@ def sell_trade(tr):
                 break
         r.delete("nems:executed_trades")
         for t in executed_trades: r.rpush("nems:executed_trades", json.dumps(t))
-    cd = 90 if pnl_pct>-0.5 else max(90, BUY_COOLDOWN_SEC)
-    r.setex(f"cooldown:{base}", cd, 1)
+    r.setex(f"cooldown:{base}", BUY_COOLDOWN_SEC, 1)
     send_message(f"💰 بيع {base} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
-# ===== Monitor / Exits =====
+# ===== Monitor (SL/Crash فقط) =====
 def _update_trade_hist(tr, ts, price):
     if "hist" not in tr: tr["hist"]=deque(maxlen=600)
     tr["hist"].append((ts,price))
@@ -451,13 +404,6 @@ def _price_n_seconds_ago(tr, now_ts, sec):
     for ts,p in reversed(hist):
         if ts<=cutoff: return p
     return None
-
-def _fast_drop(tr, now_ts, price_now, window=12, drop=0.9):
-    p=_price_n_seconds_ago(tr, now_ts, window)
-    if p and p>0:
-        d=(price_now/p-1.0)*100.0
-        return d<=-drop, d
-    return False,0.0
 
 def monitor_loop():
     while True:
@@ -476,95 +422,32 @@ def monitor_loop():
                 inc=int(max(0.0,pnl)//1); base=DYN_SL_START + inc*DYN_SL_STEP
                 tr["sl_dyn"]=max(tr.get("sl_dyn",DYN_SL_START), base)
 
-                # r30/r90 تقديري
-                hist=tr.get("hist",deque())
-                if hist:
-                    now_ts=hist[-1][0]; p30=p90=None
-                    for ts,p in hist:
-                        age=now_ts-ts
-                        if p30 is None and age>=30: p30=p
-                        if p90 is None and age>=90: p90=p
-                    basep=hist[0][1]
-                    p30=p30 or basep; p90=p90 or basep
-                    r30=(cur/p30-1.0)*100.0 if p30>0 else 0.0
-                    r90=(cur/p90-1.0)*100.0 if p90>0 else 0.0
-                else: r30=r90=0.0
-
-                age = now - tr.get("opened_at",now)
-
-                # نافذة منع اللف
-                if age < NO_CHURN_WINDOW_S:
-                    # مسموح فقط SL/TP/Crash
-                    pass
-
-                # هدف سريع حسب الحالة
-                ob_ok,_,obf=orderbook_guard(m)
-                spread=obf.get("spread_bp",999.0) if obf else 999.0
-                imb=obf.get("imb",0.0) if obf else 0.0
-                weak=(not ob_ok) or (spread>140.0) or (imb<1.0) or (r30<0 and r90<0)
-                tp=TP_WEAK if weak else TP_GOOD
-                if spread>110.0 and not weak: tp=max(TP_WEAK, 0.9)
-
-                if pnl>=tp and tr.get("peak_pct",0.0)<(tp+0.4):
-                    tr["exit_in_progress"]=True; tr["last_exit_try"]=now
-                    sell_trade(tr); tr["exit_in_progress"]=False; continue
-
-                # Giveback من القمة
-                peak=tr.get("peak_pct",0.0)
-                if peak>=PEAK_TRIGGER:
-                    give=min(GIVEBACK_CAP, GIVEBACK_RATIO*peak)
-                    desired=peak-give
-                    if desired>tr.get("sl_dyn",DYN_SL_START): tr["sl_dyn"]=desired
-                    if (peak-pnl)>=give and (r30<=-0.25 or r90<=0.0):
-                        if age >= NO_CHURN_WINDOW_S:  # احترام نافذة عدم اللف
-                            tr["exit_in_progress"]=True; tr["last_exit_try"]=now
-                            sell_trade(tr); tr["exit_in_progress"]=False; continue
-
-                # SL
+                # SL فقط
                 if pnl<=tr.get("sl_dyn",DYN_SL_START):
                     tr["exit_in_progress"]=True; tr["last_exit_try"]=now
                     sell_trade(tr); tr["exit_in_progress"]=False; continue
 
-                # Time-stop (مع حماية BE)
-                if age>=TIME_STOP_MIN and TIME_STOP_PNL_LO<=pnl<=TIME_STOP_PNL_HI and r90<=0.0:
-                    if age >= NO_CHURN_WINDOW_S and pnl <= BE_PROTECT:
+                # Crash سريع
+                p=_price_n_seconds_ago(tr, now, CRASH_WINDOW_SEC)
+                if p and p>0:
+                    d=(cur/p-1.0)*100.0
+                    if d<=-CRASH_DROP_PCT and pnl<=CRASH_EXTRA_PNL:
                         tr["exit_in_progress"]=True; tr["last_exit_try"]=now
                         sell_trade(tr); tr["exit_in_progress"]=False; continue
 
-                # Crash سريع
-                crash,d12=_fast_drop(tr, now, cur, window=12, drop=0.9)
-                if crash and pnl<-1.4:
-                    tr["exit_in_progress"]=True; tr["last_exit_try"]=now
-                    sell_trade(tr); tr["exit_in_progress"]=False; continue
-
-            time.sleep(0.18)
+            time.sleep(0.2)
         except Exception as e:
             print("monitor err:", e); time.sleep(1)
 Thread(target=monitor_loop, daemon=True).start()
 
-# ===== Engine + Replacement =====
-def weakest_open_trade():
-    with lk: arr=list(active_trades)
-    if not arr: return None
-    worst=None; score=None; now=time.time()
-    for t in arr:
-        cur=fetch_price_ws_first(t["symbol"]) or t["entry"]
-        pnl=(cur/t["entry"]-1.0)*100.0
-        age_min=(now - t.get("opened_at",now))/60.0
-        sc=pnl - 0.08*min(age_min, 10.0)  # عقوبة عمر أخف
-        if score is None or sc<score: worst,score=t,sc
-    return worst
-
-def btc_regime_boost():
-    try:
-        m="BTC-EUR"
-        cs=requests.get(f"{BASE_URL}/{m}/candles?interval=1m&limit=15", timeout=4).json()
-        closes=[float(c[4]) for c in cs if isinstance(c,list) and len(c)>=5]
-        if len(closes)<5: return 0.0
-        rets=[closes[i]/closes[i-1]-1.0 for i in range(1,len(closes))]
-        v5=abs(sum(rets[-5:]))*100.0
-        return 6.0 if v5>=0.9 else (3.0 if v5>=0.6 else 0.0)
-    except Exception: return 0.0
+# ===== Replacement Logic (فرصة أقوى فقط) =====
+def current_trade_strength(tr):
+    """نحوّل الربحية الآنية + زخم السوق لدرجة 0..100 للمقارنة."""
+    m=tr["symbol"]; price=fetch_price_ws_first(m) or tr["entry"]
+    _update_hist(m, time.time(), price)
+    sc, r15, r30, r60, acc, spr, imb, snp = score_exploder(m, price)
+    pnl=((price/float(tr["entry"]))-1.0)*100.0
+    return sc + max(0.0, pnl*2.0)  # نضيف وزن بسيط للربح الحالي
 
 def engine_loop():
     global WATCHLIST_MARKETS
@@ -578,41 +461,35 @@ def engine_loop():
             if not watch: time.sleep(0.6); continue
 
             now=time.time(); best=None
-            regime=btc_regime_boost()
-            thr=AUTO_THRESHOLD - regime
-
-            # إذا ممتلئ، ما بندخل جديد إلا عبر استبدال مشروط
-            with lk: full = len(active_trades)>=MAX_TRADES
-
             for m in watch:
                 p=fetch_price_ws_first(m)
                 if not p: continue
                 _update_hist(m, now, p)
-                sc,r15,r30,r60,acc,spr,imb,snp = score_exploder(m, p)
+                sc, r15, r30, r60, acc, spr, imb, snp = score_exploder(m, p)
                 if spr>THRESH_SPREAD_BP_MAX or imb<THRESH_IMB_MIN: continue
                 base=m.replace("-EUR","")
                 if r.exists(f"ban24:{base}") or r.exists(f"cooldown:{base}"): continue
-                cand=(sc,m,r15,r30,r60,acc,spr,imb,snp)
+                cand=(sc,m,snp)
                 if (best is None) or (cand[0]>best[0]): best=cand
 
-            if best:
-                score,m,r15,r30,r60,acc,spr,imb,sniper=best
-                trigger=(score>=thr) or sniper
-                if not trigger:
-                    time.sleep(ENGINE_INTERVAL_SEC); continue
+            # لا صفقة حالياً → ادخل
+            with lk: has_pos = len(active_trades)>0
+            if best and not has_pos and (best[0] >= AUTO_THRESHOLD or best[2]):
+                buy(best[1].replace("-EUR",""))
+                time.sleep(ENGINE_INTERVAL_SEC); continue
 
-                if full:
-                    w=weakest_open_trade()
-                    if w:
-                        age_ok = (time.time()-w.get("opened_at",0)) > MIN_REPL_AGE_S
-                        cur = fetch_price_ws_first(w["symbol"]) or w["entry"]
-                        loss = (cur/w["entry"]-1.0)*100.0
-                        loss_ok = loss <= REPL_MAX_LOSS
-                        if age_ok and loss_ok and (score >= thr + REPL_EXTRA_SCORE or sniper):
-                            send_message("🔄 Replacement: أقوى فرصة دخلت محل الأضعف")
-                            sell_trade(w); buy(m.replace("-EUR",""))
-                else:
-                    buy(m.replace("-EUR",""))
+            # عندنا صفقة → نسمح باستبدال فقط إذا غير خسرانة و المرشح أقوى بوضوح
+            if best and has_pos:
+                with lk: tr=active_trades[0]
+                age=time.time()-tr.get("opened_at",time.time())
+                if age >= NO_CHURN_WINDOW_S and age >= REPL_MIN_AGE_S:
+                    cur_strength=current_trade_strength(tr)
+                    cand_strength=best[0]
+                    cur_price=fetch_price_ws_first(tr["symbol"]) or tr["entry"]
+                    pnl=((cur_price/tr["entry"])-1.0)*100.0
+                    if pnl >= REPL_ALLOW_IF_PNL_GE and (cand_strength >= cur_strength + REPL_BETTER_DELTA or best[2]):
+                        send_message("🔄 Replacement: بيع الحالي وشراء فرصة أقوى")
+                        sell_trade(tr); buy(best[1].replace("-EUR",""))
 
             time.sleep(ENGINE_INTERVAL_SEC)
         except Exception as e:
@@ -624,35 +501,26 @@ def build_summary():
     lines=[]; now=time.time()
     with lk: act=list(active_trades); ex=list(executed_trades)
     if act:
-        def cur_pnl(t):
-            cur=fetch_price_ws_first(t["symbol"]) or t["entry"]
-            return (cur/t["entry"]-1.0)
-        arr=sorted(act, key=cur_pnl, reverse=True)
-        tot_val=0.0; tot_cost=0.0
-        lines.append(f"📌 الصفقات النشطة ({len(arr)}):")
-        for i,t in enumerate(arr,1):
-            sym=t["symbol"].replace("-EUR",""); entry=float(t["entry"]); amt=float(t["amount"])
-            cur=fetch_price_ws_first(t["symbol"]) or entry
-            pnl=((cur-entry)/entry)*100.0
-            peak=float(t.get("peak_pct",0.0)); dyn=float(t.get("sl_dyn",DYN_SL_START))
-            tot_val+=amt*cur; tot_cost+=float(t.get("cost_eur", entry*amt))
-            lines.append(f"{i}. {sym}: {pnl:+.2f}% | Peak {peak:.2f}% | SL {dyn:.2f}%")
-        fl=tot_val-tot_cost; pct=((tot_val/tot_cost)-1.0)*100.0 if tot_cost>0 else 0.0
-        lines.append(f"💼 قيمة الصفقات: €{tot_val:.2f} | عائم: {fl:+.2f}€ ({pct:+.2f}%)")
+        t=act[0]
+        sym=t["symbol"].replace("-EUR",""); entry=float(t["entry"])
+        cur=fetch_price_ws_first(t["symbol"]) or entry
+        pnl=((cur-entry)/entry)*100.0
+        peak=float(t.get("peak_pct",0.0)); dyn=float(t.get("sl_dyn",DYN_SL_START))
+        val=float(t["amount"])*cur; cost=float(t.get("cost_eur", entry*float(t["amount"])))
+        fl=val-cost; pct=((val/cost)-1.0)*100.0 if cost>0 else 0.0
+        lines.append("📌 الصفقة النشطة (1):")
+        lines.append(f"{sym}: {pnl:+.2f}% | Peak {peak:.2f}% | SL {dyn:.2f}%")
+        lines.append(f"💼 قيمة الصفقة: €{val:.2f} | عائم: {fl:+.2f}€ ({pct:+.2f}%)")
     else: lines.append("📌 لا صفقات نشطة.")
 
     since=float(r.get(SINCE_RESET_KEY) or 0.0)
     closed=[t for t in ex if "pnl_eur" in t and "exit_time" in t and float(t["exit_time"])>=since]
-    closed.sort(key=lambda x: float(x["exit_time"]))
     wins=sum(1 for t in closed if float(t["pnl_eur"])>=0); losses=len(closed)-wins
     pnl_eur=sum(float(t["pnl_eur"]) for t in closed)
     avg_eur=(pnl_eur/len(closed)) if closed else 0.0
     avg_pct=(sum(float(t.get("pnl_pct",0)) for t in closed)/len(closed)) if closed else 0.0
     lines.append("\n📊 صفقات مكتملة منذ Reset:")
-    if not closed: lines.append("• لا يوجد.")
-    else:
-        lines.append(f"• العدد: {len(closed)} | محققة: {pnl_eur:+.2f}€ | متوسط/صفقة: {avg_eur:+.2f}€ ({avg_pct:+.2f}%)")
-        lines.append(f"• فوز/خسارة: {wins}/{losses}")
+    lines.append("• لا يوجد." if not closed else f"• العدد: {len(closed)} | محققة: {pnl_eur:+.2f}€ | متوسط/صفقة: {avg_eur:+.2f}€ ({avg_pct:+.2f}%)")
     lines.append(f"\n⛔ حد اليوم: {_today_pnl():+.2f}€ / {DAILY_STOP_EUR:+.2f}€")
     return "\n".join(lines)
 
@@ -686,10 +554,9 @@ def webhook():
         send_message("🧠 Reset."); return "ok"
     if has("settings","اعدادات","إعدادات"):
         send_message(
-            f"⚙️ thr={AUTO_THRESHOLD}, topN={TOPN_WATCH}, interval={ENGINE_INTERVAL_SEC}s | "
-            f"spread≤{THRESH_SPREAD_BP_MAX}bp, imb≥{THRESH_IMB_MIN} | TP={TP_WEAK}/{TP_GOOD}% | "
-            f"SL={DYN_SL_START}/{DYN_SL_STEP} | daily={DAILY_STOP_EUR}€ | fractions={BUY_FRACTIONS}\n"
-            f"replacement: age≥{MIN_REPL_AGE_S}s, loss≤{REPL_MAX_LOSS}%, +{REPL_EXTRA_SCORE} score"
+            f"⚙️ one-trade, thr={AUTO_THRESHOLD}, interval={ENGINE_INTERVAL_SEC}s | "
+            f"spread≤{THRESH_SPREAD_BP_MAX}bp, imb≥{THRESH_IMB_MIN} | SL start/step={DYN_SL_START}/{DYN_SL_STEP}% | "
+            f"daily={DAILY_STOP_EUR}€ | replacement: Δ≥{REPL_BETTER_DELTA}, pnl≥{REPL_ALLOW_IF_PNL_GE}%, age≥{REPL_MIN_AGE_S}s"
         ); return "ok"
     if starts("unban","الغ حظر","الغاء حظر","إلغاء حظر"):
         try:
@@ -711,28 +578,7 @@ def webhook():
         bals=bv_request("GET","/balance")
         if not isinstance(bals,list): send_message("❌ تعذر جلب الرصيد."); return "ok"
         eur=sum(float(b.get("available",0))+float(b.get("inOrder",0)) for b in bals if b.get("symbol")=="EUR")
-        total=eur
-        with lk: ex=list(executed_trades)
-        winners,losers=[],[]
-        for b in bals:
-            sym=b.get("symbol")
-            if sym=="EUR": continue
-            qty=float(b.get("available",0))+float(b.get("inOrder",0))
-            if qty<0.0001: continue
-            pair=f"{sym}-EUR"; price=fetch_price_ws_first(pair)
-            if price is None: continue
-            total+=qty*price
-            entry=None
-            for t in reversed(ex):
-                if t.get("symbol")==pair: entry=t.get("entry"); break
-            if entry:
-                pnl=((price-entry)/entry)*100.0
-                line=f"{sym}: {qty:.4f} @ €{price:.4f} → {pnl:+.2f}%"
-                (winners if pnl>=0 else losers).append(line)
-        lines=[f"💰 الرصيد: €{total:.2f}"]
-        if winners: lines.append("\n📈 رابحين:\n"+"\n".join(winners))
-        if losers:  lines.append("\n📉 خاسرين:\n"+"\n".join(losers))
-        if not winners and not losers: lines.append("\n🚫 لا مراكز.")
+        lines=[f"💰 الرصيد: €{eur:.2f}"]
         send_message("\n".join(lines)); return "ok"
     return "ok"
 
