@@ -31,8 +31,8 @@ BASE_URL    = "https://api.bitvavo.com/v2"
 WS_URL      = "wss://ws.bitvavo.com/v2/"
 
 # ===== Settings (مشددّة لتقليل النزيف) =====
-MAX_TRADES              = 2
-BUY_FRACTIONS           = [0.50, 0.50]      # 50% ثم 50%
+MAX_TRADES              = 1
+BUY_FRACTIONS           = [100]      # 50% ثم 50%
 
 ENGINE_INTERVAL_SEC     = 0.25
 TOPN_WATCH              = 80
