@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Nems — ULTRA NITRO (Bitvavo EUR)
-- Ultra-aggressive momentum+accel scalper + orderbook sanity
-- 1m backfill for instant metrics, widened sniper/thresholds
-- Aggressive replacement and quick TP / soft giveback / short time-stop
-- Position sizing: 50% → 50% (صغيرة الرصيد)
+Nems — High-Risk NITRO (Bitvavo EUR)
+- Aggressive momentum+accel scalper with orderbook filters
+- Watchlist by short-term vol+move, 1m backfill
+- Sniper trigger widened, general threshold lowered
+- Replacement aggressive; small, fast TP; shorter time-stop
+- 50% then 50% buy sizing
 
-تنبيه: مخاطرة عالية. عدّل DAILY_STOP/TP/SL حسب رسومك وقدرتك على تحمل المخاطر.
+ENV: BOT_TOKEN, CHAT_ID, BITVAVO_API_KEY, BITVAVO_API_SECRET, REDIS_URL
+Optional: RUN_LOCAL=1
 """
 
 import os, re, time, json, traceback, statistics as st
@@ -35,34 +37,33 @@ lk = Lock()
 BASE_URL    = "https://api.bitvavo.com/v2"
 WS_URL      = "wss://ws.bitvavo.com/v2/"
 
-# ===== ULTRA Settings =====
+# ===== Aggressive Settings =====
 MAX_TRADES              = 2
-BUY_FRACTIONS           = [0.50, 0.50]   # تقسيم الرصيد الحر لحظة الدخول: 50% ثم 50%
-ENGINE_INTERVAL_SEC     = 0.25
-TOPN_WATCH              = 80
+ENGINE_INTERVAL_SEC     = 0.35
+TOPN_WATCH              = 60
 
-AUTO_THRESHOLD          = 18.0                  # دخول أسرع
-THRESH_SPREAD_BP_MAX    = 280.0
-THRESH_IMB_MIN          = 0.55
+AUTO_THRESHOLD          = 24.0       # كان 40 → دخول أسرع
+THRESH_SPREAD_BP_MAX    = 220.0      # تقبّل أوسع
+THRESH_IMB_MIN          = 0.65
 
-DAILY_STOP_EUR          = -30.0                 # حد يومي أعلى مخاطرة
-BUY_COOLDOWN_SEC        = 35
-BAN_LOSS_PCT            = -5.0
+DAILY_STOP_EUR          = -20.0      # مخاطرة أعلى
+BUY_COOLDOWN_SEC        = 45
+BAN_LOSS_PCT            = -4.0
 CONSEC_LOSS_BAN         = 3
-BLACKLIST_EXPIRE_SECONDS= 180
+BLACKLIST_EXPIRE_SECONDS= 240
 
-EARLY_WINDOW_SEC        = 5*60
-DYN_SL_START            = -3.6
+EARLY_WINDOW_SEC        = 7*60
+DYN_SL_START            = -3.0
 DYN_SL_STEP             = 0.8
-DROP_FROM_PEAK_EXIT     = 0.9
-PEAK_TRIGGER            = 1.5
-GIVEBACK_RATIO          = 0.55
-GIVEBACK_CAP            = 1.6
-TP_WEAK                 = 0.7
-TP_GOOD                 = 1.1
-TIME_STOP_MIN           = 5*60
-TIME_STOP_PNL_LO        = -0.6
-TIME_STOP_PNL_HI        = 0.9
+DROP_FROM_PEAK_EXIT     = 1.0
+PEAK_TRIGGER            = 1.8
+GIVEBACK_RATIO          = 0.50
+GIVEBACK_CAP            = 1.4
+TP_WEAK                 = 0.9
+TP_GOOD                 = 1.4
+TIME_STOP_MIN           = 7*60
+TIME_STOP_PNL_LO        = -0.5
+TIME_STOP_PNL_HI        = 0.8
 
 # ===== WS & caches =====
 _ws_lock = Lock()
@@ -74,7 +75,7 @@ _prev_watch=set()
 HISTS={}
 OB_CACHE={}
 VOL_CACHE={}
-WATCH_REFRESH_SEC=150
+WATCH_REFRESH_SEC=180
 _last_watch=0
 
 enabled=True; auto_enabled=True
@@ -211,7 +212,7 @@ def _mom_metrics_symbol(m, price_now):
     if new_high: HISTS[m]["last_new_high"]=now_ts
     return r15,r30,r60,new_high
 
-def _backfill_hist_1m(m, minutes=45):
+def _backfill_hist_1m(m, minutes=60):
     try:
         rows=requests.get(f"{BASE_URL}/{m}/candles?interval=1m&limit={minutes}", timeout=6).json()
         if not isinstance(rows,list): return
@@ -221,7 +222,7 @@ def _backfill_hist_1m(m, minutes=45):
         if p: _update_hist(m, time.time(), p)
     except Exception as e: print("backfill err:", e)
 
-def fetch_orderbook(m, ttl=1.6):
+def fetch_orderbook(m, ttl=2.0):
     now=time.time(); rec=OB_CACHE.get(m)
     if rec and (now-rec["ts"])<ttl: return rec["data"]
     try:
@@ -231,7 +232,7 @@ def fetch_orderbook(m, ttl=1.6):
     except Exception: pass
     return None
 
-def orderbook_guard(market, min_bid_eur=30.0, req_imb=THRESH_IMB_MIN, max_spread_bp=THRESH_SPREAD_BP_MAX, depth_used=3):
+def orderbook_guard(market, min_bid_eur=40.0, req_imb=THRESH_IMB_MIN, max_spread_bp=THRESH_SPREAD_BP_MAX, depth_used=3):
     ob=fetch_orderbook(market)
     if not ob or not ob.get("bids") or not ob.get("asks"): return False,"no_book",{}
     try:
@@ -262,7 +263,7 @@ def _t_fresh():
 def _score_market_volvol(market):
     now=time.time()
     rec=VOL_CACHE.get(market)
-    if rec and (now-rec[0])<120: return rec[1]
+    if rec and (now-rec[0])<180: return rec[1]
     try:
         cs=requests.get(f"{BASE_URL}/{market}/candles?interval=1m&limit=20", timeout=4).json()
         closes=[float(c[4]) for c in cs if isinstance(c,list) and len(c)>=5]
@@ -298,7 +299,7 @@ def refresh_watchlist():
     new=set(build_watchlist(TOPN_WATCH))
     with _ws_lock: WATCHLIST_MARKETS=set(new)
     newly=new-_prev_watch
-    for m in newly: _backfill_hist_1m(m, minutes=45)
+    for m in newly: _backfill_hist_1m(m, minutes=60)
     _prev_watch=set(new)
 
 # ===== Scoring =====
@@ -308,17 +309,17 @@ def score_exploder(market, price_now):
     ok,_,feats = orderbook_guard(market, max_spread_bp=THRESH_SPREAD_BP_MAX, req_imb=THRESH_IMB_MIN)
     spread = feats.get("spread_bp", 999.0); imb=feats.get("imb", 0.0)
 
-    mom_pts = max(0.0, min(70.0, 2.3*r15 + 2.3*r30 + 0.3*r60))
-    acc_pts = max(0.0, min(24.0, 10.0*max(0.0, accel)))
+    mom_pts = max(0.0, min(70.0, 2.1*r15 + 2.1*r30 + 0.4*r60))
+    acc_pts = max(0.0, min(24.0, 9.0*max(0.0, accel)))
     ob_pts  = 0.0
     if ok:
-        if spread <= 200.0: ob_pts += max(0.0, min(10.0, (200.0-spread)*0.06))
-        if imb >= 0.85:     ob_pts += max(0.0, min(10.0, (imb-0.85)*10.0))
-        if spread <= 100.0: ob_pts += 3.0
+        if spread <= 160.0: ob_pts += max(0.0, min(10.0, (160.0-spread)*0.08))
+        if imb >= 0.9:      ob_pts += max(0.0, min(10.0, (imb-0.9)*10.0))
+        if spread <= 80.0:  ob_pts += 3.0
         if imb >= 1.20:     ob_pts += 4.0
 
     score = max(0.0, min(100.0, mom_pts + acc_pts + ob_pts))
-    sniper = (r15>=0.05 and accel>=0.06 and spread<=200.0 and imb>=0.75)
+    sniper = (r15>=0.08 and accel>=0.08 and spread<=150.0 and imb>=0.80)
     return score, r15, r30, r60, accel, spread, imb, sniper
 
 # ===== Trading =====
@@ -337,18 +338,11 @@ def place_order(side, market, amount=None, amount_quote=None):
 
 def _adaptive_ob_requirements(price_now):
     if price_now < 0.02:
-        return max(15.0, price_now*600), 420.0, 0.18
+        return max(20.0, price_now*800), 400.0, 0.20
     elif price_now < 0.2:
-        return max(25.0, price_now*180), 260.0, 0.28
+        return max(35.0, price_now*250), 220.0, 0.30
     else:
-        return max(40.0, price_now*3),   220.0, 0.26
-
-def _next_fraction():
-    with lk:
-        k=len(active_trades)
-    if k < len(BUY_FRACTIONS):
-        return BUY_FRACTIONS[k]
-    return max(0.1, 1.0 - sum(BUY_FRACTIONS))  # احتياطي لو تغيّر الإعداد
+        return max(50.0, price_now*4),   200.0, 0.28
 
 def buy(base_symbol):
     base=base_symbol.upper().strip()
@@ -362,12 +356,7 @@ def buy(base_symbol):
     min_bid,max_spread,req_imb=_adaptive_ob_requirements(price_now)
     ok,why,feats=orderbook_guard(market, min_bid_eur=min_bid, req_imb=req_imb, max_spread_bp=max_spread)
     if not ok:
-        # توضيح سبب الرفض لسهولة الديبغ
-        send_message(
-            f"⛔ رفض {base}: {why} | spread={feats.get('spread_bp',0):.0f}bp, "
-            f"imb={feats.get('imb',0):.2f}, bid€={feats.get('bid_eur',0):.0f}"
-        )
-        r.setex(f"cooldown:{base}", 90, 1)
+        r.setex(f"cooldown:{base}", 120, 1)
         return
 
     with lk:
@@ -376,8 +365,7 @@ def buy(base_symbol):
 
     eur=get_eur_available()
     if eur<5.0: return
-    frac=_next_fraction()
-    amt_quote=round(max(5.0, eur*frac), 2)
+    amt_quote=round((eur/2.0) if len(active_trades)==0 else eur, 2)
     if amt_quote<5.0: return
 
     res=place_order("buy", market, amount_quote=amt_quote)
@@ -395,7 +383,7 @@ def buy(base_symbol):
         r.set("nems:active_trades", json.dumps(active_trades))
         r.rpush("nems:executed_trades", json.dumps(tr))
     with _ws_lock: WATCHLIST_MARKETS.add(market)
-    send_message(f"✅ شراء {base} | €{amt_quote:.2f} ({frac*100:.0f}%) | SL {DYN_SL_START:.1f}%")
+    send_message(f"✅ شراء {base} | €{amt_quote:.2f} | SL {DYN_SL_START:.1f}%")
 
 def sell_trade(tr):
     market=tr["symbol"]; base=market.replace("-EUR","")
@@ -436,7 +424,7 @@ def sell_trade(tr):
                 break
         r.delete("nems:executed_trades")
         for t in executed_trades: r.rpush("nems:executed_trades", json.dumps(t))
-    cd = 35 if pnl_pct>-0.5 else max(90, BUY_COOLDOWN_SEC)
+    cd = 45 if pnl_pct>-0.5 else max(120, BUY_COOLDOWN_SEC)
     r.setex(f"cooldown:{base}", cd, 1)
     send_message(f"💰 بيع {base} | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%)")
 
@@ -453,7 +441,7 @@ def _price_n_seconds_ago(tr, now_ts, sec):
         if ts<=cutoff: return p
     return None
 
-def _fast_drop(tr, now_ts, price_now, window=12, drop=0.9):
+def _fast_drop(tr, now_ts, price_now, window=15, drop=1.0):
     p=_price_n_seconds_ago(tr, now_ts, window)
     if p and p>0:
         d=(price_now/p-1.0)*100.0
@@ -477,7 +465,7 @@ def monitor_loop():
                 inc=int(max(0.0,pnl)//1); base=DYN_SL_START + inc*DYN_SL_STEP
                 tr["sl_dyn"]=max(tr.get("sl_dyn",DYN_SL_START), base)
 
-                # r30/r90 تقديري
+                # r30/r90 تقدير بسيط من هيستوري الصفقة
                 hist=tr.get("hist",deque())
                 if hist:
                     now_ts=hist[-1][0]; p30=p90=None
@@ -494,11 +482,11 @@ def monitor_loop():
                 ob_ok,_,obf=orderbook_guard(m)
                 spread=obf.get("spread_bp",999.0) if obf else 999.0
                 imb=obf.get("imb",0.0) if obf else 0.0
-                weak=(not ob_ok) or (spread>170.0) or (imb<0.92) or (r30<0 and r90<0)
+                weak=(not ob_ok) or (spread>130.0) or (imb<0.95) or (r30<0 and r90<0)
                 tp=TP_WEAK if weak else TP_GOOD
-                if spread>110.0 and not weak: tp=max(TP_WEAK, 0.9)
+                if spread>90.0 and not weak: tp=1.2
 
-                if pnl>=tp and tr.get("peak_pct",0.0)<(tp+0.4):
+                if pnl>=tp and tr.get("peak_pct",0.0)<(tp+0.5):
                     tr["exit_in_progress"]=True; tr["last_exit_try"]=now
                     sell_trade(tr); tr["exit_in_progress"]=False; continue
 
@@ -507,7 +495,7 @@ def monitor_loop():
                     give=min(GIVEBACK_CAP, GIVEBACK_RATIO*peak)
                     desired=peak-give
                     if desired>tr.get("sl_dyn",DYN_SL_START): tr["sl_dyn"]=desired
-                    if (peak-pnl)>=give and (r30<=-0.25 or r90<=0.0):
+                    if (peak-pnl)>=give and (r30<=-0.3 or r90<=0.0):
                         tr["exit_in_progress"]=True; tr["last_exit_try"]=now
                         sell_trade(tr); tr["exit_in_progress"]=False; continue
 
@@ -520,11 +508,11 @@ def monitor_loop():
                     tr["exit_in_progress"]=True; tr["last_exit_try"]=now
                     sell_trade(tr); tr["exit_in_progress"]=False; continue
 
-                crash,d12=_fast_drop(tr, now, cur, window=12, drop=0.9)
-                if crash and pnl<-1.4:
+                crash,d20=_fast_drop(tr, now, cur, window=15, drop=1.0)
+                if crash and pnl<-1.6:
                     tr["exit_in_progress"]=True; tr["last_exit_try"]=now
                     sell_trade(tr); tr["exit_in_progress"]=False; continue
-            time.sleep(0.18)
+            time.sleep(0.20)
         except Exception as e:
             print("monitor err:", e); time.sleep(1)
 Thread(target=monitor_loop, daemon=True).start()
@@ -538,12 +526,12 @@ def weakest_open_trade():
         cur=fetch_price_ws_first(t["symbol"]) or t["entry"]
         pnl=(cur/t["entry"]-1.0)*100.0
         age=(now - t.get("opened_at",now))/60.0
-        sc=pnl - 0.35*min(age, 15.0)  # كلما طال بدون تقدم يُعدّ أضعف
+        sc=pnl - 0.3*min(age, 15.0)
         if score is None or sc<score: worst,score=t,sc
     return worst
 
 def btc_regime_boost():
-    """لو BTC متقلبة، اخفض العتبة أكثر."""
+    """لو BTC متقلبة بقوة، خفّض العتبة قليلاً."""
     try:
         m="BTC-EUR"
         cs=requests.get(f"{BASE_URL}/{m}/candles?interval=1m&limit=15", timeout=4).json()
@@ -551,7 +539,7 @@ def btc_regime_boost():
         if len(closes)<5: return 0.0
         rets=[closes[i]/closes[i-1]-1.0 for i in range(1,len(closes))]
         v5=abs(sum(rets[-5:]))*100.0
-        return 8.0 if v5>=1.0 else (5.0 if v5>=0.7 else 0.0)
+        return 6.0 if v5>=1.0 else (3.0 if v5>=0.6 else 0.0)
     except Exception: return 0.0
 
 def engine_loop():
@@ -563,15 +551,15 @@ def engine_loop():
 
             with lk:
                 full=len(active_trades)>=MAX_TRADES
+            if full: time.sleep(ENGINE_INTERVAL_SEC); continue
 
             refresh_watchlist()
             watch=list(WATCHLIST_MARKETS)
-            if not watch: time.sleep(0.6); continue
+            if not watch: time.sleep(0.7); continue
 
             now=time.time(); best=None
-            regime=btc_regime_boost()
-            # Clamp للعَتبة كي لا تصبح أوفر-أجريسف في الهدوء
-            thr=max(8.0, AUTO_THRESHOLD - regime)
+            regime_boost=btc_regime_boost()   # 0..6
+            thr=AUTO_THRESHOLD - regime_boost
 
             for m in watch:
                 p=fetch_price_ws_first(m)
@@ -591,7 +579,7 @@ def engine_loop():
                     with lk: full=len(active_trades)>=MAX_TRADES
                     if full:
                         w=weakest_open_trade()
-                        if w and (score>=thr+2.0 or sniper) and (time.time()-w.get("opened_at",0))>15:
+                        if w and (score>=thr+4.0 or sniper) and (time.time()-w.get("opened_at",0))>20:
                             send_message("🔄 Replacement: أقوى فرصة دخلت محل الأضعف")
                             sell_trade(w); buy(m.replace("-EUR",""))
                     else:
@@ -639,7 +627,7 @@ def build_summary():
     lines.append(f"\n⛔ حد اليوم: {_today_pnl():+.2f}€ / {DAILY_STOP_EUR:+.2f}€")
     return "\n".join(lines)
 
-def send_chunks(txt, chunk=3300):
+def send_chunks(txt, chunk=3400):
     if not txt: return
     buf=""
     for line in txt.splitlines(True):
@@ -668,7 +656,7 @@ def webhook():
             r.delete("nems:active_trades"); r.delete("nems:executed_trades"); r.set(SINCE_RESET_KEY, time.time())
         send_message("🧠 Reset."); return "ok"
     if has("settings","اعدادات","إعدادات"):
-        send_message(f"⚙️ thr={AUTO_THRESHOLD}, topN={TOPN_WATCH}, interval={ENGINE_INTERVAL_SEC}s | spread≤{THRESH_SPREAD_BP_MAX}bp, imb≥{THRESH_IMB_MIN} | TP={TP_WEAK}/{TP_GOOD}% | SL={DYN_SL_START}/{DYN_SL_STEP} | daily={DAILY_STOP_EUR}€ | fractions={BUY_FRACTIONS}")
+        send_message(f"⚙️ thr={AUTO_THRESHOLD}, topN={TOPN_WATCH}, interval={ENGINE_INTERVAL_SEC}s | spread≤{THRESH_SPREAD_BP_MAX}bp, imb≥{THRESH_IMB_MIN} | TP={TP_WEAK}/{TP_GOOD}% | SL={DYN_SL_START}/{DYN_SL_STEP} | daily={DAILY_STOP_EUR}€")
         return "ok"
     if starts("unban","الغ حظر","الغاء حظر","إلغاء حظر"):
         try:
@@ -679,14 +667,11 @@ def webhook():
         return "ok"
     if starts("buy","اشتري","إشتري"):
         try:
-            parts = re.split(r"\s+", text.strip(), maxsplit=1)
-            sym = parts[1].upper() if len(parts) > 1 else ""
-            if "-" in sym: sym = sym.split("-")[0]
+            sym=re.search(r"[A-Za-z0-9\-]+", text).group(0).upper()
+            if "-" in sym: sym=sym.split("-")[0]
             if sym.endswith("EUR") and len(sym)>3: sym=sym[:-3]
-            sym = re.sub(r"[^A-Z0-9]", "", sym)
+            sym=re.sub(r"[^A-Z0-9]","", sym)
         except Exception:
-            send_message("❌ الصيغة: buy ADA"); return "ok"
-        if not sym:
             send_message("❌ الصيغة: buy ADA"); return "ok"
         buy(sym); return "ok"
     if has("balance","الرصيد","رصيد"):
@@ -726,11 +711,6 @@ try:
     executed_trades=[json.loads(t) for t in et]
     if not r.exists(SINCE_RESET_KEY): r.set(SINCE_RESET_KEY, 0)
 except Exception as e: print("state load err:", e)
-
-# تأكيد اشتراك WS بالأسواق المفتوحة بعد تحميل الحالة
-with _ws_lock:
-    for t in active_trades:
-        WATCHLIST_MARKETS.add(t["symbol"])
 
 if __name__=="__main__" and RUN_LOCAL:
     app.run(host="0.0.0.0", port=5000)
