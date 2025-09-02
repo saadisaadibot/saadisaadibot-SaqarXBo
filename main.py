@@ -41,13 +41,13 @@ MAX_TRADES              = 1              # صفقة واحدة فقط
 ENGINE_INTERVAL_SEC     = 0.25
 TOPN_WATCH              = 60
 
-AUTO_THRESHOLD          = 22.0           # عتبة دخول عامة
-REPLACE_EXTRA           = 4.0            # لازم الأفضلية تزيد عن العتبة بهالقدر على الأقل
-MIN_TRADE_AGE_REPL_S    = 20             # أقل عمر للصفقة قبل السماح باستبدال
+AUTO_THRESHOLD          = 16.0           # عتبة دخول عامة
+REPLACE_EXTRA           = 2.0            # لازم الأفضلية تزيد عن العتبة بهالقدر على الأقل
+MIN_TRADE_AGE_REPL_S    = 10             # أقل عمر للصفقة قبل السماح باستبدال
 MAX_PNL_FOR_REPL        = 0.6            # لا نستبدل إذا الربح الحالي أعلى من هذا (ندعه يجري)
 
-THRESH_SPREAD_BP_MAX    = 220.0
-THRESH_IMB_MIN          = 0.65
+THRESH_SPREAD_BP_MAX    = 280.0
+THRESH_IMB_MIN          = 0.55
 
 DAILY_STOP_EUR          = -20.0
 COOLDOWN_SEC            = 35
