@@ -75,6 +75,18 @@ TIME_STOP_MIN           = 14*60
 TIME_STOP_NEUTRAL_LO    = -0.4
 TIME_STOP_NEUTRAL_HI    = 0.9
 
+# ========= Fast trigger via WS (arm → fire) =========
+FAST_SCORE_ARM        = 26.0   # تأهيل مبدئي أخف من العتبة العامة
+FAST_SCORE_FIRE       = 34.0   # إطلاق بعد العبور + تسارع
+FAST_MIN_ACCEL        = 0.14   # r30 - r60
+FAST_MIN_R15          = 0.10
+FAST_COOLDOWN_SEC     = 30
+FAST_RECHECK_SEC      = 0.8    # إعادة فحص خاطفة قبل الإطلاق
+ARM_HOLD_SEC          = 2.5    # يجب أن يبقى مؤهَّل لبضع ثوانٍ (هيسترة)
+MICRO_WINDOW_SEC      = 12     # نافذة تسارع مصغّرة
+
+FAST_STATE = {}  # market -> {"armed_at": ts or 0, "last_fire": ts or 0, "micro": deque[(ts,price)]}
+
 # ========= State & infra =========
 r  = redis.from_url(REDIS_URL) if REDIS_URL else redis.Redis()
 lk = Lock()
@@ -172,16 +184,69 @@ def _ws_on_open(ws):
         mkts=sorted(WATCHLIST_MARKETS | ({active_trade["symbol"]} if active_trade else set()))
         if mkts: ws.send(json.dumps(_ws_sub_payload(mkts)))
     except Exception: traceback.print_exc()
+
+def _micro_update(market, ts, price):
+    st = FAST_STATE.setdefault(market, {"armed_at":0, "last_fire":0, "micro":deque(maxlen=60)})
+    st["micro"].append((ts, price))
+    cutoff = ts - MICRO_WINDOW_SEC
+    while st["micro"] and st["micro"][0][0] < cutoff:
+        st["micro"].popleft()
+    return st
+
+def _try_fast_trigger(market, price_now):
+    # لا تكرار أثناء صفقة
+    with lk:
+        if active_trade:
+            return
+    base = market.replace("-EUR","")
+    if r.exists(f"cooldown:{base}"):
+        return
+
+    sc, r15, r30, r60, acc, spr, imb, snp = score_exploder(market, price_now)
+    ok, _, feats = orderbook_guard(market, max_spread_bp=THRESH_SPREAD_BP_MAX, req_imb=THRESH_IMB_MIN)
+    if not ok:
+        return
+
+    now = time.time()
+    st = _micro_update(market, now, price_now)
+
+    # ARM
+    if sc >= FAST_SCORE_ARM and acc >= FAST_MIN_ACCEL and r15 >= FAST_MIN_R15:
+        if st["armed_at"] == 0:
+            st["armed_at"] = now
+    else:
+        st["armed_at"] = 0
+        return
+
+    # FIRE
+    if st["armed_at"] and (now - st["armed_at"] >= ARM_HOLD_SEC) and sc >= FAST_SCORE_FIRE:
+        if now - st["last_fire"] < FAST_COOLDOWN_SEC:
+            return
+        time.sleep(FAST_RECHECK_SEC)
+        p2 = fetch_price_ws_first(market)
+        if not p2:
+            return
+        sc2, r15b, r30b, r60b, accb, sprb, imbb, _ = score_exploder(market, p2)
+        if (sc2 >= FAST_SCORE_FIRE and accb >= acc and p2 >= price_now*0.999 and imbb >= THRESH_IMB_MIN):
+            st["last_fire"] = now
+            open_position(base)
+            r.setex(f"cooldown:{base}", COOLDOWN_SEC, 1)
+
 def _ws_on_message(ws,msg):
     try: d=json.loads(msg)
     except Exception: return
     if isinstance(d,dict) and d.get("event")=="ticker":
         m=d.get("market"); price=d.get("price") or d.get("lastPrice") or d.get("open")
         try:
-            p=float(price); 
+            p=float(price)
             if p>0:
-                with _ws_lock: _ws_prices[m]={"price":p,"ts":time.time()}
+                with _ws_lock:
+                    _ws_prices[m]={"price":p,"ts":time.time()}
+                # حدّث هيستوري الدقيقة وفعّل المشغّل السريع
+                _update_hist(m, time.time(), p)
+                _try_fast_trigger(m, p)
         except Exception: pass
+
 def _ws_on_error(ws,err): print("WS err:", err)
 def _ws_on_close(ws,c,rn): 
     global WS_RUNNING; WS_RUNNING=False; print("WS closed:",c,rn)
@@ -247,7 +312,7 @@ def _backfill_hist_1m(m, minutes=60):
         if not isinstance(rows,list): return
         for ts,o,h,l,c,v in rows[-minutes:]:
             _update_hist(m, ts/1000.0, float(c))
-        p=fetch_price_ws_first(m); 
+        p=fetch_price_ws_first(m) 
         if p: _update_hist(m, time.time(), p)
     except Exception as e: print("backfill err:", e)
 
@@ -405,7 +470,6 @@ def maker_to_taker_buy(market, eur_to_spend):
             t0=time.time()
             wait = MAKER_REQUOTE_SEC if attempt < MAKER_MAX_REQUOTES else MAKER_WAIT_AFTER_LAST
             while time.time()-t0 < wait:
-                # تحقق من حالة الطلب
                 stt = bv_request("GET", f"/order?market={market}&orderId={order_id}")
                 if isinstance(stt,dict) and stt.get("status")=="filled":
                     fills=stt.get("fills",[])
@@ -413,7 +477,6 @@ def maker_to_taker_buy(market, eur_to_spend):
                     if tb>0:
                         return {"fills":fills,"status":"filled","maker":True}, "filled_maker"
                 time.sleep(1.2)
-            # لم يٌملأ كليًا: نلغيه ونعيد تسعير
             cancel_order(market, order_id)
             ob = fetch_orderbook(market)
             if not ob: break
@@ -421,7 +484,6 @@ def maker_to_taker_buy(market, eur_to_spend):
             price = best_bid * (1.0 + MAKER_PRICE_OFFSET_BPS/10000.0)
             amount = _round_amount(eur_to_spend / price)
 
-    # تحوّل لتاكر (Market) إذا لسه المؤشرات صالحة
     res = place_market("buy", market, amount_quote=eur_to_spend)
     if isinstance(res,dict) and res.get("status")=="filled":
         return {"fills":res.get("fills",[]),"status":"filled","maker":False}, "filled_taker"
@@ -431,16 +493,14 @@ def maker_to_taker_sell(market, amount):
     ob = fetch_orderbook(market)
     if not ob: return None, "no_ob"
     best_bid = float(ob["bids"][0][0]); best_ask=float(ob["asks"][0][0])
-    price = best_ask * (1.0 - MAKER_PRICE_OFFSET_BPS/10000.0)  # بيع كـ Maker: فوق الـ bid؟ كصانع بنحط على ask جانب الصفقات (سعر ≥ ask)،
-    # لضمان Maker حقيقي يجب أن يكون السعر >= أفضل Ask. سنرفع قليلًا:
-    price = max(price, best_ask * (1.0 + 0.0001))
+    price = best_ask * (1.0 - MAKER_PRICE_OFFSET_BPS/10000.0)
+    price = max(price, best_ask * (1.0 + 0.0001))  # ضمان Maker حقيقي
 
     order_id=None
     res = place_limit("sell", market, price, amount, post_only=MAKER_POSTONLY)
     if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
         order_id = res.get("orderId")
         t0=time.time()
-        # نمنح فرصة للتنفيذ الماكر
         while time.time()-t0 < MAKER_WAIT_AFTER_LAST:
             stt = bv_request("GET", f"/order?market={market}&orderId={order_id}")
             if isinstance(stt,dict) and stt.get("status")=="filled":
@@ -451,7 +511,6 @@ def maker_to_taker_sell(market, amount):
             time.sleep(1.2)
         cancel_order(market, order_id)
 
-    # Taker فوري
     res = place_market("sell", market, amount=amount)
     if isinstance(res,dict) and res.get("status")=="filled":
         return {"fills":res.get("fills",[]),"status":"filled","maker":False}, "filled_taker"
@@ -497,6 +556,40 @@ def open_position(base):
     style = "Maker" if trade["maker_entry"] else "Taker"
     send_message(f"✅ شراء {base} | €{eur:.2f} | {style}-first→{'Taker' if not trade['maker_entry'] else 'Maker'} دخول @€{avg_incl:.6f}")
 
+def partial_close(pct, reason="Partial"):
+    """بيع جزئي Maker أولاً ثم Taker عند الحاجة، مع تعديل حالة الصفقة."""
+    global active_trade
+    with lk:
+        tr = dict(active_trade) if active_trade else None
+    if not tr: 
+        return False
+    if not (0.05 <= pct <= 0.95):
+        return False
+    market = tr["symbol"]
+    amt = float(tr["amount"]) * pct
+    if amt <= 0:
+        return False
+
+    res, how = maker_to_taker_sell(market, amt)
+    if not (isinstance(res, dict) and res.get("status") == "filled"):
+        return False
+
+    tb, tq, fee = totals_from_fills_eur(res.get("fills", []))
+    proceeds = tq - fee
+
+    with lk:
+        if active_trade and active_trade.get("symbol") == market:
+            old_amt = float(active_trade["amount"])
+            remain = max(0.0, old_amt - tb)
+            if remain <= 0:
+                active_trade = {}
+            else:
+                ratio = remain / old_amt
+                active_trade["amount"] = remain
+                active_trade["cost_eur"] = active_trade["cost_eur"] * ratio
+    send_message(f"💸 بيع جزئي {market.replace('-EUR','')} {int(pct*100)}% — {reason}")
+    return True
+
 def close_position(reason=""):
     global active_trade
     with lk:
@@ -511,7 +604,6 @@ def close_position(reason=""):
     else:
         res = place_market("sell", market, amount=amt); how="taker_direct"
         if not (isinstance(res,dict) and res.get("status")=="filled"):
-            # محاولة أخيرة Maker
             res,how = maker_to_taker_sell(market, amt)
 
     if isinstance(res,dict) and res.get("status")=="filled":
@@ -554,7 +646,7 @@ def monitor_loop():
             dyn = max(tr.get("sl_dyn", SL_START), SL_START + inc*SL_STEP)
             tr["sl_dyn"]=dyn
 
-            # r30/r90 تقديري من هيستوري الصفقه
+            # r30/r90 تقديري من هيستوري الصفقة
             if "hist" not in tr: tr["hist"]=deque(maxlen=600)
             tr["hist"].append((time.time(), cur))
             cutoff=time.time()-120
@@ -582,19 +674,24 @@ def monitor_loop():
             if pnl>=tp and tr.get("peak_pct",0.0)<(tp+0.4) and (time.time()-tr.get("opened_at",0))>=HOLD_MIN_SEC:
                 close_position(f"TP {tp:.2f}%"); continue
 
-            # Trailing من القمة
+            # جزئي ذكي في بيئة ضعيفة
+            if pnl >= 1.0 and weak_env and (time.time()-tr.get("opened_at",0)) >= max(45, HOLD_MIN_SEC//2):
+                if not tr.get("did_partial"):
+                    if partial_close(0.35, reason="Weak-env +1%"):
+                        tr["did_partial"] = True
+
+            # Trailing من القمة (Giveback أسرع عند تفكك الزخم)
             peak=tr.get("peak_pct",0.0)
             if peak>=TRAIL_START:
                 give=min(TRAIL_GIVEBACK_CAP, TRAIL_GIVEBACK_RATIO*peak)
                 desired=peak-give
                 if desired>tr.get("sl_dyn",SL_START): tr["sl_dyn"]=desired
                 drop=peak - pnl
-                if drop>=give and (r30<=-0.25 or r90<=0.0):
+                if drop>=give and (r30<=-0.20 or (r30<=0.0 and r90<=0.0)):
                     close_position(f"Giveback {drop:.2f}%"); continue
 
             # SL
             if pnl<=tr.get("sl_dyn",SL_START):
-                # لا نبيع فورًا إن كان قريبًا جدًا بعد الدخول (حماية)
                 if (time.time()-tr.get("opened_at",0))>=HOLD_MIN_SEC:
                     close_position(f"SL {tr['sl_dyn']:.2f}%"); continue
 
@@ -654,12 +751,10 @@ def engine_loop():
                     if age < REPLACE_MIN_HOLD_SEC: 
                         time.sleep(ENGINE_INTERVAL_SEC); continue
                     if m != tr["symbol"]:
-                        # تقدير "ميزة" بدائية: r30 الجديد - r30 الحالي، + فارق score
                         cur_p = fetch_price_ws_first(tr["symbol"]) or tr["entry"]
                         pnl_now = (cur_p/tr["entry"]-1.0)*100.0
                         cur_sc,cr15,cr30,cr60,cacc,cspr,cimb,csnp = score_exploder(tr["symbol"], cur_p)
                         gap = score - cur_sc
-                        # كلفة الرسوم التقريبية round-trip
                         fee_cost_pct = (FEE_TAKER_BPS + FEE_MAKER_BPS)/100.0
                         min_edge = max(REPLACE_MIN_EDGE_PCT, fee_cost_pct*1.5)
                         if (gap>=REPLACE_GAP_SCORE and r30>0 and acc>0 and (pnl_now<=0.0 or r30>cr30)):
