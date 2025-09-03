@@ -40,9 +40,9 @@ TOPN_WATCH              = 120
 WATCH_REFRESH_SEC       = 120
 
 # اختيار/إشارة
-AUTO_THRESHOLD          = 35.0           # عتبة Score عامة
-THRESH_SPREAD_BP_MAX    = 140.0          # سقف السبريد المقبول
-THRESH_IMB_MIN          = 0.95           # أدنى ميل طلبات (خفيف)
+AUTO_THRESHOLD          = 32.0           # عتبة Score عامة
+THRESH_SPREAD_BP_MAX    = 220.0          # سقف السبريد المقبول
+THRESH_IMB_MIN          = 0.40           # أدنى ميل طلبات (خفيف)
 
 # Replacement (فقط عند ميزة واضحة تغطي الرسوم + هامش)
 REPLACE_MIN_HOLD_SEC    = 90
@@ -71,7 +71,7 @@ TRAIL_GIVEBACK_CAP      = 1.4
 SL_START                = -2.8
 SL_STEP                 = 0.9            # يعلو مع التقدم
 HOLD_MIN_SEC            = 75             # لا بيع مبكر مباشرة بعد الدخول
-TIME_STOP_MIN           = 20*60
+TIME_STOP_MIN           = 14*60
 TIME_STOP_NEUTRAL_LO    = -0.4
 TIME_STOP_NEUTRAL_HI    = 0.9
 
