@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Nems — Daily Simple (Bitvavo EUR)
+Nems — Daily Simple v2 (Bitvavo EUR)
 • مسح بطيء مرة/24h لآخر 3 أيام (5m) → Top10 (لم تنفجر بعد) → شراء Top1 فقط (Maker-first)
 • مراقبة سريعة بعد الشراء (SL ثابت + Trailing Giveback)
 • أوامر: start/stop, /top10, /summary, /balance
-تحذير: التداول ينطوي على مخاطر.
 """
 
 import os, re, time, json, math, statistics as st, traceback
@@ -36,25 +35,25 @@ FEE_TAKER_BPS = float(os.getenv("FEE_TAKER_BPS", 25))    # 0.25%
 # ========= Daily scan (3d, 5m) =========
 DAILY_ENABLED         = True
 DAILY_TOPN            = int(os.getenv("DAILY_TOPN", 10))
-DAILY_SCAN_EVERY_SEC  = 24*3600      # مرة باليوم
-DAILY_REQUEST_SLEEP   = 0.12         # سرعة الجمع (بطيء = دقيق)
+DAILY_SCAN_EVERY_SEC  = 24*3600
+DAILY_REQUEST_SLEEP   = 0.12
 
 # فلتر دفتر الأوامر خلال المسح
 THRESH_SPREAD_BP_MAX  = 220.0
 THRESH_IMB_MIN        = 0.40
 
-# “لم تنفجر بعد” (يتم استبعاد الأزواج التي اندفعت مؤخرًا)
-MAX_RET_1H            = 2.2          # % خلال 1h
-MAX_RET_6H            = 6.0          # % خلال 6h
+# “لم تنفجر بعد”
+MAX_RET_1H            = 2.2
+MAX_RET_6H            = 6.0
 
 # ========= إدارة مركز بعد الشراء =========
 EUR_RESERVE           = 0.00
-BUY_MIN_EUR           = 5.00
+BUY_MIN_EUR_DEFAULT   = 5.00      # حد عام إذا السوق ما رجع minOrderInQuote
 
-SL_FIXED              = -3.0          # ستوب ثابت
-TRAIL_ON_AT           = 3.0           # فعّل التريلينغ بعد +3%
-TRAIL_GIVEBACK        = 1.2           # -1.2% من القمة
-HOLD_MIN_SEC          = 60            # لا خروج فوري
+SL_FIXED              = -3.0
+TRAIL_ON_AT           = 3.0
+TRAIL_GIVEBACK        = 1.2
+HOLD_MIN_SEC          = 60
 WS_STALENESS_SEC      = 2.0
 
 # ========= حالة =========
@@ -67,7 +66,7 @@ executed_trades = []
 today_top = []
 _last_daily_scan = 0
 
-# ========= إرسال تيليغرام =========
+# ========= Telegram =========
 def send_message(text, force=False):
     try:
         if not (BOT_TOKEN and CHAT_ID):
@@ -101,7 +100,10 @@ def bv_request(method, path, body=None, timeout=10):
         resp=requests.request(method,url,headers=headers,
                               json=(body or {}) if method!="GET" else None,
                               timeout=timeout)
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text}
     except Exception as e:
         print("bv_request err:", e); return {"error":"request_failed"}
 
@@ -114,6 +116,34 @@ def get_eur_available()->float:
                     return max(0.0, float(b.get("available",0) or 0))
     except Exception: pass
     return 0.0
+
+# ======== Market rules (min notional, decimals) ========
+MARKETS_CACHE={}
+def get_market_rules(market):
+    now=time.time()
+    rec=MARKETS_CACHE.get(market)
+    if rec and (now-rec["ts"])<3600:   # ساعة
+        return rec["data"]
+    try:
+        j=bv_request("GET", f"/markets?market={market}")
+        # Bitvavo تعيد list بمدخل واحد
+        if isinstance(j, list) and j:
+            item=j[0]
+        elif isinstance(j, dict) and j.get("market")==market:
+            item=j
+        else:
+            item={}
+        data={
+            "pricePrecision": item.get("pricePrecision"),
+            "amountDecimals": item.get("amountDecimals"),
+            # أحيانًا minOrderInQuote موجود مباشرة، أحيانًا بالمفتاح minOrderQuote
+            "minOrderInQuote": float(item.get("minOrderInQuote") or item.get("minOrderQuote") or 0) if item else 0.0,
+            "minOrderInBase": float(item.get("minOrderInBase") or item.get("minOrderBase") or 0) if item else 0.0
+        }
+        MARKETS_CACHE[market]={"ts":now,"data":data}
+        return data
+    except Exception as e:
+        print("market rules err:", e); return {"minOrderInQuote":0.0,"minOrderInBase":0.0}
 
 # ========= Orderbook / WS (للمراقبة بعد الشراء فقط) =========
 _ws_lock=Lock()
@@ -200,57 +230,8 @@ def totals_from_fills_eur(fills):
         tb+=amt; tq+=amt*price; fee+=fe
     return tb,tq,fee
 
-def maker_to_taker_buy(market, eur_to_spend):
-    ob=fetch_orderbook(market)
-    if not ob: return None, "no_ob"
-    bb=ob["bb"]
-    price = bb*(1.0 + 3.0/10000.0)     # +3bps فوق الـBid
-    amount=_round_amount(eur_to_spend/price)
-    order_id=None
-    for attempt in range(3+1):
-        res=place_limit("buy", market, price, amount, post_only=True)
-        if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
-            order_id=res.get("orderId"); t0=time.time(); wait=6 if attempt<3 else 10
-            while time.time()-t0<wait:
-                stt=bv_request("GET", f"/order?market={market}&orderId={order_id}")
-                if isinstance(stt,dict) and stt.get("status")=="filled":
-                    tb,tq,fee=totals_from_fills_eur(stt.get("fills",[]))
-                    if tb>0: return {"fills":stt.get("fills",[]),"maker":True},"filled_maker"
-                time.sleep(1.2)
-            cancel_order(market, order_id)
-            ob=fetch_orderbook(market); 
-            if not ob: break
-            bb=ob["bb"]; price=bb*(1.0 + 3.0/10000.0)
-            amount=_round_amount(eur_to_spend/price)
-    # fallback taker
-    res=place_market("buy", market, amount_quote=eur_to_spend)
-    if isinstance(res,dict) and res.get("status")=="filled":
-        return {"fills":res.get("fills",[]),"maker":False}, "filled_taker"
-    return None, "failed"
-
-def maker_to_taker_sell(market, amount):
-    ob=fetch_orderbook(market)
-    if not ob: return None, "no_ob"
-    aa=ob["aa"]
-    price = max(aa*(1.0+0.0001), aa*(1.0 - 3.0/10000.0))
-    res=place_limit("sell", market, price, amount, post_only=True)
-    if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
-        t0=time.time()
-        while time.time()-t0<10:
-            stt=bv_request("GET", f"/order?market={market}&orderId={res.get('orderId')}")
-            if isinstance(stt,dict) and stt.get("status")=="filled":
-                return {"fills":stt.get("fills",[]),"maker":True},"filled_maker"
-            time.sleep(1.2)
-        cancel_order(market, res.get("orderId"))
-    # fallback
-    res=place_market("sell", market, amount=amount)
-    if isinstance(res,dict) and res.get("status")=="filled":
-        return {"fills":res.get("fills",[]),"maker":False},"filled_taker"
-    return None, "failed"
-
 # ========= Daily Scan (3 days, 5m) =========
 def _t_fresh():
-    # إستعمال /ticker/24h لجلب قائمة الأسواق
     try:
         rows=requests.get(f"{BASE_URL}/ticker/24h", timeout=10).json()
         return rows if isinstance(rows,list) else []
@@ -295,12 +276,11 @@ def _compute_features(market):
     vols  =[float(c[5]) for c in cs]
     logs  =[math.log(max(1e-12,p)) for p in closes]
 
-    # 3 نوافذ: 1h/6h/3d
     def ret_n(n): 
         if len(closes)<=n: return 0.0
         return ((closes[-1]/closes[-n]) - 1.0)*100.0
-    ret_1h  = ret_n(12)     # 12×5m
-    ret_6h  = ret_n(72)     # 72×5m
+    ret_1h  = ret_n(12)
+    ret_6h  = ret_n(72)
 
     last_1d = logs[-288:] if len(logs)>=288 else logs
     last_3d = logs[-min(1000,len(logs)):]
@@ -308,38 +288,28 @@ def _compute_features(market):
     slope3d = _linreg_slope(last_3d) * 12
     accel   = slope1d - slope3d
 
-    # r15 على 5m (≈15m)
     p_now=closes[-1]; p_3=closes[-4] if len(closes)>=4 else closes[0]
     r15 = ((p_now/p_3)-1.0)*100.0 if p_3>0 else 0.0
 
-    # انقباض
     bw_now=_boll_width(closes,20)
     bws=[_boll_width(closes[:i],20) for i in range(60, min(600,len(closes)))]
-    med_bw = (sorted([w for w in bws if w])[len([w for w in bws if w])//2] if any(bws) else bw_now) or bw_now
-    squeeze = bw_now / max(1e-9, med_bw)  # أصغر أفضل
+    med_vals=[w for w in bws if w>0]
+    med_bw = (sorted(med_vals)[len(med_vals)//2] if med_vals else bw_now) or bw_now
+    squeeze = bw_now / max(1e-9, med_bw)
 
-    # حجم: آخر 30m / متوسط 12h
     v6  = sum(vols[-6:])/6.0
     v144= (sum(vols[-144:])/144.0) if len(vols)>=144 else (sum(vols)/max(1,len(vols)))
     volx = v6 / max(1e-9, v144)
 
-    # دفتر
     ob = fetch_orderbook(market) or {}
     spread=ob.get("spread", 999.0); imb=ob.get("imb", 0.0)
 
-    return {
-        "market":market, "price":p_now,
-        "accel":accel, "r15":r15, "squeeze":squeeze, "volx":volx,
-        "spread":spread, "imb":imb,
-        "ret_1h":ret_1h, "ret_6h":ret_6h
-    }
+    return {"market":market,"price":p_now,"accel":accel,"r15":r15,"squeeze":squeeze,
+            "volx":volx,"spread":spread,"imb":imb,"ret_1h":ret_1h,"ret_6h":ret_6h}
 
 def _score_row(f):
-    # استبعاد “منفجرة” حديثاً
-    if f["ret_1h"]>MAX_RET_1H or f["ret_6h"]>MAX_RET_6H:
-        return -1.0
-    if f["spread"]>THRESH_SPREAD_BP_MAX or f["imb"]<THRESH_IMB_MIN:
-        return -1.0
+    if f["ret_1h"]>MAX_RET_1H or f["ret_6h"]>MAX_RET_6H: return -1.0
+    if f["spread"]>THRESH_SPREAD_BP_MAX or f["imb"]<THRESH_IMB_MIN: return -1.0
 
     accel = max(-0.5, min(0.5, f["accel"]))
     r15   = max(-1.5, min(1.5, f["r15"]))
@@ -348,7 +318,7 @@ def _score_row(f):
     spr   = f["spread"]; imb=f["imb"]
 
     mom = 30.0*max(0.0, min(1.0, (accel-0.02)/0.18)) + 15.0*max(0.0, min(1.0, (r15-0.05)/0.30))
-    sqp = 20.0*max(0.0, min(1.0, (1.2 - sq)/1.0))           # أصغر = أضيق
+    sqp = 20.0*max(0.0, min(1.0, (1.2 - sq)/1.0))
     vpp = 15.0*max(0.0, min(1.0, (volx - 0.9)/1.6))
     obp = 10.0*max(0.0, min(1.0, (200.0 - spr)/150.0)) + 10.0*max(0.0, min(1.0, (imb - 0.95)/0.6))
     return mom + sqp + vpp + obp
@@ -371,24 +341,109 @@ def daily_scan_top():
     rows.sort(key=lambda x: x["score"], reverse=True)
     return rows[:DAILY_TOPN]
 
-# ========= فتح/إغلاق ومراقبة =========
+# ========= تداول =========
+def maker_to_taker_buy(market, eur_to_spend):
+    """
+    Maker-first: نضع Limit تحت أفضل Bid (postOnly)
+    ثم fallback إلى Market بمبلغ لا يقل عن minOrderInQuote.
+    """
+    # حد السوق باليورو
+    rules = get_market_rules(market)
+    min_quote = float(rules.get("minOrderInQuote") or 0.0)
+    if min_quote <= 0.0:
+        min_quote = BUY_MIN_EUR_DEFAULT
+
+    eur_to_spend = max(eur_to_spend, min_quote)
+    eur_to_spend = round(eur_to_spend, 2)
+
+    ob = fetch_orderbook(market)
+    if not ob:
+        return None, "no_ob"
+    best_bid = ob["bb"]; best_ask = ob["aa"]
+
+    # سعر Maker (أقل من الـBid)
+    price = best_bid * (1.0 - 3.0/10000.0)
+    amount = _round_amount(eur_to_spend / price)
+
+    order_id=None
+    for attempt in range(3+1):
+        res = place_limit("buy", market, price, amount, post_only=True)
+        if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
+            order_id = res.get("orderId"); t0=time.time(); wait = 6 if attempt<3 else 10
+            while time.time()-t0 < wait:
+                stt = bv_request("GET", f"/order?market={market}&orderId={order_id}")
+                if isinstance(stt,dict) and stt.get("status")=="filled":
+                    tb,tq,fee=totals_from_fills_eur(stt.get("fills",[]))
+                    if tb>0: 
+                        return {"fills":stt.get("fills",[]),"maker":True}, "filled_maker"
+                time.sleep(1.2)
+            cancel_order(market, order_id)
+            ob = fetch_orderbook(market)
+            if not ob: break
+            best_bid = ob["bb"]; price = best_bid * (1.0 - 3.0/10000.0)
+            amount = _round_amount(eur_to_spend / price)
+
+    # Fallback: Market
+    res = place_market("buy", market, amount_quote=eur_to_spend)
+    if isinstance(res,dict) and res.get("status")=="filled":
+        return {"fills":res.get("fills",[]),"maker":False}, "filled_taker"
+
+    # لو فشل، رجّع السبب للمستخدم
+    return {"error":res}, "failed"
+
+def maker_to_taker_sell(market, amount):
+    ob=fetch_orderbook(market)
+    if not ob: return None, "no_ob"
+    aa=ob["aa"]
+    # سعر Maker للبيع (أعلى من الـAsk حتى لا يعبر السبريد)
+    price = max(aa*(1.0+0.0001), aa*(1.0 - 3.0/10000.0))
+    res=place_limit("sell", market, price, amount, post_only=True)
+    if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
+        t0=time.time()
+        while time.time()-t0<10:
+            stt=bv_request("GET", f"/order?market={market}&orderId={res.get('orderId')}")
+            if isinstance(stt,dict) and stt.get("status")=="filled":
+                return {"fills":stt.get("fills",[]),"maker":True},"filled_maker"
+            time.sleep(1.2)
+        cancel_order(market, res.get("orderId"))
+    # fallback
+    res=place_market("sell", market, amount=amount)
+    if isinstance(res,dict) and res.get("status")=="filled":
+        return {"fills":res.get("fills",[]),"maker":False},"filled_taker"
+    return None, "failed"
+
 def open_position_from_top(idx=0):
     global active_trade
     if idx>=len(today_top): return False
     mkt=today_top[idx]["market"]; base=mkt.replace("-EUR","")
-    eur=round(max(0.0, get_eur_available()-EUR_RESERVE),2)
-    if eur<BUY_MIN_EUR:
-        send_message(f"🚫 EUR غير كافٍ: {eur:.2f}"); return False
-    res,how=maker_to_taker_buy(mkt, eur)
-    if not res: 
-        send_message(f"❌ فشل شراء {base}"); return False
+
+    eur_avail = get_eur_available()
+    rules = get_market_rules(mkt)
+    min_quote = float(rules.get("minOrderInQuote") or 0.0) or BUY_MIN_EUR_DEFAULT
+    eur = round(max(0.0, eur_avail - EUR_RESERVE), 2)
+    if eur < max(min_quote, BUY_MIN_EUR_DEFAULT):
+        send_message(f"🚫 EUR غير كافٍ: {eur:.2f} (حد السوق ≥ €{max(min_quote, BUY_MIN_EUR_DEFAULT):.2f})"); 
+        return False
+
+    # نصرف كل المتاح ولكن ≥ الحد الأدنى للسوق
+    spend = max(min_quote, eur)
+
+    res,how=maker_to_taker_buy(mkt, spend)
+    if not res or how=="failed":
+        # اطبع السبب إن وُجد
+        if isinstance(res, dict) and "error" in res:
+            send_message(f"❌ فشل شراء {base} — {res['error']}", force=True)
+        else:
+            send_message(f"❌ فشل شراء {base}", force=True)
+        return False
+
     tb,tq,fee=totals_from_fills_eur(res["fills"])
     avg=(tq+fee)/tb if tb>0 else 0.0
     with lk:
         active_trade={"symbol":mkt,"entry":avg,"amount":tb,"cost_eur":tq+fee,
                       "buy_fee_eur":fee,"opened_at":time.time(),"peak_pct":0.0}
     style="Maker" if res.get("maker") else "Taker"
-    send_message(f"✅ شراء {base} (Top1) | €{eur:.2f} | {style} @ €{avg:.6f}")
+    send_message(f"✅ شراء {base} (Top1) | €{spend:.2f} | {style} @ €{avg:.6f}")
     return True
 
 def close_position(reason=""):
@@ -406,6 +461,8 @@ def close_position(reason=""):
         with lk: active_trade={}
         send_message(f"💰 بيع {base} | {pnl_pct:+.2f}% — {reason}")
 
+# ========= مراقبة بعد الشراء =========
+_ws_lock_mon=Lock()
 def monitor_loop():
     while True:
         try:
@@ -434,7 +491,7 @@ def monitor_loop():
 Thread(target=monitor_loop, daemon=True).start()
 
 # ========= Daily scheduler =========
-def daily_scheduler():
+def daily_scan_top10_and_buy():
     global today_top, _last_daily_scan
     while True:
         try:
@@ -454,9 +511,9 @@ def daily_scheduler():
             time.sleep(5)
         except Exception as e:
             print("daily sched err:", e); time.sleep(3)
-Thread(target=daily_scheduler, daemon=True).start()
+Thread(target=daily_scan_top10_and_buy, daemon=True).start()
 
-# ========= Summary / Balance (بدون تغيير تقريبًا) =========
+# ========= Summary / Balance =========
 def build_summary():
     lines=[]
     with lk: tr=dict(active_trade) if active_trade else {}
@@ -512,7 +569,7 @@ def webhook():
         bals=bv_request("GET","/balance")
         if not isinstance(bals,list): send_message("❌ تعذر جلب الرصيد."); return "ok"
         eur=sum(float(b.get("available",0))+float(b.get("inOrder",0)) for b in bals if b.get("symbol")=="EUR")
-        total=eur; winners,losers=[],[]
+        total=eur; positions=[]
         for b in bals:
             sym=b.get("symbol")
             if sym=="EUR": continue
@@ -521,22 +578,14 @@ def webhook():
             pair=f"{sym}-EUR"; price=fetch_price_ws_first(pair)
             if price is None: continue
             total+=qty*price
-            line=f"{sym}: {qty:.4f} @ €{price:.4f}"
-            winners.append(line)
+            positions.append(f"{sym}: {qty:.4f} @ €{price:.4f}")
         lines=[f"💰 الرصيد الإجمالي (تقديري): €{total:.2f}", f"💶 EUR: €{eur:.2f}"]
-        if winners: lines.append("\n📦 مراكز:\n"+"\n".join(winners))
+        if positions: lines.append("\n📦 مراكز:\n"+"\n".join(positions))
         send_message("\n".join(lines)); return "ok"
 
     if starts("buy","اشتري","إشتري"):
-        try:
-            sym=re.search(r"[A-Za-z0-9\-]+", text).group(0).upper()
-            if "-" in sym: sym=sym.split("-")[0]
-            if sym.endswith("EUR") and len(sym)>3: sym=sym[:-3]
-            sym=re.sub(r"[^A-Z0-9]","", sym)
-        except Exception:
-            send_message("❌ الصيغة: buy ADA"); return "ok"
-        open_position_from_top(0) if sym=="TOP1" else open_position_from_top(0)
-        return "ok"
+        # اختياري يدوي
+        open_position_from_top(0); return "ok"
 
     if has("flat","اغلق","سكر","بيع الكل"):
         close_position("Manual"); return "ok"
