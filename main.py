@@ -36,9 +36,9 @@ WS_URL   = "wss://ws.bitvavo.com/v2/"
 
 # ========= Settings =========
 MAX_TRADES            = 1
-MAKER_BID_OFFSET_BP   = 4.0          # نحط اللّيمت فوق أفضل Bid بـ ~4bp ليبقى Maker
-MAKER_WAIT_TOTAL_SEC  = 20           # إجمالي وقت محاولة الشراء Maker (مع إعادة تسعير)
-MAKER_REPRICE_EVERY   = 2.5          # كل كم ثانية نعيد تسعير أمر الـ Maker
+MAKER_BID_OFFSET_BP   = 10.0
+MAKER_REPRICE_EVERY   = 0.8
+MAKER_WAIT_TOTAL_SEC  = 20    # ← بالثواني
 SELL_MARKET_ALWAYS    = True         # البيع دائمًا Market (حسب رغبتك)
 
 SL_PCT                = -3.0
@@ -343,20 +343,25 @@ Thread(target=monitor_loop, daemon=True).start()
 def do_open(market: str, eur: float):
     global active_trade
     if active_trade:
-        send_message("⛔ توجد صفقة نشطة. أغلقها أولًا.")
-        return
+        send_message("⛔ توجد صفقة نشطة. أغلقها أولًا."); return
     if eur is None or eur <= 0:
         eur = get_eur_available()
-
     if eur < BUY_MIN_EUR:
-        send_message(f"⛔ رصيد غير كافٍ. EUR المتاح {eur:.2f}€.")
-        return
+        send_message(f"⛔ رصيد غير كافٍ. EUR المتاح {eur:.2f}€."); return
 
-    # شراء Maker فقط
+    # 1) محاولة Maker لمدة MAKER_WAIT_TOTAL_SEC (مع إعادة تسعير)
     res = open_maker_buy(market, eur)
+
+    # 2) إن لم ينجح، افعل Market تلقائيًا
     if not res:
-        send_message("❌ فشل الشراء Maker.")
-        return
+        send_message("⚠️ لم يكتمل شراء Maker خلال المهلة — التحويل إلى Market.")
+        taker = _place_market(market, "buy", amountQuote=eur)
+        fills = taker.get("fills", [])
+        base_amt, quote_eur, fee_eur = totals_from_fills(fills)
+        if base_amt <= 0:
+            send_message("❌ فشل الشراء Market أيضًا."); return
+        avg = (quote_eur + fee_eur) / base_amt
+        res = {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
 
     active_trade = {
         "symbol": market,
@@ -369,8 +374,8 @@ def do_open(market: str, eur: float):
         "trailing_on": False
     }
     executed_trades.append(active_trade.copy())
-    send_message(f"✅ شراء {market.replace('-EUR','')} (Maker) @ €{active_trade['entry']:.6f} | كمية {active_trade['amount']:.8f}")
-
+    mode = "Maker" if res.get("fee_eur",0)==0 else "Taker"
+    send_message(f"✅ شراء {market.replace('-EUR','')} ({mode}) @ €{active_trade['entry']:.6f} | كمية {active_trade['amount']:.8f}")
 def do_close(reason=""):
     global active_trade
     if not active_trade: return
