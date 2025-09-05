@@ -1,597 +1,507 @@
 # -*- coding: utf-8 -*-
 """
-Nems — Daily Simple v2 (Bitvavo EUR)
-• مسح بطيء مرة/24h لآخر 3 أيام (5m) → Top10 (لم تنفجر بعد) → شراء Top1 فقط (Maker-first)
-• مراقبة سريعة بعد الشراء (SL ثابت + Trailing Giveback)
-• أوامر: start/stop, /top10, /summary, /balance
+Simple Signal Executor — Maker Buy (Bitvavo EUR) + Fast Market Sell
+- شراء Maker فقط (postOnly) مع إعادة تسعير قصيرة لتجنّب الرسوم.
+- SL = -3.0% ، Trailing: +3% تفعيل ثم -1% من القمة.
+- مصدر الإشارة:
+   1) أمر تلغرام: /buy ADA  (أو "اشتري ADA")
+   2) إعادة توجيه رسالة من قناة VIP تحتوي #COIN/USDT → يُحَوَّل إلى COIN-EUR إن كان متاحًا في Bitvavo.
+- صفقة واحدة فقط في نفس الوقت.
 """
 
-import os, re, time, json, math, statistics as st, traceback
-from collections import deque
-from threading import Thread, Lock
-from uuid import uuid4
-
+import os, re, time, json, traceback, math
 import requests, redis, websocket
+from threading import Thread, Lock
+from collections import deque
+from uuid import uuid4
 from flask import Flask, request
 from dotenv import load_dotenv
-load_dotenv()
 
-# ========= ENV / App =========
+# ========= Boot / ENV =========
+load_dotenv()
 app = Flask(__name__)
+
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
+CHAT_ID     = os.getenv("CHAT_ID")          # اختياري؛ لو تركته فاضي رح نطبع بدل الإرسال
 API_KEY     = os.getenv("BITVAVO_API_KEY")
 API_SECRET  = os.getenv("BITVAVO_API_SECRET")
 REDIS_URL   = os.getenv("REDIS_URL")
-RUN_LOCAL   = os.getenv("RUN_LOCAL","0")=="1"
+RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
 
-BASE_URL    = "https://api.bitvavo.com/v2"
-WS_URL      = "wss://ws.bitvavo.com/v2/"
-
-# ========= رسوم (bps) =========
-FEE_MAKER_BPS = float(os.getenv("FEE_MAKER_BPS", 12))    # 0.12%
-FEE_TAKER_BPS = float(os.getenv("FEE_TAKER_BPS", 25))    # 0.25%
-
-# ========= Daily scan (3d, 5m) =========
-DAILY_ENABLED         = True
-DAILY_TOPN            = int(os.getenv("DAILY_TOPN", 10))
-DAILY_SCAN_EVERY_SEC  = 24*3600
-DAILY_REQUEST_SLEEP   = 0.12
-
-# فلتر دفتر الأوامر خلال المسح
-THRESH_SPREAD_BP_MAX  = 220.0
-THRESH_IMB_MIN        = 0.40
-
-# “لم تنفجر بعد”
-MAX_RET_1H            = 2.2
-MAX_RET_6H            = 6.0
-
-# ========= إدارة مركز بعد الشراء =========
-EUR_RESERVE           = 0.00
-BUY_MIN_EUR_DEFAULT   = 5.00      # حد عام إذا السوق ما رجع minOrderInQuote
-
-SL_FIXED              = -3.0
-TRAIL_ON_AT           = 3.0
-TRAIL_GIVEBACK        = 1.2
-HOLD_MIN_SEC          = 60
-WS_STALENESS_SEC      = 2.0
-
-# ========= حالة =========
 r  = redis.from_url(REDIS_URL) if REDIS_URL else redis.Redis()
 lk = Lock()
-enabled = True
 
-active_trade = {}
-executed_trades = []
-today_top = []
-_last_daily_scan = 0
+BASE_URL = "https://api.bitvavo.com/v2"
+WS_URL   = "wss://ws.bitvavo.com/v2/"
 
-# ========= Telegram =========
-def send_message(text, force=False):
+# ========= Settings =========
+MAX_TRADES            = 1
+MAKER_BID_OFFSET_BP   = 4.0          # نحط اللّيمت فوق أفضل Bid بـ ~4bp ليبقى Maker
+MAKER_WAIT_TOTAL_SEC  = 20           # إجمالي وقت محاولة الشراء Maker (مع إعادة تسعير)
+MAKER_REPRICE_EVERY   = 2.5          # كل كم ثانية نعيد تسعير أمر الـ Maker
+SELL_MARKET_ALWAYS    = True         # البيع دائمًا Market (حسب رغبتك)
+
+SL_PCT                = -3.0
+TRAIL_ACTIVATE_PCT    = +3.0
+TRAIL_GIVEBACK_PCT    = 1.0
+
+BUY_MIN_EUR           = 5.0          # أقل قيمة شراء
+WS_STALENESS_SEC      = 2.0
+
+# ========= Runtime =========
+enabled        = True
+signals_on     = True          # شغّل/أطفئ التقاط إشارات القنوات المعاد توجيهها
+active_trade   = None          # dict أو None
+executed_trades= []
+MARKET_MAP     = {}            # 'ADA' -> 'ADA-EUR'
+_ws_prices     = {}
+_ws_lock       = Lock()
+
+# ========= Utils =========
+def send_message(text: str):
+    """يرسل تلغرام أو يطبع محليًا."""
     try:
-        if not (BOT_TOKEN and CHAT_ID):
-            print("TG:", text); return
-        if not force:
-            key="dedup:"+str(abs(hash(text))%(10**12))
-            if not r.setnx(key,1): return
-            r.expire(key, 60)
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id":CHAT_ID,"text":text}, timeout=8)
-    except Exception as e: print("TG err:", e)
+        if BOT_TOKEN and CHAT_ID:
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          data={"chat_id": CHAT_ID, "text": text}, timeout=8)
+        else:
+            print("TG:", text)
+    except Exception as e:
+        print("TG err:", e)
 
-# ========= Bitvavo auth =========
 def create_sig(ts, method, path, body_str=""):
     import hmac, hashlib
-    msg=f"{ts}{method}{path}{body_str}"
+    msg = f"{ts}{method}{path}{body_str}"
     return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def bv_request(method, path, body=None, timeout=10):
-    url=f"{BASE_URL}{path}"
-    ts=str(int(time.time()*1000))
-    body_str="" if method=="GET" else json.dumps(body or {}, separators=(',',':'))
-    sig=create_sig(ts,method,f"/v2{path}",body_str)
-    headers={
-        'Bitvavo-Access-Key':API_KEY,
-        'Bitvavo-Access-Timestamp':ts,
-        'Bitvavo-Access-Signature':sig,
-        'Bitvavo-Access-Window':'10000'
+    url = f"{BASE_URL}{path}"
+    ts  = str(int(time.time()*1000))
+    body_str = "" if method=="GET" else json.dumps(body or {}, separators=(',',':'))
+    sig = create_sig(ts, method, f"/v2{path}", body_str)
+    headers = {
+        'Bitvavo-Access-Key': API_KEY,
+        'Bitvavo-Access-Timestamp': ts,
+        'Bitvavo-Access-Signature': sig,
+        'Bitvavo-Access-Window': '10000'
     }
     try:
-        resp=requests.request(method,url,headers=headers,
-                              json=(body or {}) if method!="GET" else None,
-                              timeout=timeout)
-        try:
-            return resp.json()
-        except Exception:
-            return {"status_code": resp.status_code, "text": resp.text}
+        resp = requests.request(method, url, headers=headers,
+                                json=(body or {}) if method!="GET" else None,
+                                timeout=timeout)
+        return resp.json()
     except Exception as e:
-        print("bv_request err:", e); return {"error":"request_failed"}
+        print("bv_request err:", e)
+        return {"error":"request_failed"}
 
-def get_eur_available()->float:
+def get_eur_available() -> float:
     try:
-        bals=bv_request("GET","/balance")
-        if isinstance(bals,list):
+        bals = bv_request("GET", "/balance")
+        if isinstance(bals, list):
             for b in bals:
-                if b.get("symbol")=="EUR":
+                if b.get("symbol") == "EUR":
                     return max(0.0, float(b.get("available",0) or 0))
-    except Exception: pass
+    except Exception:
+        pass
     return 0.0
 
-# ======== Market rules (min notional, decimals) ========
-MARKETS_CACHE={}
-def get_market_rules(market):
-    now=time.time()
-    rec=MARKETS_CACHE.get(market)
-    if rec and (now-rec["ts"])<3600:   # ساعة
-        return rec["data"]
+def load_markets():
+    """ابني خريطة COIN -> COIN-EUR مرة كل تشغيل."""
+    global MARKET_MAP
     try:
-        j=bv_request("GET", f"/markets?market={market}")
-        # Bitvavo تعيد list بمدخل واحد
-        if isinstance(j, list) and j:
-            item=j[0]
-        elif isinstance(j, dict) and j.get("market")==market:
-            item=j
-        else:
-            item={}
-        data={
-            "pricePrecision": item.get("pricePrecision"),
-            "amountDecimals": item.get("amountDecimals"),
-            # أحيانًا minOrderInQuote موجود مباشرة، أحيانًا بالمفتاح minOrderQuote
-            "minOrderInQuote": float(item.get("minOrderInQuote") or item.get("minOrderQuote") or 0) if item else 0.0,
-            "minOrderInBase": float(item.get("minOrderInBase") or item.get("minOrderBase") or 0) if item else 0.0
-        }
-        MARKETS_CACHE[market]={"ts":now,"data":data}
-        return data
+        rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
+        m = {}
+        for r0 in rows:
+            base = r0.get("base")
+            quote= r0.get("quote")
+            market= r0.get("market")
+            if base and quote=="EUR":
+                m[base.upper()] = market
+        if m: MARKET_MAP = m
     except Exception as e:
-        print("market rules err:", e); return {"minOrderInQuote":0.0,"minOrderInBase":0.0}
+        print("load_markets err:", e)
 
-# ========= Orderbook / WS (للمراقبة بعد الشراء فقط) =========
-_ws_lock=Lock()
-_ws_price={}
+def coin_to_market(coin: str):
+    if not MARKET_MAP:
+        load_markets()
+    return MARKET_MAP.get(coin.upper())
+
+# ========= Prices (WS + fallback) =========
 def _ws_on_open(ws):
+    # لا اشتراك هنا؛ نعمل subscribe عند أول طلب
+    pass
+
+def _ws_on_message(ws, msg):
     try:
-        mkts=[active_trade["symbol"]] if active_trade else []
-        if mkts:
-            ws.send(json.dumps({"action":"subscribe","channels":[{"name":"ticker","markets":mkts}]}))
-    except Exception: traceback.print_exc()
+        data = json.loads(msg)
+    except Exception:
+        return
+    if isinstance(data, dict) and data.get("event") == "ticker":
+        m = data.get("market")
+        price = data.get("price") or data.get("lastPrice") or data.get("open")
+        try:
+            p = float(price)
+            if p > 0:
+                with _ws_lock:
+                    _ws_prices[m] = {"price": p, "ts": time.time()}
+        except Exception:
+            pass
 
-def _ws_on_message(ws,msg):
-    try: d=json.loads(msg)
-    except Exception: return
-    if d.get("event")=="ticker":
-        m=d.get("market"); p=float(d.get("price") or d.get("lastPrice") or 0)
-        if p>0:
-            with _ws_lock: _ws_price[m]={"p":p,"ts":time.time()}
+def _ws_on_error(ws, err): print("WS error:", err)
+def _ws_on_close(ws, c, r): pass
 
-def _ws_on_error(ws,err): print("WS err:", err)
-def _ws_on_close(ws,c,rn): print("WS closed:", c, rn)
-
-def ws_thread():
+def _ws_thread():
     while True:
         try:
-            w=websocket.WebSocketApp(WS_URL, on_open=_ws_on_open, on_message=_ws_on_message,
-                                     on_error=_ws_on_error, on_close=_ws_on_close)
-            w.run_forever(ping_interval=25, ping_timeout=10)
+            ws = websocket.WebSocketApp(
+                WS_URL, on_open=_ws_on_open, on_message=_ws_on_message,
+                on_error=_ws_on_error, on_close=_ws_on_close
+            )
+            ws.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             print("WS loop ex:", e)
         time.sleep(2)
-Thread(target=ws_thread, daemon=True).start()
 
-def fetch_price_ws_first(market):
-    now=time.time()
-    with _ws_lock:
-        rec=_ws_price.get(market)
-    if rec and (now-rec["ts"])<=WS_STALENESS_SEC: return rec["p"]
+Thread(target=_ws_thread, daemon=True).start()
+
+def ws_sub(markets):
+    if not markets: return
     try:
-        j=requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=5).json()
-        p=float(j.get("price",0) or 0)
-        if p>0:
-            with _ws_lock: _ws_price[market]={"p":p,"ts":now}
+        payload = {"action":"subscribe","channels":[{"name":"ticker","markets":markets}]}
+        # فتح سوكيت عابر لطلب الاشتراك (الـ run_forever أعلاه يحافظ على القناة)
+        ws = websocket.create_connection(WS_URL, timeout=5)
+        ws.send(json.dumps(payload))
+        ws.close()
+    except Exception:
+        pass
+
+def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
+    now = time.time()
+    with _ws_lock:
+        rec = _ws_prices.get(market)
+    if rec and (now - rec["ts"]) <= staleness:
+        return rec["price"]
+    # اطلب اشتراك على الطاير
+    ws_sub([market])
+    try:
+        j = requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=5).json()
+        p = float(j.get("price", 0) or 0)
+        if p > 0:
+            with _ws_lock:
+                _ws_prices[market] = {"price": p, "ts": now}
             return p
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
-def fetch_orderbook(market, depth=3):
+def fetch_orderbook(market):
     try:
-        j=requests.get(f"{BASE_URL}/{market}/book", timeout=6).json()
-        if not j or not j.get("bids") or not j.get("asks"): return None
-        bids=[(float(p),float(q)) for p,q,*_ in j["bids"][:depth]]
-        asks=[(float(p),float(q)) for p,q,*_ in j["asks"][:depth]]
-        bb,aa=bids[0][0], asks[0][0]
-        spread=((aa-bb)/((aa+bb)/2.0))*10000.0
-        bid_eur=sum(p*q for p,q in bids); ask_eur=sum(p*q for p,q in asks)
-        imb=bid_eur/max(1e-9, ask_eur)
-        return {"spread":spread,"imb":imb,"bb":bb,"aa":aa}
-    except Exception: return None
+        j = requests.get(f"{BASE_URL}/{market}/book", timeout=6).json()
+        if j and j.get("bids") and j.get("asks"):
+            return j
+    except Exception:
+        pass
+    return None
 
-# ========= أوامر تداول =========
-def _round_amount(x): return float(f"{x:.10f}")
-
-def place_limit(side, market, price, amount, post_only=True):
-    body={"market":market,"side":side,"orderType":"limit",
-          "price":f"{price:.10f}","amount":f"{amount:.10f}",
-          "timeInForce":"GTC","clientOrderId":str(uuid4())}
-    if post_only: body["postOnly"]=True
-    return bv_request("POST","/order", body)
-
-def place_market(side, market, amount=None, amount_quote=None):
-    body={"market":market,"side":side,"orderType":"market","clientOrderId":str(uuid4())}
-    if side=="buy":  body["amountQuote"]=f"{amount_quote:.2f}"
-    else:            body["amount"]=f"{amount:.10f}"
-    return bv_request("POST","/order", body)
-
-def cancel_order(market, order_id):
-    return bv_request("DELETE", f"/order?market={market}&orderId={order_id}")
-
-def totals_from_fills_eur(fills):
+# ========= Orders =========
+def totals_from_fills(fills):
     tb=tq=fee=0.0
     for f in (fills or []):
         amt=float(f["amount"]); price=float(f["price"]); fe=float(f.get("fee",0) or 0)
         tb+=amt; tq+=amt*price; fee+=fe
-    return tb,tq,fee
+    return tb, tq, fee
 
-# ========= Daily Scan (3 days, 5m) =========
-def _t_fresh():
-    try:
-        rows=requests.get(f"{BASE_URL}/ticker/24h", timeout=10).json()
-        return rows if isinstance(rows,list) else []
-    except Exception: return []
+def _place_limit_postonly(market, side, price, amount=None, amountQuote=None):
+    body={"market":market,"side":side,"orderType":"limit","postOnly":True,
+          "clientOrderId":str(uuid4()),"operatorId":"", "price":f"{price:.10f}"}
+    if side=="buy": body["amountQuote"]=f"{amountQuote:.2f}"
+    else:           body["amount"]=f"{amount:.10f}"
+    return bv_request("POST","/order", body)
 
-def _list_eur_markets():
-    mk=[]
-    for r0 in _t_fresh():
-        m=r0.get("market","")
-        if m.endswith("-EUR"):
-            try:
-                if float(r0.get("last",0) or 0) > 0: mk.append(m)
-            except: pass
-    return mk
+def _place_market(market, side, amount=None, amountQuote=None):
+    body={"market":market,"side":side,"orderType":"market",
+          "clientOrderId":str(uuid4()),"operatorId":""}
+    if side=="buy": body["amountQuote"]=f"{amountQuote:.2f}"
+    else:           body["amount"]=f"{amount:.10f}"
+    return bv_request("POST","/order", body)
 
-def candles_5m(market, limit=1000):
-    try:
-        rows=requests.get(f"{BASE_URL}/{market}/candles?interval=5m&limit={limit}", timeout=10).json()
-        return rows if isinstance(rows,list) else []
-    except Exception: return []
+def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
+def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={orderId}")
 
-def _linreg_slope(y):
-    n=len(y); 
-    if n<5: return 0.0
-    xs=range(n); xbar=(n-1)/2.0; ybar=sum(y)/n
-    num=sum((x-xbar)*(y[x]-ybar) for x in xs)
-    den=sum((x-xbar)*(x-xbar) for x in xs)
-    return num/den if den>0 else 0.0
-
-def _boll_width(arr, n=20):
-    if len(arr)<n: return 0.0
-    sub=arr[-n:]; m=sum(sub)/n
-    var=sum((x-m)**2 for x in sub)/n
-    std=math.sqrt(var)
-    up, dn = m+2*std, m-2*std
-    return (up-dn)/max(1e-12, m)
-
-def _compute_features(market):
-    cs = candles_5m(market, 1000)     # ~3.5d
-    if len(cs)<300: return None
-    closes=[float(c[4]) for c in cs]
-    vols  =[float(c[5]) for c in cs]
-    logs  =[math.log(max(1e-12,p)) for p in closes]
-
-    def ret_n(n): 
-        if len(closes)<=n: return 0.0
-        return ((closes[-1]/closes[-n]) - 1.0)*100.0
-    ret_1h  = ret_n(12)
-    ret_6h  = ret_n(72)
-
-    last_1d = logs[-288:] if len(logs)>=288 else logs
-    last_3d = logs[-min(1000,len(logs)):]
-    slope1d = _linreg_slope(last_1d) * 12
-    slope3d = _linreg_slope(last_3d) * 12
-    accel   = slope1d - slope3d
-
-    p_now=closes[-1]; p_3=closes[-4] if len(closes)>=4 else closes[0]
-    r15 = ((p_now/p_3)-1.0)*100.0 if p_3>0 else 0.0
-
-    bw_now=_boll_width(closes,20)
-    bws=[_boll_width(closes[:i],20) for i in range(60, min(600,len(closes)))]
-    med_vals=[w for w in bws if w>0]
-    med_bw = (sorted(med_vals)[len(med_vals)//2] if med_vals else bw_now) or bw_now
-    squeeze = bw_now / max(1e-9, med_bw)
-
-    v6  = sum(vols[-6:])/6.0
-    v144= (sum(vols[-144:])/144.0) if len(vols)>=144 else (sum(vols)/max(1,len(vols)))
-    volx = v6 / max(1e-9, v144)
-
-    ob = fetch_orderbook(market) or {}
-    spread=ob.get("spread", 999.0); imb=ob.get("imb", 0.0)
-
-    return {"market":market,"price":p_now,"accel":accel,"r15":r15,"squeeze":squeeze,
-            "volx":volx,"spread":spread,"imb":imb,"ret_1h":ret_1h,"ret_6h":ret_6h}
-
-def _score_row(f):
-    if f["ret_1h"]>MAX_RET_1H or f["ret_6h"]>MAX_RET_6H: return -1.0
-    if f["spread"]>THRESH_SPREAD_BP_MAX or f["imb"]<THRESH_IMB_MIN: return -1.0
-
-    accel = max(-0.5, min(0.5, f["accel"]))
-    r15   = max(-1.5, min(1.5, f["r15"]))
-    sq    = f["squeeze"]
-    volx  = max(0.4, min(3.0, f["volx"]))
-    spr   = f["spread"]; imb=f["imb"]
-
-    mom = 30.0*max(0.0, min(1.0, (accel-0.02)/0.18)) + 15.0*max(0.0, min(1.0, (r15-0.05)/0.30))
-    sqp = 20.0*max(0.0, min(1.0, (1.2 - sq)/1.0))
-    vpp = 15.0*max(0.0, min(1.0, (volx - 0.9)/1.6))
-    obp = 10.0*max(0.0, min(1.0, (200.0 - spr)/150.0)) + 10.0*max(0.0, min(1.0, (imb - 0.95)/0.6))
-    return mom + sqp + vpp + obp
-
-def daily_scan_top():
-    mkts=_list_eur_markets()
-    rows=[]
-    for m in mkts:
-        try:
-            f=_compute_features(m)
-            if not f: 
-                time.sleep(DAILY_REQUEST_SLEEP); continue
-            s=_score_row(f)
-            if s>=0:
-                f["score"]=round(s,2)
-                rows.append(f)
-        except Exception as e:
-            print("scan err", m, e)
-        time.sleep(DAILY_REQUEST_SLEEP)
-    rows.sort(key=lambda x: x["score"], reverse=True)
-    return rows[:DAILY_TOPN]
-
-# ========= تداول =========
-def maker_to_taker_buy(market, eur_to_spend):
-    """
-    Maker-first: نضع Limit تحت أفضل Bid (postOnly)
-    ثم fallback إلى Market بمبلغ لا يقل عن minOrderInQuote.
-    """
-    # حد السوق باليورو
-    rules = get_market_rules(market)
-    min_quote = float(rules.get("minOrderInQuote") or 0.0)
-    if min_quote <= 0.0:
-        min_quote = BUY_MIN_EUR_DEFAULT
-
-    eur_to_spend = max(eur_to_spend, min_quote)
-    eur_to_spend = round(eur_to_spend, 2)
+# ========= Trade Ops =========
+def open_maker_buy(market: str, eur_amount: float):
+    """يحاول Maker فقط لمدة محدودة مع إعادة تسعير؛ إن لم ينجح يرجع None."""
+    if eur_amount < BUY_MIN_EUR:
+        send_message(f"⛔ المبلغ أقل من {BUY_MIN_EUR}€.")
+        return None
 
     ob = fetch_orderbook(market)
     if not ob:
-        return None, "no_ob"
-    best_bid = ob["bb"]; best_ask = ob["aa"]
+        send_message("⛔ لا يمكن قراءة دفتر الأوامر.")
+        return None
 
-    # سعر Maker (أقل من الـBid)
-    price = best_bid * (1.0 - 3.0/10000.0)
-    amount = _round_amount(eur_to_spend / price)
+    started = time.time()
+    last_order = None
+    fills = []
 
-    order_id=None
-    for attempt in range(3+1):
-        res = place_limit("buy", market, price, amount, post_only=True)
-        if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
-            order_id = res.get("orderId"); t0=time.time(); wait = 6 if attempt<3 else 10
-            while time.time()-t0 < wait:
-                stt = bv_request("GET", f"/order?market={market}&orderId={order_id}")
-                if isinstance(stt,dict) and stt.get("status")=="filled":
-                    tb,tq,fee=totals_from_fills_eur(stt.get("fills",[]))
-                    if tb>0: 
-                        return {"fills":stt.get("fills",[]),"maker":True}, "filled_maker"
-                time.sleep(1.2)
-            cancel_order(market, order_id)
+    try:
+        while time.time() - started < MAKER_WAIT_TOTAL_SEC:
             ob = fetch_orderbook(market)
-            if not ob: break
-            best_bid = ob["bb"]; price = best_bid * (1.0 - 3.0/10000.0)
-            amount = _round_amount(eur_to_spend / price)
+            best_bid = float(ob["bids"][0][0])
+            tick_price = best_bid * (1 + MAKER_BID_OFFSET_BP/10000.0)  # فوق أفضل Bid بقليل
 
-    # Fallback: Market
-    res = place_market("buy", market, amount_quote=eur_to_spend)
-    if isinstance(res,dict) and res.get("status")=="filled":
-        return {"fills":res.get("fills",[]),"maker":False}, "filled_taker"
+            # ألغِ الأمر السابق (إن وجد)
+            if last_order:
+                try: _cancel_order(last_order)
+                except Exception: pass
 
-    # لو فشل، رجّع السبب للمستخدم
-    return {"error":res}, "failed"
+            # ضع أمر Maker جديد
+            res = _place_limit_postonly(market, "buy", tick_price, amountQuote=eur_amount)
+            orderId = res.get("orderId")
+            last_order = orderId
 
-def maker_to_taker_sell(market, amount):
-    ob=fetch_orderbook(market)
-    if not ob: return None, "no_ob"
-    aa=ob["aa"]
-    # سعر Maker للبيع (أعلى من الـAsk حتى لا يعبر السبريد)
-    price = max(aa*(1.0+0.0001), aa*(1.0 - 3.0/10000.0))
-    res=place_limit("sell", market, price, amount, post_only=True)
-    if isinstance(res,dict) and res.get("status") in ("new","partiallyFilled","filled"):
-        t0=time.time()
-        while time.time()-t0<10:
-            stt=bv_request("GET", f"/order?market={market}&orderId={res.get('orderId')}")
-            if isinstance(stt,dict) and stt.get("status")=="filled":
-                return {"fills":stt.get("fills",[]),"maker":True},"filled_maker"
-            time.sleep(1.2)
-        cancel_order(market, res.get("orderId"))
-    # fallback
-    res=place_market("sell", market, amount=amount)
-    if isinstance(res,dict) and res.get("status")=="filled":
-        return {"fills":res.get("fills",[]),"maker":False},"filled_taker"
-    return None, "failed"
+            # انتظر تعبئة قصيرة
+            t0 = time.time()
+            while time.time() - t0 < MAKER_REPRICE_EVERY:
+                st = _fetch_order(orderId)
+                if st.get("status") == "filled":
+                    fills = st.get("fills", [])
+                    last_order = None
+                    break
+                time.sleep(0.4)
 
-def open_position_from_top(idx=0):
-    global active_trade
-    if idx>=len(today_top): return False
-    mkt=today_top[idx]["market"]; base=mkt.replace("-EUR","")
+            if fills: break  # تم الشراء Maker
+        # نظّف أمرًا معلقًا إن بقي
+        if last_order:
+            try: _cancel_order(last_order)
+            except Exception: pass
+    except Exception as e:
+        print("open_maker_buy err:", e)
 
-    eur_avail = get_eur_available()
-    rules = get_market_rules(mkt)
-    min_quote = float(rules.get("minOrderInQuote") or 0.0) or BUY_MIN_EUR_DEFAULT
-    eur = round(max(0.0, eur_avail - EUR_RESERVE), 2)
-    if eur < max(min_quote, BUY_MIN_EUR_DEFAULT):
-        send_message(f"🚫 EUR غير كافٍ: {eur:.2f} (حد السوق ≥ €{max(min_quote, BUY_MIN_EUR_DEFAULT):.2f})"); 
-        return False
+    if not fills:
+        send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة.")
+        return None
 
-    # نصرف كل المتاح ولكن ≥ الحد الأدنى للسوق
-    spend = max(min_quote, eur)
+    base_amt, quote_eur, fee_eur = totals_from_fills(fills)
+    if base_amt <= 0: return None
+    avg = (quote_eur + fee_eur) / base_amt
+    return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
 
-    res,how=maker_to_taker_buy(mkt, spend)
-    if not res or how=="failed":
-        # اطبع السبب إن وُجد
-        if isinstance(res, dict) and "error" in res:
-            send_message(f"❌ فشل شراء {base} — {res['error']}", force=True)
-        else:
-            send_message(f"❌ فشل شراء {base}", force=True)
-        return False
+def close_market_sell(market: str, amount: float):
+    res = _place_market(market, "sell", amount=amount)
+    fills = res.get("fills", [])
+    base, quote_eur, fee_eur = totals_from_fills(fills)
+    proceeds = quote_eur - fee_eur
+    return proceeds, fee_eur
 
-    tb,tq,fee=totals_from_fills_eur(res["fills"])
-    avg=(tq+fee)/tb if tb>0 else 0.0
-    with lk:
-        active_trade={"symbol":mkt,"entry":avg,"amount":tb,"cost_eur":tq+fee,
-                      "buy_fee_eur":fee,"opened_at":time.time(),"peak_pct":0.0}
-    style="Maker" if res.get("maker") else "Taker"
-    send_message(f"✅ شراء {base} (Top1) | €{spend:.2f} | {style} @ €{avg:.6f}")
-    return True
-
-def close_position(reason=""):
-    global active_trade
-    with lk: tr=dict(active_trade) if active_trade else None
-    if not tr: return
-    m=tr["symbol"]; base=m.replace("-EUR","")
-    amt=float(tr["amount"])
-    res,how=maker_to_taker_sell(m, amt)
-    if isinstance(res,dict):
-        tb,tq,fee=totals_from_fills_eur(res.get("fills",[]))
-        proceeds=tq-fee
-        orig=tr["entry"]*amt
-        pnl_pct=(proceeds/orig - 1.0)*100.0 if orig>0 else 0.0
-        with lk: active_trade={}
-        send_message(f"💰 بيع {base} | {pnl_pct:+.2f}% — {reason}")
-
-# ========= مراقبة بعد الشراء =========
-_ws_lock_mon=Lock()
+# ========= Monitor =========
 def monitor_loop():
+    global active_trade
     while True:
         try:
-            with lk: tr=dict(active_trade) if active_trade else None
-            if not tr: time.sleep(0.5); continue
-            m=tr["symbol"]; p=fetch_price_ws_first(m)
-            if not p: time.sleep(0.3); continue
-            entry=tr["entry"]; pnl=((p/entry)-1.0)*100.0
-            tr["peak_pct"]=max(tr.get("peak_pct",0.0), pnl)
+            if not active_trade:
+                time.sleep(0.25)
+                continue
 
-            if (not tr.get("trail_on")) and tr["peak_pct"]>=TRAIL_ON_AT:
-                tr["trail_on"]=True
+            m   = active_trade["symbol"]
+            ent = active_trade["entry"]
+            cur = fetch_price_ws_first(m)
+            if not cur:
+                time.sleep(0.25)
+                continue
 
-            if tr.get("trail_on"):
-                drop=tr["peak_pct"] - pnl
-                if drop>=TRAIL_GIVEBACK and (time.time()-tr["opened_at"])>=HOLD_MIN_SEC:
-                    close_position(f"Giveback {drop:.2f}%"); continue
+            pnl = ((cur/ent) - 1.0) * 100.0
+            # حدّث القمة
+            active_trade["peak_pct"] = max(active_trade["peak_pct"], pnl)
 
-            if pnl<=SL_FIXED and (time.time()-tr["opened_at"])>=HOLD_MIN_SEC:
-                close_position(f"SL {SL_FIXED:.2f}%"); continue
+            # تفعيل التريلينغ
+            if (not active_trade["trailing_on"]) and pnl >= TRAIL_ACTIVATE_PCT:
+                active_trade["trailing_on"] = True
+                send_message(f"⛳ تفعيل التريلينغ عند {TRAIL_ACTIVATE_PCT:.1f}%")
 
-            with lk: active_trade.update(tr)
-            time.sleep(0.25)
+            # SL ثابت
+            if pnl <= SL_PCT:
+                do_close("SL -3%")
+                time.sleep(0.5)
+                continue
+
+            # تريلينغ: إذا فعال وتراجع من القمة 1%
+            if active_trade["trailing_on"]:
+                peak = active_trade["peak_pct"]
+                if (peak - pnl) >= TRAIL_GIVEBACK_PCT:
+                    do_close("Trailing giveback 1%")
+                    time.sleep(0.5)
+                    continue
+
+            time.sleep(0.12)
         except Exception as e:
-            print("monitor err:", e); time.sleep(1)
+            print("monitor err:", e)
+            time.sleep(0.5)
+
 Thread(target=monitor_loop, daemon=True).start()
 
-# ========= Daily scheduler =========
-def daily_scan_top10_and_buy():
-    global today_top, _last_daily_scan
-    while True:
-        try:
-            now=time.time()
-            if enabled and DAILY_ENABLED and (now-_last_daily_scan)>=DAILY_SCAN_EVERY_SEC:
-                send_message("🔎 Daily: بدء مسح (3 أيام / 5m)…")
-                top=daily_scan_top()
-                today_top=top; _last_daily_scan=now
-                if not top:
-                    send_message("❌ Daily: لا مرشحين اليوم.")
-                else:
-                    lines=["📈 Daily Top 10 (لم تنفجر بعد):"]
-                    for i,f in enumerate(top,1):
-                        lines.append(f"{i:>2}. {f['market'].replace('-EUR',''):<7} | score {f['score']:.1f} | acc {f['accel']:.3f} | r15 {f['r15']:+.2f}% | sq {f['squeeze']:.2f} | vol×{f['volx']:.2f} | ob {f['spread']:.0f}bp/{f['imb']:.2f} | 1h {f['ret_1h']:+.2f}% | 6h {f['ret_6h']:+.2f}%")
-                    send_message("\n".join(lines))
-                    open_position_from_top(0)
-            time.sleep(5)
-        except Exception as e:
-            print("daily sched err:", e); time.sleep(3)
-Thread(target=daily_scan_top10_and_buy, daemon=True).start()
+def do_open(market: str, eur: float):
+    global active_trade
+    if active_trade:
+        send_message("⛔ توجد صفقة نشطة. أغلقها أولًا.")
+        return
+    if eur is None or eur <= 0:
+        eur = get_eur_available()
 
-# ========= Summary / Balance =========
+    if eur < BUY_MIN_EUR:
+        send_message(f"⛔ رصيد غير كافٍ. EUR المتاح {eur:.2f}€.")
+        return
+
+    # شراء Maker فقط
+    res = open_maker_buy(market, eur)
+    if not res:
+        send_message("❌ فشل الشراء Maker.")
+        return
+
+    active_trade = {
+        "symbol": market,
+        "entry":  float(res["avg"]),
+        "amount": float(res["amount"]),
+        "cost_eur": float(res["cost_eur"]),
+        "buy_fee_eur": float(res["fee_eur"]),
+        "opened_at": time.time(),
+        "peak_pct": 0.0,
+        "trailing_on": False
+    }
+    executed_trades.append(active_trade.copy())
+    send_message(f"✅ شراء {market.replace('-EUR','')} (Maker) @ €{active_trade['entry']:.6f} | كمية {active_trade['amount']:.8f}")
+
+def do_close(reason=""):
+    global active_trade
+    if not active_trade: return
+    m   = active_trade["symbol"]
+    amt = float(active_trade["amount"])
+    proceeds, sell_fee = close_market_sell(m, amt)
+    pnl_eur = proceeds - float(active_trade["cost_eur"])
+    pnl_pct = (proceeds/float(active_trade["cost_eur"]) - 1.0) * 100.0 if active_trade["cost_eur"]>0 else 0.0
+
+    # سجّل الإغلاق
+    for t in reversed(executed_trades):
+        if t["symbol"]==m and "exit_eur" not in t:
+            t.update({"exit_eur": proceeds, "sell_fee_eur": sell_fee,
+                      "pnl_eur": pnl_eur, "pnl_pct": pnl_pct,
+                      "exit_time": time.time()})
+            break
+
+    send_message(f"💰 بيع {m.replace('-EUR','')} (Market) | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%) {('— '+reason) if reason else ''}")
+    # انهِ الصفقة
+    active_trade = None
+
+# ========= Signal Parsing (Telegram forwarded VIP) =========
+COIN_PATTS = [
+    re.compile(r"#([A-Z0-9]{2,15})/USDT", re.I),
+    re.compile(r"\b([A-Z0-9]{2,15})USDT\b", re.I),
+    re.compile(r"\b([A-Z0-9]{2,15})\s*-\s*USDT\b", re.I),
+]
+
+def extract_coin_from_text(txt: str):
+    for rx in COIN_PATTS:
+        m = rx.search(txt or "")
+        if m:
+            return m.group(1).upper()
+    return None
+
+# ========= Summary =========
 def build_summary():
     lines=[]
-    with lk: tr=dict(active_trade) if active_trade else {}
-    if tr:
-        cur=fetch_price_ws_first(tr["symbol"]) or tr["entry"]
-        pnl=((cur-tr["entry"])/tr["entry"])*100.0
-        peak=float(tr.get("peak_pct",0.0))
-        base=tr["symbol"].replace("-EUR","")
-        lines.append("📌 الصفقة النشطة:")
-        lines.append(f"• {base}: {pnl:+.2f}% | Peak {peak:.2f}%")
+    if active_trade:
+        cur = fetch_price_ws_first(active_trade["symbol"]) or active_trade["entry"]
+        pnl = ((cur/active_trade["entry"])-1.0)*100.0
+        lines.append("📌 صفقة نشطة:")
+        lines.append(f"• {active_trade['symbol'].replace('-EUR','')} @ €{active_trade['entry']:.6f} | PnL {pnl:+.2f}% | Peak {active_trade['peak_pct']:.2f}% | Trailing {'ON' if active_trade['trailing_on'] else 'OFF'}")
     else:
         lines.append("📌 لا صفقات نشطة.")
-    if today_top:
-        best=today_top[0]
-        lines.append("\n⭐️ مرشح اليوم: "+best["market"].replace("-EUR","")+f" | score {best['score']:.1f}")
+    closed=[x for x in executed_trades if "exit_eur" in x]
+    pnl_eur=sum(float(x["pnl_eur"]) for x in closed)
+    wins=sum(1 for x in closed if float(x.get("pnl_eur",0))>=0)
+    lines.append(f"\n📊 صفقات مكتملة: {len(closed)} | محققة: {pnl_eur:+.2f}€ | فوز/خسارة: {wins}/{len(closed)-wins}")
+    lines.append(f"\n⚙️ signals={'ON' if signals_on else 'OFF'} | buy=Maker | sell=Market | SL={SL_PCT}% | trail +{TRAIL_ACTIVATE_PCT}/-{TRAIL_GIVEBACK_PCT}%")
     return "\n".join(lines)
 
-# ========= Telegram =========
+# ========= Telegram Webhook =========
+def handle_text_command(text_raw: str):
+    global enabled, signals_on
+    t = (text_raw or "").strip()
+    low = t.lower()
+
+    def starts(*k): return any(low.startswith(x) for x in k)
+    def has(*k):    return any(x in low for x in k)
+
+    # أوامر أساسية
+    if starts("/start") or has("تشغيل","ابدأ"):
+        enabled=True; send_message("✅ تم التفعيل."); return
+
+    if has("stop","ايقاف","إيقاف","قف"):
+        enabled=False; send_message("🛑 تم الإيقاف."); return
+
+    if has("signals on","signal on","/signals_on","اشارات تشغيل","إشارات تشغيل"):
+        signals_on=True; send_message("📡 الإشارات: ON"); return
+
+    if has("signals off","signal off","/signals_off","اشارات ايقاف","إشارات إيقاف"):
+        signals_on=False; send_message("📡 الإشارات: OFF"); return
+
+    if has("/summary","summary","ملخص","الملخص"):
+        send_message(build_summary()); return
+
+    if has("/reset","reset","انسى","أنسى"):
+        global active_trade, executed_trades
+        active_trade=None; executed_trades.clear()
+        send_message("🧠 Reset."); return
+
+    if has("/sell","بيع الان","بيع الآن"):
+        if active_trade: do_close("Manual"); 
+        else: send_message("لا توجد صفقة لإغلاقها.")
+        return
+
+    # شراء يدوي: /buy ADA [eur]
+    if starts("/buy") or starts("buy") or starts("اشتري") or starts("اشتر"):
+        parts = re.split(r"\s+", t)
+        coin = None; eur=None
+        for p in parts[1:]:
+            if re.fullmatch(r"[A-Za-z0-9]{2,15}", p): coin=p.upper()
+            elif re.fullmatch(r"\d+(\.\d+)?", p): eur=float(p)
+        if not coin:
+            send_message("اكتب: /buy ADA [eur]")
+            return
+        market = coin_to_market(coin)
+        if not market:
+            send_message(f"⛔ {coin}-EUR غير متاح على Bitvavo.")
+            return
+        do_open(market, eur)
+        return
+
+    # التقط إشارات VIP المعاد توجيهها
+    if signals_on:
+        coin = extract_coin_from_text(t)
+        if coin:
+            market = coin_to_market(coin)
+            if market:
+                send_message(f"📥 إشارة VIP ملتقطة: #{coin}/USDT → {market} — بدء شراء Maker…")
+                do_open(market, None)
+            else:
+                send_message(f"⚠️ {coin}-EUR غير متوفر على Bitvavo.")
+        # إن لم نجد عملة، نتجاهل بصمت
+
 @app.route("/", methods=["POST"])
 def webhook():
-    global enabled, DAILY_ENABLED, _last_daily_scan
-    data=request.get_json(silent=True) or {}
-    text=(data.get("message",{}).get("text") or data.get("text") or "").strip()
-    if not text: return "ok"
-    low=text.lower()
-
-    def has(*k): return any(x in low for x in k)
-    def starts(*k): return any(low.startswith(x) for x in k)
-
-    if has("start","تشغيل","ابدأ"):
-        enabled=True; send_message("✅ تم التفعيل."); return "ok"
-    if has("stop","قف","ايقاف","إيقاف"):
-        enabled=False; send_message("🛑 تم الإيقاف."); return "ok"
-
-    if has("daily on","daily_on","اختيار يومي تشغيل"):
-        DAILY_ENABLED=True; send_message("🟢 Daily: ON"); return "ok"
-    if has("daily off","daily_off","اختيار يومي ايقاف","اختيار يومي إيقاف"):
-        DAILY_ENABLED=False; send_message("🔴 Daily: OFF"); return "ok"
-    if has("daily now","daily scan","مسح يومي"):
-        _last_daily_scan=0; send_message("⏱️ Daily: سيتم المسح الآن."); return "ok"
-
-    if has("top10","قائمة","القائمة"):
-        if not today_top: send_message("🚫 لا قائمة اليوم بعد."); return "ok"
-        lines=["📈 Top 10 اليوم:"]
-        for i,f in enumerate(today_top,1):
-            lines.append(f"{i:>2}. {f['market'].replace('-EUR',''):<7} | score {f['score']:.1f} | acc {f['accel']:.3f} | r15 {f['r15']:+.2f}% | sq {f['squeeze']:.2f} | vol×{f['volx']:.2f}")
-        send_message("\n".join(lines)); return "ok"
-
-    if has("summary","ملخص","الملخص"):
-        send_message(build_summary()); return "ok"
-
-    if has("balance","الرصيد","رصيد"):
-        bals=bv_request("GET","/balance")
-        if not isinstance(bals,list): send_message("❌ تعذر جلب الرصيد."); return "ok"
-        eur=sum(float(b.get("available",0))+float(b.get("inOrder",0)) for b in bals if b.get("symbol")=="EUR")
-        total=eur; positions=[]
-        for b in bals:
-            sym=b.get("symbol")
-            if sym=="EUR": continue
-            qty=float(b.get("available",0))+float(b.get("inOrder",0))
-            if qty<0.0001: continue
-            pair=f"{sym}-EUR"; price=fetch_price_ws_first(pair)
-            if price is None: continue
-            total+=qty*price
-            positions.append(f"{sym}: {qty:.4f} @ €{price:.4f}")
-        lines=[f"💰 الرصيد الإجمالي (تقديري): €{total:.2f}", f"💶 EUR: €{eur:.2f}"]
-        if positions: lines.append("\n📦 مراكز:\n"+"\n".join(positions))
-        send_message("\n".join(lines)); return "ok"
-
-    if starts("buy","اشتري","إشتري"):
-        # اختياري يدوي
-        open_position_from_top(0); return "ok"
-
-    if has("flat","اغلق","سكر","بيع الكل"):
-        close_position("Manual"); return "ok"
-
+    data = request.get_json(silent=True) or {}
+    # يدعم: {message:{text:..}} أو {text:..}
+    text = (data.get("message",{}).get("text") or data.get("text") or "").strip()
+    if not text:
+        return "ok"
+    try:
+        handle_text_command(text)
+    except Exception as e:
+        traceback.print_exc()
+        send_message(f"🐞 خطأ: {e}")
     return "ok"
 
 # ========= Local run =========
-if __name__=="__main__" and RUN_LOCAL:
+if __name__ == "__main__" and RUN_LOCAL:
+    load_markets()
     app.run(host="0.0.0.0", port=5000)
