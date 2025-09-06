@@ -2,7 +2,8 @@
 """
 Simple Signal Executor — Maker Buy (Bitvavo EUR) + Fast Market Sell
 - نفس منطق النسخة القديمة.
-- تحسين وحيد: فولباك الشراء Market صار يتعامل مع قفل الرصيد/الحد الأدنى/التأخير.
+- تحسين Maker: تسعير آمن لا يلمس الـ ask + قبول partial fills + إعادة تسعير هادئة.
+- تحسين فولباك Market: ينتظر تحرير الرصيد ويتأكد من التعبئة مع retries.
 """
 
 import os, re, time, json, traceback, math
@@ -31,11 +32,15 @@ WS_URL   = "wss://ws.bitvavo.com/v2/"
 
 # ========= Settings =========
 MAX_TRADES            = 1
-MAKER_BID_OFFSET_BP   = 10.0
-MAKER_REPRICE_EVERY   = 0.8
-MAKER_WAIT_TOTAL_SEC  = 20
 SELL_MARKET_ALWAYS    = True
 
+# Maker tuning
+MAKER_BID_OFFSET_BP   = 3.0      # أقرب للـ bid كي لا يرفض postOnly
+MAKER_REPRICE_EVERY   = 2.0      # لا تكسر الصف كثير
+MAKER_WAIT_TOTAL_SEC  = 30       # مهلة أطول قليلاً
+MAKER_REPRICE_THRESH  = 0.0005   # إعادة التسعير فقط لو تحرك bid > 0.05%
+
+# Risk
 SL_PCT                = -3.0
 TRAIL_ACTIVATE_PCT    = +3.0
 TRAIL_GIVEBACK_PCT    = 1.0
@@ -43,11 +48,11 @@ TRAIL_GIVEBACK_PCT    = 1.0
 BUY_MIN_EUR           = 5.0
 WS_STALENESS_SEC      = 2.0
 
-# ✅ تحسينات فولباك الماركت (فقط)
-MARKET_CONFIRM_TIMEOUT= 18.0   # ننتظر تعبئة orderId لهذا الزمن
-MARKET_RETRIES        = 4      # عدد المحاولات
-MARKET_SAFETY         = 0.995  # خصم 0.5% من المبلغ لتفادي الحد الأدنى/الرسوم
-RELEASE_WAIT_SEC      = 10.0   # أقصى انتظار لتحرير الرصيد بعد إلغاء Maker
+# Market fallback tuning
+MARKET_CONFIRM_TIMEOUT= 18.0     # ننتظر تعبئة orderId لهذا الزمن
+MARKET_RETRIES        = 4        # عدد المحاولات
+MARKET_SAFETY         = 0.995    # خصم 0.5% لتفادي الحد الأدنى/الرسوم (يمكن 0.992 عند الحاجة)
+RELEASE_WAIT_SEC      = 10.0     # أقصى انتظار لتحرير الرصيد بعد إلغاء Maker
 POLL_INTERVAL         = 0.35
 
 # ========= Runtime =========
@@ -228,14 +233,14 @@ def _safe_quote(eur: float) -> float:
     return round(q, 2)
 
 def wait_for_eur_release(target_eur: float, timeout_sec: float = RELEASE_WAIT_SEC):
-    """ينتظر تحرير الرصيد بعد إلغاء أوامر Maker (Bitvavo يحجز لحظياً)."""
+    """انتظر فعلاً لغاية ما يتحرر الرصيد بعد إلغاء أوامر Maker."""
+    start_free = get_eur_available()
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         free = get_eur_available()
-        if free + 1e-9 >= min(target_eur, free):  # أي زيادة طفيفة تكفي
-            # إذا الرصيد المتاح يغطي الحد الأدنى المطلوب نخرج
-            if free >= BUY_MIN_EUR:
-                return True
+        # تحرر الرصيد إذا: زاد عن البداية ≥0.01€ أو صار يغطي المبلغ المطلوب أو على الأقل الحد الأدنى
+        if (free - start_free) >= 0.01 or free >= target_eur or free >= BUY_MIN_EUR:
+            return True
         time.sleep(0.5)
     return False
 
@@ -246,7 +251,6 @@ def market_buy_best_effort(market: str, eur_amount: float):
     - يحاول عدة مرات مع تأخير متزايد.
     - يتابع orderId حتى التعبئة خلال MARKET_CONFIRM_TIMEOUT.
     """
-    # تأكد أن الرصيد تحرر فعلاً
     wait_for_eur_release(eur_amount, RELEASE_WAIT_SEC)
 
     amt_q = _safe_quote(min(eur_amount, get_eur_available()))
@@ -290,7 +294,12 @@ def market_buy_best_effort(market: str, eur_amount: float):
 
 # ========= Trade Ops =========
 def open_maker_buy(market: str, eur_amount: float):
-    """يحاول Maker فقط لمدة محدودة مع إعادة تسعير؛ إن لم ينجح يرجع None."""
+    """
+    Maker فقط مع:
+    - تسعير آمن لا يلمس الـ ask (postOnly).
+    - قبول partial fills وجمعها حتى نهاية المهلة.
+    - إعادة تسعير هادئة عندما يتحرك أفضل Bid فعليًا.
+    """
     if eur_amount < BUY_MIN_EUR:
         send_message(f"⛔ المبلغ أقل من {BUY_MIN_EUR}€.")
         return None
@@ -302,44 +311,88 @@ def open_maker_buy(market: str, eur_amount: float):
 
     started = time.time()
     last_order = None
-    fills = []
+    all_fills  = []
+    remaining_q = float(eur_amount)
 
     try:
-        while time.time() - started < MAKER_WAIT_TOTAL_SEC:
+        while time.time() - started < MAKER_WAIT_TOTAL_SEC and remaining_q >= BUY_MIN_EUR * 0.999:
             ob = fetch_orderbook(market)
             best_bid = float(ob["bids"][0][0])
-            tick_price = best_bid * (1 + MAKER_BID_OFFSET_BP/10000.0)  # فوق أفضل Bid بقليل
+            best_ask = float(ob["asks"][0][0])
 
+            # سعر آمن: قريب من الـ bid ولا يلامس الـ ask
+            target = best_bid * (1.0 + MAKER_BID_OFFSET_BP/10000.0)
+            safe_cap = best_ask * (1.0 - 1e-6)  # شعرة تحت الـ ask
+            price = min(target, safe_cap)
+
+            # إن وُجد أمر سابق: افحصه وقد نجمع تعبئاته
             if last_order:
-                try: _cancel_order(last_order)
-                except Exception: pass
+                st = _fetch_order(last_order)
+                st_status = st.get("status")
+                if st_status in ("filled", "partiallyFilled"):
+                    fills = st.get("fills", [])
+                    if fills:
+                        all_fills += fills
+                        base, quote_eur, fee_eur = totals_from_fills(fills)
+                        remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
+                    if remaining_q < BUY_MIN_EUR * 0.999:
+                        last_order = None
+                        break
+                # أعد التسعير فقط إذا ابتعد السعر فعليًا
+                my_price = float(st.get("price", price) or price)
+                if abs((price / max(my_price, 1e-12)) - 1.0) >= MAKER_REPRICE_THRESH:
+                    try: _cancel_order(last_order)
+                    except Exception: pass
+                    last_order = None
 
-            res = _place_limit_postonly(market, "buy", tick_price, amountQuote=eur_amount)
-            orderId = res.get("orderId")
-            last_order = orderId
+            # إذا لا يوجد أمر فعّال، أنشئ واحدًا
+            if not last_order and remaining_q >= BUY_MIN_EUR * 0.999:
+                res = _place_limit_postonly(market, "buy", price, amountQuote=remaining_q)
+                # لو رفض postOnly (لأن السعر يضرب الـ ask) ضع على أفضل Bid لضمان Maker
+                if not res.get("orderId"):
+                    safe_bid = best_bid * (1.0 - 1e-6)
+                    res = _place_limit_postonly(market, "buy", safe_bid, amountQuote=remaining_q)
+                last_order = res.get("orderId")
+                if not last_order:
+                    time.sleep(0.25)
+                    continue
 
+            # انتظار قبل إعادة التسعير
             t0 = time.time()
             while time.time() - t0 < MAKER_REPRICE_EVERY:
-                st = _fetch_order(orderId)
-                if st.get("status") == "filled":
-                    fills = st.get("fills", [])
-                    last_order = None
+                if not last_order:
                     break
-                time.sleep(0.4)
+                st = _fetch_order(last_order)
+                st_status = st.get("status")
+                if st_status in ("filled", "partiallyFilled"):
+                    fills = st.get("fills", [])
+                    if fills:
+                        all_fills += fills
+                        base, quote_eur, fee_eur = totals_from_fills(fills)
+                        remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
+                    if remaining_q < BUY_MIN_EUR * 0.999:
+                        last_order = None
+                        break
+                time.sleep(0.35)
 
-            if fills: break
+            if remaining_q < BUY_MIN_EUR * 0.999:
+                break
+
+        # نظّف أي أمر معلق
         if last_order:
             try: _cancel_order(last_order)
             except Exception: pass
+
     except Exception as e:
         print("open_maker_buy err:", e)
 
-    if not fills:
+    if not all_fills:
         send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة.")
         return None
 
-    base_amt, quote_eur, fee_eur = totals_from_fills(fills)
-    if base_amt <= 0: return None
+    base_amt, quote_eur, fee_eur = totals_from_fills(all_fills)
+    if base_amt <= 0:
+        return None
     avg = (quote_eur + fee_eur) / base_amt
     return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
 
@@ -398,14 +451,12 @@ def do_open(market: str, eur: float):
     # 1) محاولة Maker لمدة محدودة
     res = open_maker_buy(market, eur)
 
-    # 2) إن لم ينجح، نفّذ Market قوي (بدون تغيير باقي السلوك)
+    # 2) إن لم ينجح، نفّذ Market قوي
     if not res:
         send_message("⚠️ لم يكتمل شراء Maker خلال المهلة — التحويل إلى Market.")
-        # انتظر لحظة لتحرير أي حجز رصيد من أوامر Maker
-        time.sleep(0.8)
+        time.sleep(0.8)  # تحرر أي حجز رصيد من أوامر Maker
         res = market_buy_best_effort(market, eur)
         if not res:
-            # فشل نهائي، لا صفقة
             return
 
     active_trade = {
