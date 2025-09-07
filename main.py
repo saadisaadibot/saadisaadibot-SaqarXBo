@@ -230,25 +230,25 @@ def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={order
 
 # ========= Trade Ops =========
 def open_maker_buy(market: str, eur_amount: float):
-    """يحاول Maker فقط لمدة محدودة مع إعادة تسعير؛ إن لم ينجح يرجع None.
-       (نسخة محسّنة لا تلامس ask وتقبل الملء الجزئي)"""
+    """Maker مع إعادة تسعير ذكية: لا نلغي إلا إذا تحرك الـ bid فعلياً، ونقبل partial fills."""
     if eur_amount < BUY_MIN_EUR:
         send_message(f"⛔ المبلغ أقل من {BUY_MIN_EUR}€.")
         return None
 
     ob = fetch_orderbook(market)
-    if not ob:
+    if not ob or not ob.get("bids") or not ob.get("asks"):
         send_message("⛔ لا يمكن قراءة دفتر الأوامر.")
         return None
 
-    started     = time.time()
-    last_order  = None
-    all_fills   = []
-    remaining_q = float(eur_amount)
+    started      = time.time()
+    last_order   = None
+    last_price   = None
+    all_fills    = []
+    remaining_q  = float(eur_amount)
 
     try:
         while time.time() - started < MAKER_WAIT_TOTAL_SEC and remaining_q >= BUY_MIN_EUR * 0.999:
-            # آخر دفتر أوامر
+            # احصل على أفضل Bid/Ask الآن
             ob = fetch_orderbook(market)
             if not ob or not ob.get("bids") or not ob.get("asks"):
                 time.sleep(0.2); continue
@@ -256,76 +256,79 @@ def open_maker_buy(market: str, eur_amount: float):
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
 
-            # لا تلمس الـ ask إطلاقاً (postOnly سيرفض لو لمسنا)
+            # سعر آمن للـ postOnly: قريب من الـ bid ولا يلمس الـ ask
             target   = best_bid * (1.0 + MAKER_BID_OFFSET_BP/10000.0)
-            safe_cap = best_ask * (1.0 - 1e-6)            # شعرة تحت الـ ask
+            safe_cap = best_ask * (1.0 - 1e-6)
             price    = min(target, safe_cap)
+            if price >= best_ask:            # أمان إضافي
+                price = best_bid
 
-            # إن كان في أمر سابق، نتابع وضعه
+            # عندي أمر سابق؟ افحصه أولاً
             if last_order:
                 st = _fetch_order(last_order)
                 st_status = st.get("status")
+
                 if st_status in ("filled", "partiallyFilled"):
-                    this_fills = st.get("fills", [])
-                    if this_fills:
-                        all_fills += this_fills
-                        base, quote_eur, fee_eur = totals_from_fills(this_fills)
+                    fills = st.get("fills", [])
+                    if fills:
+                        all_fills += fills
+                        base, quote_eur, fee_eur = totals_from_fills(fills)
                         remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
-                    # إذا كان جزئي ولسّا مفتوح، ألغِه لنعيد التسعير
-                    if st_status != "filled":
-                        try: _cancel_order(last_order)
-                        except Exception: pass
-                    last_order = None
-                    if remaining_q < BUY_MIN_EUR * 0.999:
+                    # إذا اكتمل خلاص
+                    if st_status == "filled" or remaining_q < BUY_MIN_EUR * 0.999:
+                        last_order = None
                         break
-                else:
-                    # لم يُملأ خلال نافذة الانتظار السابقة ⇒ ألغِ لإعادة التسعير
+
+                # هل نحتاج إعادة تسعير؟ فقط إذا تحرك السعر فعلاً
+                need_reprice = (last_price is None) or (abs(price/last_price - 1.0) >= 0.0005)  # 0.05%
+                if need_reprice:
                     try: _cancel_order(last_order)
                     except Exception: pass
                     last_order = None
+                else:
+                    # لا نعيد التسعير الآن؛ نعطيه مهلة قصيرة ونجرّب تاني
+                    time.sleep(0.35)
+                    continue
 
-            # ضع أمر جديد على السعر الآمن
-            if remaining_q >= BUY_MIN_EUR * 0.999:
+            # إذا ما في أمر فعّال، أنشئ واحداً بالسعر المحسوب
+            if not last_order and remaining_q >= BUY_MIN_EUR * 0.999:
                 res = _place_limit_postonly(market, "buy", price, amountQuote=remaining_q)
-                orderId = res.get("orderId")
+                oid = res.get("orderId")
 
-                # لو رفض postOnly (لأنه يضرب الـ ask)، ضع على أفضل Bid مباشرة
-                if not orderId:
-                    safe_bid = best_bid * (1.0 - 1e-6)
-                    res = _place_limit_postonly(market, "buy", safe_bid, amountQuote=remaining_q)
-                    orderId = res.get("orderId")
+                # لو رفض postOnly لأن السعر يضرب الـ ask، جرّب على أفضل Bid مباشرة
+                if not oid:
+                    res = _place_limit_postonly(market, "buy", best_bid, amountQuote=remaining_q)
+                    oid = res.get("orderId")
 
-                last_order = orderId
-
-                # إن فشل إنشاء الأمر بالكامل انتظر شوي وأعد المحاولة
-                if not last_order:
+                if not oid:
+                    # فشل إنشاء الطلب؛ انتظر قليلًا وكرر
                     time.sleep(0.25)
                     continue
 
-                # نافذة انتظار قصيرة قبل إعادة التسعير
+                last_order = oid
+                last_price = price
+
+                # نافذة انتظار قبل التفكير بإعادة التسعير
                 t0 = time.time()
                 while time.time() - t0 < MAKER_REPRICE_EVERY:
                     st = _fetch_order(last_order)
                     st_status = st.get("status")
                     if st_status in ("filled", "partiallyFilled"):
-                        this_fills = st.get("fills", [])
-                        if this_fills:
-                            all_fills += this_fills
-                            base, quote_eur, fee_eur = totals_from_fills(this_fills)
+                        fills = st.get("fills", [])
+                        if fills:
+                            all_fills += fills
+                            base, quote_eur, fee_eur = totals_from_fills(fills)
                             remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
-                        # لو لم يكتمل، ألغِ لإعادة التسعير في الدورة القادمة
-                        if st_status != "filled":
-                            try: _cancel_order(last_order)
-                            except Exception: pass
-                        last_order = None
-                        break
+                        if st_status == "filled" or remaining_q < BUY_MIN_EUR * 0.999:
+                            last_order = None
+                            break
                     time.sleep(0.4)
 
-            # كفاية تعبئة؟
+            # اكتفينا؟
             if remaining_q < BUY_MIN_EUR * 0.999:
                 break
 
-        # تنظيف أمر معلق إن وجد
+        # نظّف أي أمر باقٍ
         if last_order:
             try: _cancel_order(last_order)
             except Exception: pass
@@ -340,10 +343,8 @@ def open_maker_buy(market: str, eur_amount: float):
     base_amt, quote_eur, fee_eur = totals_from_fills(all_fills)
     if base_amt <= 0:
         return None
-
     avg = (quote_eur + fee_eur) / base_amt
-    return {"amount": base_amt, "avg": avg,
-            "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
+    return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
 def close_market_sell(market: str, amount: float):
     res = _place_market(market, "sell", amount=amount)
     fills = res.get("fills", [])
