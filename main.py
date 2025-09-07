@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Simple Signal Executor — Maker Buy (Bitvavo EUR) + Fast Market Sell
-- شراء Maker فقط (postOnly) مع إعادة تسعير قصيرة لتجنّب الرسوم.
+- شراء Maker (postOnly) + فولباك Market عند الفشل.
 - SL = -3.0% ، Trailing: +3% تفعيل ثم -1% من القمة.
-- مصدر الإشارة:
-   1) أمر تلغرام: /buy ADA  (أو "اشتري ADA")
-   2) إعادة توجيه رسالة من قناة VIP تحتوي #COIN/USDT → يُحَوَّل إلى COIN-EUR إن كان متاحًا في Bitvavo.
+- مصادر الإشارة: أوامر تيليغرام أو إعادة توجيه VIP (#COIN/USDT -> COIN-EUR).
 - صفقة واحدة فقط في نفس الوقت.
 """
 
 import os, re, time, json, traceback, math
 import requests, redis, websocket
 from threading import Thread, Lock
-from collections import deque
 from uuid import uuid4
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -39,21 +36,21 @@ MAX_TRADES            = 1
 MAKER_BID_OFFSET_BP   = 10.0
 MAKER_REPRICE_EVERY   = 0.8
 MAKER_WAIT_TOTAL_SEC  = 20    # ← بالثواني
-SELL_MARKET_ALWAYS    = True         # البيع دائمًا Market (حسب رغبتك)
+SELL_MARKET_ALWAYS    = True
 
 SL_PCT                = -3.0
 TRAIL_ACTIVATE_PCT    = +3.0
 TRAIL_GIVEBACK_PCT    = 1.0
 
-BUY_MIN_EUR           = 5.0          # أقل قيمة شراء
+BUY_MIN_EUR           = 5.0
 WS_STALENESS_SEC      = 2.0
 
 # ========= Runtime =========
 enabled        = True
-signals_on     = True          # شغّل/أطفئ التقاط إشارات القنوات المعاد توجيهها
-active_trade   = None          # dict أو None
+signals_on     = True
+active_trade   = None
 executed_trades= []
-MARKET_MAP     = {}            # 'ADA' -> 'ADA-EUR'
+MARKET_MAP     = {}
 _ws_prices     = {}
 _ws_lock       = Lock()
 
@@ -128,7 +125,6 @@ def coin_to_market(coin: str):
 
 # ========= Prices (WS + fallback) =========
 def _ws_on_open(ws):
-    # لا اشتراك هنا؛ نعمل subscribe عند أول طلب
     pass
 
 def _ws_on_message(ws, msg):
@@ -168,7 +164,6 @@ def ws_sub(markets):
     if not markets: return
     try:
         payload = {"action":"subscribe","channels":[{"name":"ticker","markets":markets}]}
-        # فتح سوكيت عابر لطلب الاشتراك (الـ run_forever أعلاه يحافظ على القناة)
         ws = websocket.create_connection(WS_URL, timeout=5)
         ws.send(json.dumps(payload))
         ws.close()
@@ -181,7 +176,6 @@ def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
         rec = _ws_prices.get(market)
     if rec and (now - rec["ts"]) <= staleness:
         return rec["price"]
-    # اطلب اشتراك على الطاير
     ws_sub([market])
     try:
         j = requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=5).json()
@@ -212,26 +206,35 @@ def totals_from_fills(fills):
     return tb, tq, fee
 
 def _place_limit_postonly(market, side, price, amount=None, amountQuote=None):
+    """داعم للسيناريو الصحيح: buy يستخدم amount (مش amountQuote)."""
     body={"market":market,"side":side,"orderType":"limit","postOnly":True,
           "clientOrderId":str(uuid4()),"operatorId":"", "price":f"{price:.10f}"}
-    if side=="buy": body["amountQuote"]=f"{amountQuote:.2f}"
-    else:           body["amount"]=f"{amount:.10f}"
+    # لو مررت amount نرسلو، ولو مررت amountQuote نرسلو (احتياطي)
+    if amount is not None:    body["amount"]      = f"{float(amount):.10f}"
+    if amountQuote is not None: body["amountQuote"]= f"{float(amountQuote):.2f}"
     return bv_request("POST","/order", body)
 
 def _place_market(market, side, amount=None, amountQuote=None):
     body={"market":market,"side":side,"orderType":"market",
           "clientOrderId":str(uuid4()),"operatorId":""}
-    if side=="buy": body["amountQuote"]=f"{amountQuote:.2f}"
-    else:           body["amount"]=f"{amount:.10f}"
+    if side=="buy": body["amountQuote"]=f"{float(amountQuote):.2f}"
+    else:           body["amount"]=f"{float(amount):.10f}"
     return bv_request("POST","/order", body)
 
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
 def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={orderId}")
 
+# --- Helper: حول EUR -> كمية Base بحسب السعر (مع تقريب سفلي آمن) ---
+def _quote_to_base(eur: float, price: float, decimals: int = 8) -> float:
+    if price <= 0: 
+        return 0.0
+    amt = eur / price
+    factor = 10**decimals
+    return math.floor(amt * factor) / factor
+
 # ========= Trade Ops =========
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker buy آمن: السعر = أفضل Bid دائماً (لا يلامس ask)،
-       إعادة تسعير فقط عند تغير أفضل Bid، وقبول partial fills."""
+    """Maker buy صحيح: limit postOnly بكمية (amount) وليس amountQuote."""
     if eur_amount < BUY_MIN_EUR:
         send_message(f"⛔ المبلغ أقل من {BUY_MIN_EUR}€.")
         return None
@@ -249,23 +252,24 @@ def open_maker_buy(market: str, eur_amount: float):
 
     try:
         while time.time() - started < MAKER_WAIT_TOTAL_SEC and remaining_q >= BUY_MIN_EUR * 0.999:
-            # اقرأ أفضل Bid/Ask
             ob = fetch_orderbook(market)
             if not ob or not ob.get("bids") or not ob.get("asks"):
-                time.sleep(0.2); continue
+                time.sleep(0.2); 
+                continue
 
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
 
-            # سعر آمن 100% للـ postOnly: لا نسمح أبداً بتجاوز ask
-            price = min(best_bid, best_ask * (1.0 - 1e-6))  # عملياً = best_bid
+            # لا نلامس الـ ask مع postOnly
+            price = min(best_bid * (1.0 + MAKER_BID_OFFSET_BP/10000.0),
+                        best_ask * (1.0 - 1e-6))
+            if price >= best_ask:   # أمان إضافي
+                price = best_bid
 
-            # إذا عندنا أمر سابق
+            # أمر سابق؟ راقبه
             if last_order:
                 st = _fetch_order(last_order)
                 st_status = st.get("status")
-
-                # التقط التعبئات
                 if st_status in ("filled", "partiallyFilled"):
                     fills = st.get("fills", []) or []
                     if fills:
@@ -276,33 +280,38 @@ def open_maker_buy(market: str, eur_amount: float):
                         last_order = None
                         break
 
-                # أعد التسعير فقط لو تغيّر أفضل Bid فعلاً
-                if (last_bid is None) or (abs(best_bid/last_bid - 1.0) >= 0.0005):  # 0.05%
-                    try: _cancel_order(last_order)
-                    except Exception: pass
-                    last_order = None
-                else:
+                # أعد التسعير فقط إذا تغيّر أفضل Bid فعليًا (~0.05%)
+                if last_bid is not None and abs(best_bid/last_bid - 1.0) < 0.0005:
                     time.sleep(0.35)
                     continue
+                try: _cancel_order(last_order)
+                except Exception: pass
+                last_order = None
 
-            # إذا ما في أمر فعّال، ضع أمر جديد على أفضل Bid
+            # ضع أمر جديد بالـ amount (مو amountQuote)
             if not last_order and remaining_q >= BUY_MIN_EUR * 0.999:
-                res = _place_limit_postonly(market, "buy", price, amountQuote=remaining_q)
+                base_amt = _quote_to_base(remaining_q, price, 8)
+                if base_amt <= 0:
+                    time.sleep(0.25); 
+                    continue
+
+                res = _place_limit_postonly(market, "buy", price, amount=base_amt)
                 orderId = res.get("orderId")
 
-                # لو رفض postOnly لأي سبب (نادر)، جرّب على best_bid مباشرة مرة ثانية
+                # احتياطي: جرّب على best_bid مباشرة إذا رفض postOnly
                 if not orderId:
-                    res = _place_limit_postonly(market, "buy", best_bid, amountQuote=remaining_q)
+                    base_amt = _quote_to_base(remaining_q, best_bid, 8)
+                    res = _place_limit_postonly(market, "buy", best_bid, amount=base_amt)
                     orderId = res.get("orderId")
 
                 if not orderId:
-                    time.sleep(0.25)
+                    time.sleep(0.25); 
                     continue
 
                 last_order = orderId
                 last_bid   = best_bid
 
-                # امنحه وقتاً معقولاً قبل إعادة التسعير
+                # امنحه وقتاً قبل أي تعديل
                 t0 = time.time()
                 while time.time() - t0 < MAKER_REPRICE_EVERY:
                     st = _fetch_order(last_order)
@@ -321,7 +330,7 @@ def open_maker_buy(market: str, eur_amount: float):
             if remaining_q < BUY_MIN_EUR * 0.999:
                 break
 
-        # نظّف أي أمر معلق
+        # تنظيف أي أمر باقٍ
         if last_order:
             try: _cancel_order(last_order)
             except Exception: pass
@@ -339,6 +348,7 @@ def open_maker_buy(market: str, eur_amount: float):
 
     avg = (quote_eur + fee_eur) / base_amt
     return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
+
 def close_market_sell(market: str, amount: float):
     res = _place_market(market, "sell", amount=amount)
     fills = res.get("fills", [])
@@ -363,21 +373,17 @@ def monitor_loop():
                 continue
 
             pnl = ((cur/ent) - 1.0) * 100.0
-            # حدّث القمة
             active_trade["peak_pct"] = max(active_trade["peak_pct"], pnl)
 
-            # تفعيل التريلينغ
             if (not active_trade["trailing_on"]) and pnl >= TRAIL_ACTIVATE_PCT:
                 active_trade["trailing_on"] = True
                 send_message(f"⛳ تفعيل التريلينغ عند {TRAIL_ACTIVATE_PCT:.1f}%")
 
-            # SL ثابت
             if pnl <= SL_PCT:
                 do_close("SL -3%")
                 time.sleep(0.5)
                 continue
 
-            # تريلينغ: إذا فعال وتراجع من القمة 1%
             if active_trade["trailing_on"]:
                 peak = active_trade["peak_pct"]
                 if (peak - pnl) >= TRAIL_GIVEBACK_PCT:
@@ -404,7 +410,7 @@ def do_open(market: str, eur: float):
     # 1) محاولة Maker لمدة MAKER_WAIT_TOTAL_SEC (مع إعادة تسعير)
     res = open_maker_buy(market, eur)
 
-    # 2) إن لم ينجح، افعل Market تلقائيًا
+    # 2) إن لم ينجح، افعل Market تلقائيًا (نفس منطقك)
     if not res:
         send_message("⚠️ لم يكتمل شراء Maker خلال المهلة — التحويل إلى Market.")
         taker = _place_market(market, "buy", amountQuote=eur)
@@ -428,6 +434,7 @@ def do_open(market: str, eur: float):
     executed_trades.append(active_trade.copy())
     mode = "Maker" if res.get("fee_eur",0)==0 else "Taker"
     send_message(f"✅ شراء {market.replace('-EUR','')} ({mode}) @ €{active_trade['entry']:.6f} | كمية {active_trade['amount']:.8f}")
+
 def do_close(reason=""):
     global active_trade
     if not active_trade: return
@@ -446,7 +453,6 @@ def do_close(reason=""):
             break
 
     send_message(f"💰 بيع {m.replace('-EUR','')} (Market) | {pnl_eur:+.2f}€ ({pnl_pct:+.2f}%) {('— '+reason) if reason else ''}")
-    # انهِ الصفقة
     active_trade = None
 
 # ========= Signal Parsing (Telegram forwarded VIP) =========
@@ -542,7 +548,6 @@ def handle_text_command(text_raw: str):
                 do_open(market, None)
             else:
                 send_message(f"⚠️ {coin}-EUR غير متوفر على Bitvavo.")
-        # إن لم نجد عملة، نتجاهل بصمت
 
 @app.route("/", methods=["POST"])
 def webhook():
