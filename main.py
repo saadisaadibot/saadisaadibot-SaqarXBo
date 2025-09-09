@@ -40,7 +40,7 @@ WS_URL   = "wss://ws.bitvavo.com/v2/"
 # ========= Settings =========
 # ===== Safety headroom to avoid insufficient balance =====
 EST_FEE_RATE       = float(os.getenv("FEE_RATE_EST", "0.0025"))  # ≈0.25%
-HEADROOM_EUR_MIN   = float(os.getenv("HEADROOM_EUR_MIN", "0.15"))  # هامش ثابت ≥ 0.15€
+HEADROOM_EUR_MIN   = float(os.getenv("HEADROOM_EUR_MIN", "0.50"))  # هامش ثابت ≥ 0.15€
 
 MAX_TRADES            = 1
 
