@@ -317,21 +317,37 @@ def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> f
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع تجميع partial fills."""
+    """Maker postOnly على أفضل Bid، مع تجميع partial fills + هامش أمان للرصيد."""
+    # ---- 1) الرصيد والهامش ----
+    eur_available = get_eur_available()
+
+    # إذا ما انطلب مبلغ محدد، استخدم الرصيد المتاح
     if eur_amount is None or eur_amount <= 0:
-        eur_amount = get_eur_available()
+        eur_amount = eur_available
+
     eur_amount = float(eur_amount)
-    minq = _min_quote(market)
-    if eur_amount < max(minq, BUY_MIN_EUR):
-        send_message(f"⛔ رصيد غير كافٍ. الحد الأدنى ≈ €{max(minq, BUY_MIN_EUR):.2f}.")
+    minq       = _min_quote(market)
+
+    # هامش أمان لتجنّب رفض الرصيد (رسوم + احتجاز صغير)
+    EST_FEE_RATE     = 0.0025   # ≈ 0.25%
+    HEADROOM_EUR_MIN = 0.15     # اترك دائماً 0.15€ على الأقل
+    buffer_eur  = max(HEADROOM_EUR_MIN, eur_amount * EST_FEE_RATE * 1.5)
+    spendable   = min(eur_amount, max(0.0, eur_available - buffer_eur))
+
+    if spendable < max(minq, BUY_MIN_EUR):
+        need = max(minq, BUY_MIN_EUR)
+        send_message(f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}.")
         return None
 
-    patience = get_patience_sec(market)
-    started  = time.time()
-    last_order = None
-    last_bid   = None
-    all_fills  = []
-    remaining_eur = eur_amount
+    send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} (هامش €{buffer_eur:.2f})")
+
+    # ---- 2) الإعدادات الداخلية ----
+    patience     = get_patience_sec(market)
+    started      = time.time()
+    last_order   = None
+    last_bid     = None
+    all_fills    = []
+    remaining_eur= float(spendable)
 
     try:
         while (time.time() - started) < patience and remaining_eur >= (minq * 0.999):
@@ -437,7 +453,6 @@ def open_maker_buy(market: str, eur_amount: float):
     relax_patience_on_success(market)
     avg = (quote_eur + fee_eur) / base_amt
     return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
-
 # ========= Maker Sell =========
 def close_maker_sell(market: str, amount: float):
     """بيع Maker (postOnly) على أفضل Ask، مع تجميع partial fills حتى تصفير الكمية."""
