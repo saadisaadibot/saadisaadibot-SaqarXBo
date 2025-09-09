@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Maker-Only Relay Executor — Bitvavo EUR
+Maker-Only Relay Executor — Bitvavo EUR (Fixed)
 - يستقبل أمر شراء من بوت خارجي عبر /hook (POST JSON).
 - شراء Maker فقط (postOnly) مع إعادة تسعير هادئة وتجميع partial fills.
 - مراقبة لحظية مع سلّم وقف متدرّج: -2% → -1% → 0% → +1% → +2% ... بحسب القمة.
 - بيع Maker فقط (postOnly) مع تجميع partial fills حتى تصفير الكمية.
 - صفقة واحدة فقط بنفس اللحظة.
+
+🔥 تغييرات مهمّة:
+- operatorId="" مضاف لجميع الأوامر.
+- Bitvavo لا يقبل amountQuote للـ limit/postOnly ⇒ نحسب amount ونرسله.
 """
 
 import os, re, time, json, math, traceback
@@ -31,7 +35,7 @@ r  = redis.from_url(REDIS_URL) if REDIS_URL else redis.Redis()
 lk = Lock()
 
 BASE_URL = "https://api.bitvavo.com/v2"
-WS_URL   = "wss://ws.bitvav o.com/v2/".replace(" ", "")  # حماية بسيطة من اللصق الخاطئ
+WS_URL   = "wss://ws.bitvavo.com/v2/"
 
 # ========= Settings =========
 MAX_TRADES            = 1
@@ -49,7 +53,6 @@ WS_STALENESS_SEC      = 2.0
 POLL_INTERVAL         = 0.35
 
 # سلّم الوقف (حسب القمة المحققة منذ الدخول)
-# كل عنصر: (peak_at_least_pct, new_stop_pct)
 STOP_LADDER = [
     (0.0,  -2.0),
     (1.0,  -1.0),
@@ -57,7 +60,6 @@ STOP_LADDER = [
     (3.0,  +1.0),
     (4.0,  +2.0),
     (5.0,  +3.0),
-    # يمكن تمديده لاحقًا إذا رغبت
 ]
 
 # ========= Runtime =========
@@ -156,9 +158,11 @@ def _round_amount(market, amount):
 def _min_quote(market):
     return (MARKET_META.get(market, {}) or {}).get("minQuote", BUY_MIN_EUR)
 
+def _min_base(market):
+    return (MARKET_META.get(market, {}) or {}).get("minBase", 0.0)
+
 # ========= WS Prices =========
 def _ws_on_open(ws): pass
-
 def _ws_on_message(ws, msg):
     try:
         data = json.loads(msg)
@@ -174,7 +178,6 @@ def _ws_on_message(ws, msg):
                     _ws_prices[m] = {"price": p, "ts": time.time()}
         except Exception:
             pass
-
 def _ws_on_error(ws, err): print("WS error:", err)
 def _ws_on_close(ws, c, r): pass
 
@@ -189,7 +192,6 @@ def _ws_thread():
         except Exception as e:
             print("WS loop ex:", e)
         time.sleep(2)
-
 Thread(target=_ws_thread, daemon=True).start()
 
 def ws_sub(markets):
@@ -229,25 +231,23 @@ def fetch_orderbook(market):
     return None
 
 # ========= Maker-only Order Helpers =========
-def _place_limit_postonly(market, side, price, amount=None, amountQuote=None):
-    body = {
-        "market": market,
-        "side": side,
-        "orderType": "limit",
-        "postOnly": True,
-        "clientOrderId": str(uuid4()),
-        "price": f"{_round_price(market, price):.10f}",
-        "operatorId": ""   # ✅ مضاف إلزامي
-    }
-    if side == "buy":
-        if amountQuote is None:
-            raise ValueError("amountQuote required for buy")
-        body["amountQuote"] = f"{max(_min_quote(market), float(amountQuote)):.2f}"
-    else:
-        if amount is None:
-            raise ValueError("amount required for sell")
-        body["amount"] = f"{_round_amount(market, float(amount)):.10f}"
-    return bv_request("POST", "/order", body)
+def _place_limit_postonly(market, side, price, amount=None):
+    """
+    Bitvavo: limit/postOnly لا يقبل amountQuote.
+    - الشراء: مرِّر amount (base) محسوبة مسبقًا.
+    - البيع: مرِّر amount (base).
+    """
+    body={"market":market,"side":side,"orderType":"limit","postOnly":True,
+          "clientOrderId":str(uuid4()),
+          "price":f"{_round_price(market, price):.10f}",
+          "operatorId": ""}   # ✅ إلزامي
+
+    if amount is None or float(amount) <= 0:
+        raise ValueError("amount is required for limit postOnly")
+
+    body["amount"] = f"{_round_amount(market, float(amount)):.10f}"
+    return bv_request("POST","/order", body)
+
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
 def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={orderId}")
 
@@ -260,7 +260,6 @@ def totals_from_fills(fills):
 
 # ========= Patience Learning (Redis) =========
 def _patience_key(market): return f"maker:patience:{market}"
-
 def get_patience_sec(market):
     try:
         v = r.get(_patience_key(market))
@@ -269,14 +268,12 @@ def get_patience_sec(market):
     except Exception:
         pass
     return MAKER_WAIT_BASE_SEC
-
 def bump_patience_on_fail(market):
     try:
         cur = get_patience_sec(market)
         r.set(_patience_key(market), min(MAKER_WAIT_MAX_SEC, cur + MAKER_WAIT_STEP_UP))
     except Exception:
         pass
-
 def relax_patience_on_success(market):
     try:
         cur = get_patience_sec(market)
@@ -286,8 +283,19 @@ def relax_patience_on_success(market):
         pass
 
 # ========= Maker Buy =========
+def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> float:
+    """
+    يحوّل مبلغ EUR إلى كمية base وفق السعر الحالي،
+    ويضمن حدّ minBase على الأقل.
+    """
+    min_base = _min_base(market)
+    price = max(1e-12, float(use_price))
+    base_amt = target_eur / price
+    base_amt = max(base_amt, min_base)  # احترام الحد الأدنى لو موجود
+    return _round_amount(market, base_amt)
+
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع تجميع partial fills، بلا أي fallback."""
+    """Maker postOnly على أفضل Bid (أو ضمن السبريد)، تجميع partial fills."""
     if eur_amount is None or eur_amount <= 0:
         eur_amount = get_eur_available()
     eur_amount = float(eur_amount)
@@ -301,10 +309,10 @@ def open_maker_buy(market: str, eur_amount: float):
     last_order = None
     last_bid   = None
     all_fills  = []
-    remaining_q= eur_amount
+    remaining_eur = eur_amount
 
     try:
-        while (time.time() - started) < patience and remaining_q >= (minq * 0.999):
+        while (time.time() - started) < patience and remaining_eur >= (minq * 0.999):
             ob = fetch_orderbook(market)
             if not ob or not ob.get("bids") or not ob.get("asks"):
                 time.sleep(0.25); continue
@@ -322,8 +330,8 @@ def open_maker_buy(market: str, eur_amount: float):
                     if fills:
                         all_fills += fills
                         base, quote_eur, fee_eur = totals_from_fills(fills)
-                        remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
-                if st_status == "filled" or remaining_q < (minq * 0.999):
+                        remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
+                if st_status == "filled" or remaining_eur < (minq * 0.999):
                     try: _cancel_order(last_order)
                     except: pass
                     last_order = None
@@ -342,8 +350,8 @@ def open_maker_buy(market: str, eur_amount: float):
                             if fills:
                                 all_fills += fills
                                 base, quote_eur, fee_eur = totals_from_fills(fills)
-                                remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
-                            if st_status == "filled" or remaining_q < (minq * 0.999):
+                                remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
+                            if st_status == "filled" or remaining_eur < (minq * 0.999):
                                 try: _cancel_order(last_order)
                                 except: pass
                                 last_order = None
@@ -352,12 +360,17 @@ def open_maker_buy(market: str, eur_amount: float):
                     if last_order:
                         continue
 
-            # ضع أمر جديد
-            if not last_order and remaining_q >= (minq * 0.999):
-                res = _place_limit_postonly(market, "buy", price, amountQuote=remaining_q)
+            # ضع أمر جديد (amount بالـ base، بدون amountQuote)
+            if not last_order and remaining_eur >= (minq * 0.999):
+                amt_base = _calc_buy_amount_base(market, remaining_eur, price)
+                if amt_base <= 0:
+                    time.sleep(0.3); continue
+                res = _place_limit_postonly(market, "buy", price, amount=amt_base)
                 orderId = res.get("orderId")
                 if not orderId:
-                    res = _place_limit_postonly(market, "buy", best_bid, amountQuote=remaining_q)
+                    # محاولة ثانية على best_bid
+                    amt_base = _calc_buy_amount_base(market, remaining_eur, best_bid)
+                    res = _place_limit_postonly(market, "buy", best_bid, amount=amt_base)
                     orderId = res.get("orderId")
                 if not orderId:
                     time.sleep(0.3); continue
@@ -365,6 +378,7 @@ def open_maker_buy(market: str, eur_amount: float):
                 last_order = orderId
                 last_bid   = best_bid
 
+                # متابعة قصيرة
                 t0 = time.time()
                 while time.time() - t0 < MAKER_REPRICE_EVERY:
                     st = _fetch_order(last_order); st_status = st.get("status")
@@ -373,8 +387,8 @@ def open_maker_buy(market: str, eur_amount: float):
                         if fills:
                             all_fills += fills
                             base, quote_eur, fee_eur = totals_from_fills(fills)
-                            remaining_q = max(0.0, remaining_q - (quote_eur + fee_eur))
-                        if st_status == "filled" or remaining_q < (minq * 0.999):
+                            remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
+                        if st_status == "filled" or remaining_eur < (minq * 0.999):
                             try: _cancel_order(last_order)
                             except: pass
                             last_order = None
@@ -405,7 +419,6 @@ def open_maker_buy(market: str, eur_amount: float):
 # ========= Maker Sell =========
 def close_maker_sell(market: str, amount: float):
     """بيع Maker (postOnly) على أفضل Ask، مع تجميع partial fills حتى تصفير الكمية."""
-    minq = _min_quote(market)
     patience = get_patience_sec(market)
     started  = time.time()
     remaining = float(amount)
@@ -421,7 +434,6 @@ def close_maker_sell(market: str, amount: float):
 
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
-            # لتأكيد postOnly: سعر البيع لا يعبر السبريد (أعلى من bid بقليل وعلى ask)
             price    = max(best_ask, best_bid*(1.0+1e-6))
             price    = _round_price(market, price)
 
@@ -546,7 +558,6 @@ def monitor_loop():
             if changed:
                 send_message(f"📈 تحديث: Peak={updated_peak:.2f}% → SL {new_stop:+.2f}%")
 
-            # شرط الإغلاق (Maker)
             with lk:
                 at2 = active_trade.copy() if active_trade else None
             if at2 and pnl <= at2.get("dyn_stop_pct", -2.0):
@@ -640,16 +651,9 @@ def build_summary():
 @app.route("/hook", methods=["POST"])
 def hook():
     """
-    يتوقّع JSON من البوت الخارجي مثل:
-    {
-      "cmd": "buy",
-      "coin": "ADA",        # مطلوب
-      "eur":  25.0          # اختياري (إذا غاب يستخدم الرصيد المتاح)
-    }
-    أو:
-    { "cmd": "close" }  → إغلاق الصفقة الحالية (Maker)
-    { "cmd": "summary"} → ملخص
-    { "cmd": "enable"/"disable" }
+    يتوقّع JSON:
+      {"cmd":"buy","coin":"ADA","eur":25.0}   # eur اختياري
+      {"cmd":"close"} / {"cmd":"summary"} / {"cmd":"enable"} / {"cmd":"disable"}
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -700,7 +704,7 @@ def hook():
         traceback.print_exc()
         return jsonify({"ok":False,"err":str(e)}), 500
 
-# ========= Health & Simple Routes =========
+# ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
     return "Maker-Only Relay Executor ✅"
@@ -710,7 +714,7 @@ def http_summary():
     txt = build_summary()
     return f"<pre>{txt}</pre>"
 
-# ========= Local run =========
+# ========= Main =========
 if __name__ == "__main__" or RUN_LOCAL:
     load_markets()
     app.run(host="0.0.0.0", port=PORT)
