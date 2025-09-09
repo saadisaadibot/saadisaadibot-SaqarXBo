@@ -295,9 +295,7 @@ def get_patience_sec(market):
             return min(MAKER_WAIT_MAX_SEC, max(MAKER_WAIT_BASE_SEC, int(v)))
     except Exception:
         pass
-    return MA
-
-KER_WAIT_BASE_SEC
+    return MAKER_WAIT_BASE_SEC
 def bump_patience_on_fail(market):
     try:
         cur = get_patience_sec(market)
