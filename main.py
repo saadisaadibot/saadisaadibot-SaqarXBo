@@ -230,18 +230,24 @@ def fetch_orderbook(market):
 
 # ========= Maker-only Order Helpers =========
 def _place_limit_postonly(market, side, price, amount=None, amountQuote=None):
-    body={"market":market,"side":side,"orderType":"limit","postOnly":True,
-          "clientOrderId":str(uuid4()),"price":f"{_round_price(market, price):.10f}"}
-    if side=="buy":
+    body = {
+        "market": market,
+        "side": side,
+        "orderType": "limit",
+        "postOnly": True,
+        "clientOrderId": str(uuid4()),
+        "price": f"{_round_price(market, price):.10f}",
+        "operatorId": ""   # ✅ مضاف إلزامي
+    }
+    if side == "buy":
         if amountQuote is None:
             raise ValueError("amountQuote required for buy")
-        body["amountQuote"]=f"{max(_min_quote(market), float(amountQuote)):.2f}"
+        body["amountQuote"] = f"{max(_min_quote(market), float(amountQuote)):.2f}"
     else:
         if amount is None:
             raise ValueError("amount required for sell")
-        body["amount"]=f"{_round_amount(market, float(amount)):.10f}"
-    return bv_request("POST","/order", body)
-
+        body["amount"] = f"{_round_amount(market, float(amount)):.10f}"
+    return bv_request("POST", "/order", body)
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
 def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={orderId}")
 
