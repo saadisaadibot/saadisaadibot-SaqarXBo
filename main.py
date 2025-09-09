@@ -334,7 +334,7 @@ def open_maker_buy(market: str, eur_amount: float):
 
     # هامش أمان لتجنّب رفض الرصيد (رسوم + احتجاز صغير)
     EST_FEE_RATE     = 0.0025   # ≈ 0.25%
-    HEADROOM_EUR_MIN = 0.15     # اترك دائماً 0.15€ على الأقل
+    HEADROOM_EUR_MIN = 0.50     # اترك دائماً 0.15€ على الأقل
     buffer_eur  = max(HEADROOM_EUR_MIN, eur_amount * EST_FEE_RATE * 1.5)
     spendable   = min(eur_amount, max(0.0, eur_available - buffer_eur))
 
