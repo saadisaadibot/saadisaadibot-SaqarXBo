@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Maker-Only Relay Executor — Bitvavo EUR (Final)
-- استقبال أوامر شراء عبر /hook (POST JSON).
-- شراء/بيع Maker (postOnly) مع إعادة تسعير هادئة وتجميع partial fills.
+Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
+- شراء وبيع Maker (postOnly) فقط مع تجميع partial fills.
 - وقف ديناميكي متدرّج حسب القمة.
-- صفقة واحدة فقط في الوقت نفسه.
-
-التغييرات:
-- operatorId="" مضاف لكل أمر.
-- بدون amountQuote في limit/postOnly → نحسب amount من EUR والسعر.
-- احترام الدقة (precision) للسعر والكمية حسب السوق لتجنّب خطأ "too many decimal digits".
+- صفقة واحدة في نفس الوقت.
+- كل الإصلاحات: operatorId، precision صحيحة، لا amountQuote للـ limit،
+  حماية رصيد + backoff عند insufficient balance.
 """
 
 import os, re, time, json, math, traceback
@@ -31,6 +27,16 @@ REDIS_URL   = os.getenv("REDIS_URL")
 RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
 PORT        = int(os.getenv("PORT", "5000"))
 
+# حماية الرصيد (تُعدل من .env)
+EST_FEE_RATE        = float(os.getenv("FEE_RATE_EST", "0.0025"))   # ≈0.25%
+HEADROOM_EUR_MIN    = float(os.getenv("HEADROOM_EUR_MIN", "0.50")) # ≥ 0.50€
+MAX_SPEND_FRACTION  = float(os.getenv("MAX_SPEND_FRACTION", "0.90"))
+FIXED_EUR_PER_TRADE = float(os.getenv("FIXED_EUR", "0"))           # 0=معطّل، >0=مبلغ ثابت
+
+# Backoff عند رفض الرصيد
+IB_BACKOFF_FACTOR   = float(os.getenv("IB_BACKOFF_FACTOR", "0.96")) # كل فشل: -4%
+IB_BACKOFF_TRIES    = int(os.getenv("IB_BACKOFF_TRIES", "5"))       # محاولات
+
 r  = redis.from_url(REDIS_URL) if REDIS_URL else redis.Redis()
 lk = Lock()
 
@@ -38,19 +44,13 @@ BASE_URL = "https://api.bitvavo.com/v2"
 WS_URL   = "wss://ws.bitvavo.com/v2/"
 
 # ========= Settings =========
-# ===== Safety headroom to avoid insufficient balance =====
-EST_FEE_RATE       = float(os.getenv("FEE_RATE_EST", "0.0025"))  # ≈0.25%
-HEADROOM_EUR_MIN   = float(os.getenv("HEADROOM_EUR_MIN", "0.50"))  # هامش ثابت ≥ 0.15€
-
 MAX_TRADES            = 1
-
 MAKER_REPRICE_EVERY   = 2.0
 MAKER_REPRICE_THRESH  = 0.0005   # 0.05%
 MAKER_WAIT_BASE_SEC   = 45
 MAKER_WAIT_MAX_SEC    = 300
 MAKER_WAIT_STEP_UP    = 15
 MAKER_WAIT_STEP_DOWN  = 10
-
 BUY_MIN_EUR           = 5.0
 WS_STALENESS_SEC      = 2.0
 POLL_INTERVAL         = 0.35
@@ -89,7 +89,7 @@ def create_sig(ts, method, path, body_str=""):
     msg = f"{ts}{method}{path}{body_str}"
     return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
-def bv_request(method, path, body=None, timeout=10):
+def bv_request(method, path, body=None, timeout=12):
     url = f"{BASE_URL}{path}"
     ts  = str(int(time.time()*1000))
     body_str = "" if method=="GET" else json.dumps(body or {}, separators=(',',':'))
@@ -167,7 +167,6 @@ def _round_price(market, price):
 
 def _round_amount(market, amount):
     step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-    # floor للتماشي مع step ثم صياغة بالدقة الصحيحة
     floored = math.floor(float(amount) / step) * step
     decs = _decimals_from_step(step)
     return round(max(step, floored), decs)
@@ -238,7 +237,7 @@ def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
         return rec["price"]
     ws_sub([market])
     try:
-        j = requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=5).json()
+        j = requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=6).json()
         p = float(j.get("price", 0) or 0)
         if p > 0:
             with _ws_lock:
@@ -260,8 +259,8 @@ def fetch_orderbook(market):
 # ========= Maker-only Order Helpers =========
 def _place_limit_postonly(market, side, price, amount=None):
     """
-    Bitvavo: limit/postOnly لا يقبل amountQuote.
-    - الشراء/البيع: مرِّر amount (base) مع price.
+    Bitvavo limit/postOnly لا يقبل amountQuote.
+    - مرّر amount (base) مع price.
     """
     if amount is None or float(amount) <= 0:
         raise ValueError("amount is required for limit postOnly")
@@ -296,7 +295,9 @@ def get_patience_sec(market):
             return min(MAKER_WAIT_MAX_SEC, max(MAKER_WAIT_BASE_SEC, int(v)))
     except Exception:
         pass
-    return MAKER_WAIT_BASE_SEC
+    return MA
+
+KER_WAIT_BASE_SEC
 def bump_patience_on_fail(market):
     try:
         cur = get_patience_sec(market)
@@ -313,7 +314,7 @@ def relax_patience_on_success(market):
 
 # ========= Maker Buy =========
 def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> float:
-    """حوِّل EUR إلى كمية base وفق السعر والدقة."""
+    """حوّل EUR إلى كمية base وفق السعر والدقة."""
     min_base = _min_base(market)
     price = max(1e-12, float(use_price))
     base_amt = float(target_eur) / price
@@ -321,37 +322,48 @@ def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> f
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع تجميع partial fills + هامش أمان للرصيد."""
-    # ---- 1) الرصيد والهامش ----
+    """Maker postOnly على أفضل Bid، مع تجميع partial fills + حماية رصيد + backoff."""
+    # --- 1) تحديد مبلغ الشراء الحقيقي مع هوامش الأمان ---
     eur_available = get_eur_available()
 
-    # إذا ما انطلب مبلغ محدد، استخدم الرصيد المتاح
-    if eur_amount is None or eur_amount <= 0:
-        eur_amount = eur_available
+    # أولوية: FIXED_EUR_PER_TRADE > eur_amount > الرصيد
+    if FIXED_EUR_PER_TRADE and FIXED_EUR_PER_TRADE > 0:
+        target_eur = float(FIXED_EUR_PER_TRADE)
+    elif eur_amount is None or eur_amount <= 0:
+        target_eur = float(eur_available)
+    else:
+        target_eur = float(eur_amount)
 
-    eur_amount = float(eur_amount)
-    minq       = _min_quote(market)
+    # لا نستهلك أكثر من نسبة من الرصيد
+    target_eur = min(target_eur, eur_available * MAX_SPEND_FRACTION)
+    minq = _min_quote(market)
 
-    # هامش أمان لتجنّب رفض الرصيد (رسوم + احتجاز صغير)
-    EST_FEE_RATE     = 0.0025   # ≈ 0.25%
-    HEADROOM_EUR_MIN = 0.50     # اترك دائماً 0.15€ على الأقل
-    buffer_eur  = max(HEADROOM_EUR_MIN, eur_amount * EST_FEE_RATE * 1.5)
-    spendable   = min(eur_amount, max(0.0, eur_available - buffer_eur))
+    # هامش أمان: ثابت + نسبة
+    buffer_eur = max(HEADROOM_EUR_MIN, target_eur * EST_FEE_RATE * 2.0, 0.05)
+
+    # المبلغ الفعلي
+    spendable = min(target_eur, max(0.0, eur_available - buffer_eur))
 
     if spendable < max(minq, BUY_MIN_EUR):
         need = max(minq, BUY_MIN_EUR)
-        send_message(f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}.")
+        send_message(
+            f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | بعد الهامش €{spendable:.2f} "
+            f"| هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}."
+        )
         return None
 
-    send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} (هامش €{buffer_eur:.2f})")
+    send_message(
+        f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} "
+        f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f})"
+    )
 
-    # ---- 2) الإعدادات الداخلية ----
-    patience     = get_patience_sec(market)
-    started      = time.time()
-    last_order   = None
-    last_bid     = None
-    all_fills    = []
-    remaining_eur= float(spendable)
+    # --- 2) التنفيذ ---
+    patience      = get_patience_sec(market)
+    started       = time.time()
+    last_order    = None
+    last_bid      = None
+    all_fills     = []
+    remaining_eur = float(spendable)
 
     try:
         while (time.time() - started) < patience and remaining_eur >= (minq * 0.999):
@@ -401,24 +413,45 @@ def open_maker_buy(market: str, eur_amount: float):
                     if last_order:
                         continue
 
-            # ضع أمر جديد (amount محسوبة من EUR)
+            # ضع أمر جديد (amount محسوبة من EUR) مع backoff
             if not last_order and remaining_eur >= (minq * 0.999):
-                amt_base = _calc_buy_amount_base(market, remaining_eur, price)
-                if amt_base <= 0:
-                    time.sleep(0.3); continue
-                res = _place_limit_postonly(market, "buy", price, amount=amt_base)
-                orderId = res.get("orderId")
-                if not orderId:
-                    # محاولة ثانية على best_bid
-                    price2 = _round_price(market, best_bid)
-                    amt_base = _calc_buy_amount_base(market, remaining_eur, price2)
-                    res = _place_limit_postonly(market, "buy", price2, amount=amt_base)
-                    orderId = res.get("orderId")
-                if not orderId:
-                    time.sleep(0.3); continue
+                attempt   = 0
+                placed    = False
+                cur_price = price
 
-                last_order = orderId
-                last_bid   = best_bid
+                while attempt < IB_BACKOFF_TRIES and remaining_eur >= (minq * 0.999):
+                    amt_base = _calc_buy_amount_base(market, remaining_eur, cur_price)
+                    if amt_base <= 0:
+                        break
+
+                    exp_quote = amt_base * cur_price
+                    send_message(
+                        f"🧪 محاولة شراء #{attempt+1}: amount={_format_amount(market, amt_base)} "
+                        f"| سعر≈{_format_price(market, cur_price)} | EUR≈{exp_quote:.2f}"
+                    )
+
+                    res = _place_limit_postonly(market, "buy", cur_price, amount=amt_base)
+                    orderId = (res or {}).get("orderId")
+                    err_txt = str((res or {}).get("error","")).lower()
+
+                    if orderId:
+                        last_order = orderId
+                        last_bid   = best_bid
+                        placed     = True
+                        break
+
+                    if "insufficient balance" in err_txt or "not have sufficient balance" in err_txt:
+                        remaining_eur = remaining_eur * IB_BACKOFF_FACTOR
+                        attempt += 1
+                        time.sleep(0.15)
+                        continue
+
+                    attempt = IB_BACKOFF_TRIES
+                    break
+
+                if not placed:
+                    time.sleep(0.3)
+                    continue
 
                 # متابعة قصيرة
                 t0 = time.time()
@@ -457,6 +490,7 @@ def open_maker_buy(market: str, eur_amount: float):
     relax_patience_on_success(market)
     avg = (quote_eur + fee_eur) / base_amt
     return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
+
 # ========= Maker Sell =========
 def close_maker_sell(market: str, amount: float):
     """بيع Maker (postOnly) على أفضل Ask، مع تجميع partial fills حتى تصفير الكمية."""
@@ -613,7 +647,6 @@ Thread(target=monitor_loop, daemon=True).start()
 
 # ========= Trade Flow =========
 def do_open_maker(market: str, eur: float):
-    """يشغّل في ثريد حتى لا يحجز الويبهوك."""
     def _runner():
         global active_trade
         try:
@@ -624,7 +657,6 @@ def do_open_maker(market: str, eur: float):
             if not res:
                 send_message("⏳ لم يكتمل شراء Maker. سنحاول لاحقًا (الصبر يتكيف تلقائياً).")
                 return
-
             with lk:
                 active_trade = {
                     "symbol": market,
@@ -637,7 +669,6 @@ def do_open_maker(market: str, eur: float):
                     "dyn_stop_pct": -2.0
                 }
                 executed_trades.append(active_trade.copy())
-
             send_message(f"✅ شراء {market.replace('-EUR','')} (Maker) @ €{active_trade['entry']:.8f} | كمية {active_trade['amount']:.8f}")
         except Exception as e:
             traceback.print_exc()
@@ -688,11 +719,11 @@ def build_summary():
     lines.append(f"\n⚙️ buy=Maker | sell=Maker | سلم الوقف: -2%→-1%→0%→+1%…")
     return "\n".join(lines)
 
-# ========= Webhook (Relay) =========
+# ========= Webhook =========
 @app.route("/hook", methods=["POST"])
 def hook():
     """
-    يتوقّع JSON:
+    JSON:
       {"cmd":"buy","coin":"ADA","eur":25.0}   # eur اختياري
       {"cmd":"close"} / {"cmd":"summary"} / {"cmd":"enable"} / {"cmd":"disable"}
     """
