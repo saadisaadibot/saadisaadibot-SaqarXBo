@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
-- شراء/بيع Maker (postOnly) فقط مع تجميع partial fills.
+- شراء وبيع Maker (postOnly) فقط مع تجميع partial fills.
 - وقف ديناميكي متدرّج حسب القمة.
 - صفقة واحدة في نفس الوقت.
-- إصلاحات: operatorId، precision الصحيح (pricePrecision/amountPrecision قد تكون digits أو step),
-  عدم استخدام amountQuote مع limit، حماية رصيد + backoff، فحص minQuote/minBase،
-  توضيح الماركت في الرسائل، و Fallback عبر قياس الرصيد إذا لم تُلتقط التعبئات.
+- يستقبل الشراء فقط من بوت الإشارة عبر /hook
+- باقي الأوامر عبر تيليجرام /tg (بدون /buy في تيليجرام)
 """
 
 import os, re, time, json, math, traceback
@@ -21,14 +20,14 @@ load_dotenv()
 app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
+CHAT_ID     = os.getenv("CHAT_ID")  # (اختياري) حصر الأوامر على دردشة واحدة
 API_KEY     = os.getenv("BITVAVO_API_KEY")
 API_SECRET  = os.getenv("BITVAVO_API_SECRET")
 REDIS_URL   = os.getenv("REDIS_URL")
 RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
 PORT        = int(os.getenv("PORT", "5000"))
 
-# حماية الرصيد (تُضبط من .env)
+# حماية الرصيد (تُعدل من .env)
 EST_FEE_RATE        = float(os.getenv("FEE_RATE_EST", "0.0025"))   # ≈0.25%
 HEADROOM_EUR_MIN    = float(os.getenv("HEADROOM_EUR_MIN", "0.50")) # ≥ 0.50€
 MAX_SPEND_FRACTION  = float(os.getenv("MAX_SPEND_FRACTION", "0.90"))
@@ -54,7 +53,6 @@ MAKER_WAIT_STEP_UP    = 15
 MAKER_WAIT_STEP_DOWN  = 10
 BUY_MIN_EUR           = 5.0
 WS_STALENESS_SEC      = 2.0
-POLL_INTERVAL         = 0.35
 
 STOP_LADDER = [
     (0.0,  -2.0),
@@ -78,11 +76,8 @@ _ws_lock       = Lock()
 def send_message(text: str):
     try:
         if BOT_TOKEN and CHAT_ID:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": CHAT_ID, "text": text},
-                timeout=8
-            )
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          json={"chat_id": CHAT_ID, "text": text}, timeout=8)
         else:
             print("TG:", text)
     except Exception as e:
@@ -127,70 +122,23 @@ def get_eur_available() -> float:
         pass
     return 0.0
 
-def get_asset_available(symbol: str) -> float:
-    """أعد رصيد متاح لرمز (EUR أو BASE)."""
-    try:
-        bals = bv_request("GET", "/balance")
-        if isinstance(bals, list):
-            for b in bals:
-                if b.get("symbol") == symbol.upper():
-                    return max(0.0, float(b.get("available", 0) or 0))
-    except Exception:
-        pass
-    return 0.0
-
 # ========= Markets / Meta =========
-def _as_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def _parse_step_from_precision(val, default_step):
-    """
-    Bitvavo قد يعيد:
-      - عدد خانات (int/str): 8  → step = 10^-8
-      - خطوة مباشرة (float): 0.000001 → step = 0.000001
-    """
-    try:
-        if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
-            d = int(val)
-            if 0 <= d <= 20:
-                return 10.0 ** (-d)
-        v = float(val)
-        if 0 < v < 1:
-            return v
-    except Exception:
-        pass
-    return default_step
-
-def _decimals_from_step(step: float) -> int:
-    """استخرج عدد الخانات من step حتى لو ليس قوة 10 تمامًا."""
-    try:
-        s = ("%.16f" % float(step)).rstrip("0").rstrip(".")
-        if "." in s:
-            return max(0, len(s.split(".")[1]))
-        return 0
-    except Exception:
-        return 8
-
 def load_markets():
-    """حمّل الماركتات وفسّر precision بشكل مرن."""
     global MARKET_MAP, MARKET_META
     try:
         rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
         m, meta = {}, {}
         for r0 in rows:
-            base = r0.get("base"); quote = r0.get("quote"); market = r0.get("market")
+            base = r0.get("base"); quote= r0.get("quote"); market = r0.get("market")
             if base and quote == "EUR":
-                tick = _parse_step_from_precision(r0.get("pricePrecision", 6), 1e-6)
-                step = _parse_step_from_precision(r0.get("amountPrecision", 8), 1e-8)
+                price_prec = float(r0.get("pricePrecision", 1e-6) or 1e-6)
+                amt_prec   = float(r0.get("amountPrecision", 1e-8) or 1e-8)
                 m[base.upper()] = market
                 meta[market] = {
-                    "minQuote": _as_float(r0.get("minOrderInQuoteAsset", 5.0), 5.0),
-                    "minBase":  _as_float(r0.get("minOrderInBaseAsset",  0.0), 0.0),
-                    "tick":     tick,
-                    "step":     step,
+                    "minQuote": float(r0.get("minOrderInQuoteAsset", 5) or 5.0),
+                    "minBase":  float(r0.get("minOrderInBaseAsset",  0) or 0.0),
+                    "tick":     price_prec,
+                    "step":     amt_prec,
                 }
         if m: MARKET_MAP = m
         if meta: MARKET_META = meta
@@ -202,17 +150,24 @@ def coin_to_market(coin: str):
         load_markets()
     return MARKET_MAP.get(coin.upper())
 
+def _decimals_from_step(step: float) -> int:
+    try:
+        if step >= 1: return 0
+        return max(0, int(round(-math.log10(step))))
+    except Exception:
+        return 8
+
 def _round_price(market, price):
     tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
     decs = _decimals_from_step(tick)
-    p = math.floor(float(price) / tick) * tick
-    return round(max(tick, p), decs)
+    p = round(price, decs)
+    return max(tick, p)
 
 def _round_amount(market, amount):
     step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-    a = math.floor(float(amount) / step) * step
+    floored = math.floor(float(amount) / step) * step
     decs = _decimals_from_step(step)
-    return round(max(step, a), decs)
+    return round(max(step, floored), decs)
 
 def _format_price(market, price) -> str:
     tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
@@ -224,33 +179,22 @@ def _format_amount(market, amount) -> str:
     decs = _decimals_from_step(step)
     return f"{_round_amount(market, amount):.{decs}f}"
 
-def _min_quote(market):
-    return (MARKET_META.get(market, {}) or {}).get("minQuote", BUY_MIN_EUR)
-
-def _min_base(market):
-    return (MARKET_META.get(market, {}) or {}).get("minBase", 0.0)
-
-def _min_required_eur(market: str, price: float) -> float:
-    """أقل كلفة مسموحة: max(minQuote , minBase*price)."""
-    return max(_min_quote(market), _min_base(market) * float(price))
+def _min_quote(market): return (MARKET_META.get(market, {}) or {}).get("minQuote", BUY_MIN_EUR)
+def _min_base(market):  return (MARKET_META.get(market, {}) or {}).get("minBase", 0.0)
 
 # ========= WS Prices =========
 def _ws_on_open(ws): pass
 def _ws_on_message(ws, msg):
-    try:
-        data = json.loads(msg)
-    except Exception:
-        return
+    try: data = json.loads(msg)
+    except Exception: return
     if isinstance(data, dict) and data.get("event") == "ticker":
         m = data.get("market")
         price = data.get("price") or data.get("lastPrice") or data.get("open")
         try:
             p = float(price)
             if p > 0:
-                with _ws_lock:
-                    _ws_prices[m] = {"price": p, "ts": time.time()}
-        except Exception:
-            pass
+                with _ws_lock: _ws_prices[m] = {"price": p, "ts": time.time()}
+        except Exception: pass
 def _ws_on_error(ws, err): print("WS error:", err)
 def _ws_on_close(ws, c, r): pass
 
@@ -287,8 +231,7 @@ def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
         j = requests.get(f"{BASE_URL}/ticker/price?market={market}", timeout=6).json()
         p = float(j.get("price", 0) or 0)
         if p > 0:
-            with _ws_lock:
-                _ws_prices[market] = {"price": p, "ts": now}
+            with _ws_lock: _ws_prices[market] = {"price": p, "ts": now}
             return p
     except Exception:
         pass
@@ -297,28 +240,22 @@ def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
 def fetch_orderbook(market):
     try:
         j = requests.get(f"{BASE_URL}/{market}/book", timeout=6).json()
+        if j and j.get("bids") and j.get("asks"):
+            return j
     except Exception:
-        return None
-    if j and j.get("bids") and j.get("asks"):
-        return j
+        pass
     return None
 
 # ========= Maker-only Order Helpers =========
 def _place_limit_postonly(market, side, price, amount=None):
-    """Bitvavo limit/postOnly لا يقبل amountQuote — مرّر amount (base) + price."""
     if amount is None or float(amount) <= 0:
         raise ValueError("amount is required for limit postOnly")
-    body = {
-        "market": market,
-        "side": side,
-        "orderType": "limit",
-        "postOnly": True,
-        "clientOrderId": str(uuid4()),
-        "price": _format_price(market, price),
-        "amount": _format_amount(market, float(amount)),
-        "operatorId": ""  # ✅ إلزامي (حتى لو فاضي)
-    }
-    return bv_request("POST", "/order", body)
+    body={"market":market,"side":side,"orderType":"limit","postOnly":True,
+          "clientOrderId":str(uuid4()),
+          "price": _format_price(market, price),
+          "amount": _format_amount(market, float(amount)),
+          "operatorId": ""}   # إلزامي
+    return bv_request("POST","/order", body)
 
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
 def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={orderId}")
@@ -356,22 +293,16 @@ def relax_patience_on_success(market):
 
 # ========= Maker Buy =========
 def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> float:
-    """
-    حوّل EUR -> Base بسعر معيّن.
-    لا نفرض minBase إذا ما بتغطيه؛ لو غير ممكن نرجّع 0.
-    """
-    price = max(1e-12, float(use_price))
     min_base = _min_base(market)
-    if (target_eur / price) < (min_base - 1e-15):
-        return 0.0
+    price = max(1e-12, float(use_price))
     base_amt = float(target_eur) / price
+    base_amt = max(base_amt, min_base)
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع تجميع partial fills + حماية رصيد + backoff + فحص minBase/Quote + Fallback بالرصيد."""
+    """Maker postOnly على أفضل Bid، مع حماية رصيد + backoff."""
     eur_available = get_eur_available()
 
-    # FIXED_EUR > eur_amount > available
     if FIXED_EUR_PER_TRADE and FIXED_EUR_PER_TRADE > 0:
         target_eur = float(FIXED_EUR_PER_TRADE)
     elif eur_amount is None or eur_amount <= 0:
@@ -381,23 +312,18 @@ def open_maker_buy(market: str, eur_amount: float):
 
     target_eur = min(target_eur, eur_available * MAX_SPEND_FRACTION)
     minq = _min_quote(market)
-
-    # هامش أمان
     buffer_eur = max(HEADROOM_EUR_MIN, target_eur * EST_FEE_RATE * 2.0, 0.05)
-    spendable  = min(target_eur, max(0.0, eur_available - buffer_eur))
+    spendable = min(target_eur, max(0.0, eur_available - buffer_eur))
 
     if spendable < max(minq, BUY_MIN_EUR):
         need = max(minq, BUY_MIN_EUR)
-        send_message(f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | بعد الهامش €{spendable:.2f} "
-                     f"| هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}.")
+        send_message(
+            f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | بعد الهامش €{spendable:.2f} "
+            f"| هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}."
+        )
         return None
 
-    # مراقبة رصيد الـ base قبل/بعد كـ fallback
-    base_sym = market.split("-")[0]
-    base_before = get_asset_available(base_sym)
-
-    send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} "
-                 f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f}) | ماركت: {market}")
+    send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} (هامش €{buffer_eur:.2f})")
 
     patience      = get_patience_sec(market)
     started       = time.time()
@@ -405,7 +331,6 @@ def open_maker_buy(market: str, eur_amount: float):
     last_bid      = None
     all_fills     = []
     remaining_eur = float(spendable)
-    last_seen_price = None
 
     try:
         while (time.time() - started) < patience and remaining_eur >= (minq * 0.999):
@@ -415,17 +340,7 @@ def open_maker_buy(market: str, eur_amount: float):
 
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
-            raw_price = min(best_bid, best_ask*(1.0-1e-6))
-            price = _round_price(market, raw_price)
-            last_seen_price = price
-
-            # أقل تكلفة مسموحة بهذا السعر
-            min_needed_eur = _min_required_eur(market, price)
-            if remaining_eur + 1e-9 < min_needed_eur:
-                send_message(f"⛔ الماركت يتطلب ≥ €{min_needed_eur:.2f} "
-                             f"(minBase={_min_base(market)} @ { _format_price(market, price) }) "
-                             f"| المتاح €{remaining_eur:.2f}. نتجاوز.")
-                break
+            price    = _round_price(market, min(best_bid, best_ask*(1.0-1e-6)))
 
             # أمر قائم؟
             if last_order:
@@ -474,15 +389,11 @@ def open_maker_buy(market: str, eur_amount: float):
                 while attempt < IB_BACKOFF_TRIES and remaining_eur >= (minq * 0.999):
                     amt_base = _calc_buy_amount_base(market, remaining_eur, cur_price)
                     if amt_base <= 0:
-                        need = _min_required_eur(market, cur_price)
-                        send_message(f"⛔ غير ممكن: أقل كلفة ≈ €{need:.2f} > المتاح €{remaining_eur:.2f}.")
-                        attempt = IB_BACKOFF_TRIES
                         break
 
                     exp_quote = amt_base * cur_price
                     send_message(
-                        f"🧪 محاولة شراء #{attempt+1} على {market}: "
-                        f"amount={_format_amount(market, amt_base)} "
+                        f"🧪 محاولة شراء #{attempt+1}: amount={_format_amount(market, amt_base)} "
                         f"| سعر≈{_format_price(market, cur_price)} | EUR≈{exp_quote:.2f}"
                     )
 
@@ -533,29 +444,7 @@ def open_maker_buy(market: str, eur_amount: float):
     except Exception as e:
         print("open_maker_buy err:", e)
 
-    # ===== النهايات =====
     if not all_fills:
-        # تحقّق نهائي بالرصيد (fallback) — إذا زاد رصيد الـ base نعتبرها صفقة ناجحة
-        base_after   = get_asset_available(base_sym)
-        step         = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-        delta_base   = base_after - base_before
-
-        if delta_base > (step * 0.5):
-            px = fetch_price_ws_first(market) or last_seen_price or 0.0
-            avg = float(px) if px and px > 0 else 0.0
-            cost_eur_est = delta_base * avg if avg > 0 else 0.0
-            send_message(
-                f"ℹ️ تم اكتشاف زيادة رصيد {base_sym} بمقدار ~{delta_base:.8f} "
-                f"بعد المحاولة، نعتبر الشراء ناجحًا (fallback)."
-            )
-            relax_patience_on_success(market)
-            return {
-                "amount": delta_base,
-                "avg": avg if avg > 0 else (last_seen_price or 0.0),
-                "cost_eur": cost_eur_est,
-                "fee_eur": 0.0
-            }
-
         bump_patience_on_fail(market)
         send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة (سنزيد الصبر تلقائيًا لهذا الماركت).")
         return None
@@ -571,7 +460,6 @@ def open_maker_buy(market: str, eur_amount: float):
 
 # ========= Maker Sell =========
 def close_maker_sell(market: str, amount: float):
-    """بيع Maker (postOnly) على أفضل Ask، مع تجميع partial fills حتى تصفير الكمية."""
     patience = get_patience_sec(market)
     started  = time.time()
     remaining = float(amount)
@@ -587,8 +475,7 @@ def close_maker_sell(market: str, amount: float):
 
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
-            raw_price = max(best_ask, best_bid*(1.0+1e-6))
-            price = _round_price(market, raw_price)
+            price    = _round_price(market, max(best_ask, best_bid*(1.0+1e-6)))
 
             if last_order:
                 st = _fetch_order(last_order); st_status = st.get("status")
@@ -798,78 +685,10 @@ def build_summary():
     lines.append(f"\n⚙️ buy=Maker | sell=Maker | سلم الوقف: -2%→-1%→0%→+1%…")
     return "\n".join(lines)
 
-# ========= Webhook =========
-@app.route("/hook", methods=["POST"])
-def hook():
-    """
-    JSON:
-      {"cmd":"buy","coin":"ADA","eur":25.0}   # eur اختياري
-      {"cmd":"close"} / {"cmd":"summary"} / {"cmd":"enable"} / {"cmd":"disable"}
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-        cmd  = (data.get("cmd") or "").strip().lower()
-
-        if cmd in ("enable","start","on"):
-            global enabled
-            enabled=True
-            send_message("✅ تم التفعيل.")
-            return jsonify({"ok":True})
-
-        if cmd in ("disable","stop","off"):
-            enabled=False
-            send_message("🛑 تم الإيقاف.")
-            return jsonify({"ok":True})
-
-        if cmd in ("summary","/summary"):
-            txt = build_summary()
-            send_message(txt)
-            return jsonify({"ok":True,"summary":txt})
-
-        if cmd in ("close","sell","exit"):
-            with lk:
-                has_position = active_trade is not None
-            if has_position:
-                do_close_maker("Manual")
-                return jsonify({"ok":True,"msg":"closing"})
-            else:
-                send_message("لا توجد صفقة لإغلاقها.")
-                return jsonify({"ok":False,"err":"no_active_trade"})
-
-        if cmd == "buy":
-            if not enabled:
-                return jsonify({"ok":False,"err":"bot_disabled"})
-            coin = (data.get("coin") or "").strip().upper()
-            if not re.fullmatch(r"[A-Z0-9]{2,15}", coin or ""):
-                return jsonify({"ok":False,"err":"bad_coin"})
-            market = coin_to_market(coin)
-            if not market:
-                send_message(f"⛔ {coin}-EUR غير متاح على Bitvavo.")
-                return jsonify({"ok":False,"err":"market_unavailable"})
-            eur = float(data.get("eur")) if data.get("eur") is not None else None
-            do_open_maker(market, eur)
-            return jsonify({"ok":True,"msg":"buy_started","market":market})
-
-        return jsonify({"ok":False,"err":"bad_cmd"})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"ok":False,"err":str(e)}), 500
-
-# ========= Health =========
-@app.route("/", methods=["GET"])
-def home():
-    return "Maker-Only Relay Executor ✅"
-
-@app.route("/summary", methods=["GET"])
-def http_summary():
-    txt = build_summary()
-    return f"<pre>{txt}</pre>"
-
-# ========= Telegram Webhook (اختياري) =========
+# ========= Telegram Webhook (بدون /buy) =========
 def _tg_reply(chat_id: str, text: str):
-    if not BOT_TOKEN: 
-        print("TG OUT:", text); 
-        return
+    if not BOT_TOKEN:
+        print("TG OUT:", text); return
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -880,98 +699,107 @@ def _tg_reply(chat_id: str, text: str):
         print("TG send err:", e)
 
 def _auth_chat(chat_id: str) -> bool:
-    """يقبل فقط CHAT_ID لو موجود؛ وإلا يقبل أي شات."""
     return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
 
 @app.route("/tg", methods=["POST"])
 def telegram_webhook():
-    """
-    اربط تيليجرام على هذا المسار:
-    https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<railway-app>.up.railway.app/tg
-    """
     try:
         upd = request.get_json(silent=True) or {}
         msg = upd.get("message") or upd.get("edited_message") or {}
         chat = msg.get("chat") or {}
         chat_id = str(chat.get("id") or "")
         text = (msg.get("text") or "").strip()
-
-        if not chat_id:
-            return jsonify(ok=True)
-
+        if not chat_id: return jsonify(ok=True)
         if not _auth_chat(chat_id):
-            _tg_reply(chat_id, "⛔ غير مصرّح.")
-            return jsonify(ok=True)
+            _tg_reply(chat_id, "⛔ غير مصرّح."); return jsonify(ok=True)
 
-        # أوامر
         low = text.lower()
         if low.startswith("/start"):
             _tg_reply(chat_id,
-                "أهلًا! الأوامر:\n"
+                "أهلًا! الأوامر (من تيليجرام فقط):\n"
                 "/summary — ملخّص\n"
                 "/enable — تفعيل\n"
                 "/disable — إيقاف\n"
-                "/close — إغلاق الصفقة\n"
-                "/buy COIN [EUR] — شراء Maker\n"
+                "/close — إغلاق الصفقة\n\n"
+                "ملاحظة: الشراء يأتي فقط من بوت الإشارة."
             )
             return jsonify(ok=True)
 
         if low.startswith("/summary"):
-            _tg_reply(chat_id, build_summary())
-            return jsonify(ok=True)
+            _tg_reply(chat_id, build_summary()); return jsonify(ok=True)
 
         if low.startswith("/enable"):
-            global enabled
-            enabled = True
-            _tg_reply(chat_id, "✅ تم التفعيل.")
-            return jsonify(ok=True)
+            global enabled; enabled = True
+            _tg_reply(chat_id, "✅ تم التفعيل."); return jsonify(ok=True)
 
         if low.startswith("/disable"):
             enabled = False
-            _tg_reply(chat_id, "🛑 تم الإيقاف.")
-            return jsonify(ok=True)
+            _tg_reply(chat_id, "🛑 تم الإيقاف."); return jsonify(ok=True)
 
         if low.startswith("/close"):
             with lk:
                 has_position = active_trade is not None
             if has_position:
-                do_close_maker("Manual")
-                _tg_reply(chat_id, "⏳ جاري الإغلاق (Maker)…")
+                do_close_maker("Manual"); _tg_reply(chat_id, "⏳ جاري الإغلاق (Maker)…")
             else:
                 _tg_reply(chat_id, "لا توجد صفقة لإغلاقها.")
             return jsonify(ok=True)
 
-        if low.startswith("/buy"):
-            if not enabled:
-                _tg_reply(chat_id, "⛔ البوت مُعطّل. استخدم /enable.")
-                return jsonify(ok=True)
-            # صيغة: /buy ADA 10
-            parts = text.split()
-            if len(parts) < 2:
-                _tg_reply(chat_id, "اكتب: /buy COIN [EUR]\nمثال: /buy ADA 10")
-                return jsonify(ok=True)
-            coin = parts[1].upper()
-            eur = None
-            if len(parts) >= 3:
-                try:
-                    eur = float(parts[2])
-                except:
-                    pass
-            market = coin_to_market(coin)
-            if not market:
-                _tg_reply(chat_id, f"⛔ {coin}-EUR غير متاح على Bitvavo.")
-                return jsonify(ok=True)
-            do_open_maker(market, eur)
-            _tg_reply(chat_id, f"🚀 تم بدء شراء Maker لـ {coin} (السوق {market})")
-            return jsonify(ok=True)
-
-        # غير معروف
-        _tg_reply(chat_id, "أوامر: /summary /enable /disable /close /buy COIN [EUR]")
+        _tg_reply(chat_id, "أوامر: /summary /enable /disable /close\n(الشراء فقط من بوت الإشارة)")
         return jsonify(ok=True)
 
     except Exception as e:
         print("Telegram webhook err:", e)
         return jsonify(ok=True)
+
+# ========= Webhook (Relay) — يستقبل شراء فقط من بوت الإشارة =========
+@app.route("/hook", methods=["POST"])
+def hook():
+    """
+    يتوقّع JSON من البوت الخارجي:
+      {"cmd":"buy","coin":"ADA","eur":25.0}  # eur اختياري
+    أي أمر آخر سيُرفض هنا.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        cmd  = (data.get("cmd") or "").strip().lower()
+        if cmd != "buy":
+            return jsonify({"ok":False,"err":"only_buy_allowed_here"}), 400
+
+        if not enabled:
+            return jsonify({"ok":False,"err":"bot_disabled"})
+
+        coin = (data.get("coin") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,15}", coin or ""):
+            return jsonify({"ok":False,"err":"bad_coin"})
+
+        market = coin_to_market(coin)
+        if not market:
+            send_message(f"⛔ {coin}-EUR غير متاح على Bitvavo.")
+            return jsonify({"ok":False,"err":"market_unavailable"})
+
+        eur = float(data.get("eur")) if data.get("eur") is not None else None
+        do_open_maker(market, eur)
+        return jsonify({"ok":True,"msg":"buy_started","market":market})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"ok":False,"err":str(e)}), 500
+
+# ========= Health =========
+@app.route("/", methods=["GET"])
+def home():
+    return "Maker-Only Relay Executor ✅"
+
+# (اختياري) ACK لو وصل POST على "/" بالخطأ
+@app.route("/", methods=["POST"])
+def root_post_ack():
+    return jsonify(ok=True)
+
+@app.route("/summary", methods=["GET"])
+def http_summary():
+    txt = build_summary()
+    return f"<pre>{txt}</pre>"
 
 # ========= Main =========
 if __name__ == "__main__" or RUN_LOCAL:
