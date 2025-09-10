@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
-- شراء وبيع Maker (postOnly) فقط مع تجميع partial fills.
-- وقف ديناميكي متدرّج حسب القمة.
+- شراء/بيع Maker (postOnly) مع تجميع partial fills.
+- وقف ديناميكي متدرّج.
 - صفقة واحدة في نفس الوقت.
-- كل الإصلاحات: operatorId، precision صحيحة، لا amountQuote للـ limit،
-  حماية رصيد + backoff عند insufficient balance.
+- إصلاحات: operatorId، precision صحيح (tick/step من pricePrecision/amountPrecision)،
+  لا amountQuote في limit، حماية رصيد + backoff، وفحص minQuote/minBase.
 """
 
 import os, re, time, json, math, traceback
@@ -27,7 +27,7 @@ REDIS_URL   = os.getenv("REDIS_URL")
 RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
 PORT        = int(os.getenv("PORT", "5000"))
 
-# حماية الرصيد (تُعدل من .env)
+# حماية الرصيد (من .env)
 EST_FEE_RATE        = float(os.getenv("FEE_RATE_EST", "0.0025"))   # ≈0.25%
 HEADROOM_EUR_MIN    = float(os.getenv("HEADROOM_EUR_MIN", "0.50")) # ≥ 0.50€
 MAX_SPEND_FRACTION  = float(os.getenv("MAX_SPEND_FRACTION", "0.90"))
@@ -125,21 +125,29 @@ def get_eur_available() -> float:
 
 # ========= Markets / Meta =========
 def load_markets():
+    """
+    Bitvavo /markets يعيد:
+      - pricePrecision/amountPrecision = عدد الخانات العشرية (integers)،
+        لذا نشتق tick/step هكذا: tick=10^-pricePrecision, step=10^-amountPrecision
+    """
     global MARKET_MAP, MARKET_META
     try:
         rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
         m, meta = {}, {}
         for r0 in rows:
-            base = r0.get("base"); quote= r0.get("quote"); market = r0.get("market")
+            base = r0.get("base"); quote = r0.get("quote"); market = r0.get("market")
             if base and quote == "EUR":
-                price_prec = float(r0.get("pricePrecision", 1e-6) or 1e-6)
-                amt_prec   = float(r0.get("amountPrecision", 1e-8) or 1e-8)
+                # اشتقاق tick/step بشكل صحيح
+                pp = int(r0.get("pricePrecision", 6) or 6)
+                ap = int(r0.get("amountPrecision", 8) or 8)
+                tick = 10.0 ** (-pp)
+                step = 10.0 ** (-ap)
                 m[base.upper()] = market
                 meta[market] = {
                     "minQuote": float(r0.get("minOrderInQuoteAsset", 5) or 5.0),
                     "minBase":  float(r0.get("minOrderInBaseAsset",  0) or 0.0),
-                    "tick":     price_prec,
-                    "step":     amt_prec,
+                    "tick":     tick,
+                    "step":     step,
                 }
         if m: MARKET_MAP = m
         if meta: MARKET_META = meta
@@ -161,15 +169,16 @@ def _decimals_from_step(step: float) -> int:
 def _round_price(market, price):
     tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
     decs = _decimals_from_step(tick)
-    p = round(price, decs)
-    p = max(tick, p)
-    return p
+    p = round(float(price), decs)
+    # اضبط على مضاعفات tick بدلاً من مجرد round
+    p = math.floor(p / tick) * tick
+    return max(tick, round(p, decs))
 
 def _round_amount(market, amount):
     step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-    floored = math.floor(float(amount) / step) * step
+    a = math.floor(float(amount) / step) * step
     decs = _decimals_from_step(step)
-    return round(max(step, floored), decs)
+    return round(max(step, a), decs)
 
 def _format_price(market, price) -> str:
     tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
@@ -186,6 +195,10 @@ def _min_quote(market):
 
 def _min_base(market):
     return (MARKET_META.get(market, {}) or {}).get("minBase", 0.0)
+
+def _min_required_eur(market: str, price: float) -> float:
+    """أقل كلفة مسموحة: max(minQuote , minBase*price)."""
+    return max(_min_quote(market), _min_base(market) * float(price))
 
 # ========= WS Prices =========
 def _ws_on_open(ws): pass
@@ -250,18 +263,15 @@ def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
 def fetch_orderbook(market):
     try:
         j = requests.get(f"{BASE_URL}/{market}/book", timeout=6).json()
-        if j and j.get("bids") and j.get("asks"):
-            return j
     except Exception:
-        pass
+        return None
+    if j and j.get("bids") and j.get("asks"):
+        return j
     return None
 
 # ========= Maker-only Order Helpers =========
 def _place_limit_postonly(market, side, price, amount=None):
-    """
-    Bitvavo limit/postOnly لا يقبل amountQuote.
-    - مرّر amount (base) مع price.
-    """
+    """Bitvavo limit/postOnly لا يقبل amountQuote — مرّر amount (base) + price."""
     if amount is None or float(amount) <= 0:
         raise ValueError("amount is required for limit postOnly")
 
@@ -272,8 +282,7 @@ def _place_limit_postonly(market, side, price, amount=None):
           "clientOrderId":str(uuid4()),
           "price": _format_price(market, price),
           "amount": _format_amount(market, float(amount)),
-          "operatorId": ""}   # ✅ إلزامي
-
+          "operatorId": ""}   # ✅ إلزامي (حتى لو فاضي)
     return bv_request("POST","/order", body)
 
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
@@ -312,19 +321,22 @@ def relax_patience_on_success(market):
 
 # ========= Maker Buy =========
 def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> float:
-    """حوّل EUR إلى كمية base وفق السعر والدقة."""
-    min_base = _min_base(market)
+    """
+    حوّل EUR -> Base بسعر معيّن.
+    لا نفرض minBase إذا ما بتغطيه؛ لو غير ممكن نرجّع 0.
+    """
     price = max(1e-12, float(use_price))
+    min_base = _min_base(market)
+    if (target_eur / price) < (min_base - 1e-15):
+        return 0.0
     base_amt = float(target_eur) / price
-    base_amt = max(base_amt, min_base)
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع تجميع partial fills + حماية رصيد + backoff."""
-    # --- 1) تحديد مبلغ الشراء الحقيقي مع هوامش الأمان ---
+    """Maker postOnly على أفضل Bid، مع تجميع partial fills + حماية رصيد + backoff + فحص minBase/Quote."""
     eur_available = get_eur_available()
 
-    # أولوية: FIXED_EUR_PER_TRADE > eur_amount > الرصيد
+    # FIXED_EUR > eur_amount > available
     if FIXED_EUR_PER_TRADE and FIXED_EUR_PER_TRADE > 0:
         target_eur = float(FIXED_EUR_PER_TRADE)
     elif eur_amount is None or eur_amount <= 0:
@@ -332,30 +344,22 @@ def open_maker_buy(market: str, eur_amount: float):
     else:
         target_eur = float(eur_amount)
 
-    # لا نستهلك أكثر من نسبة من الرصيد
     target_eur = min(target_eur, eur_available * MAX_SPEND_FRACTION)
     minq = _min_quote(market)
 
-    # هامش أمان: ثابت + نسبة
+    # هامش أمان
     buffer_eur = max(HEADROOM_EUR_MIN, target_eur * EST_FEE_RATE * 2.0, 0.05)
-
-    # المبلغ الفعلي
-    spendable = min(target_eur, max(0.0, eur_available - buffer_eur))
+    spendable  = min(target_eur, max(0.0, eur_available - buffer_eur))
 
     if spendable < max(minq, BUY_MIN_EUR):
         need = max(minq, BUY_MIN_EUR)
-        send_message(
-            f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | بعد الهامش €{spendable:.2f} "
-            f"| هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}."
-        )
+        send_message(f"⛔ الرصيد غير كافٍ: متاح €{eur_available:.2f} | بعد الهامش €{spendable:.2f} "
+                     f"| هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}.")
         return None
 
-    send_message(
-        f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} "
-        f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f})"
-    )
+    send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} "
+                 f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f})")
 
-    # --- 2) التنفيذ ---
     patience      = get_patience_sec(market)
     started       = time.time()
     last_order    = None
@@ -371,7 +375,19 @@ def open_maker_buy(market: str, eur_amount: float):
 
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
-            price    = _round_price(market, min(best_bid, best_ask*(1.0-1e-6)))
+            raw_price = min(best_bid, best_ask*(1.0-1e-6))
+            price = _round_price(market, raw_price)
+
+            # Debug بسيط للأسعار والدقة
+            # send_message(f"📊 {market}: bid={best_bid}, ask={best_ask}, price={price}")
+
+            # أقل تكلفة مسموحة لهذا السوق بهذا السعر
+            min_needed_eur = _min_required_eur(market, price)
+            if remaining_eur + 1e-9 < min_needed_eur:
+                send_message(f"⛔ الماركت يتطلب ≥ €{min_needed_eur:.2f} "
+                             f"(minBase={_min_base(market)} @ { _format_price(market, price) }) "
+                             f"| المتاح €{remaining_eur:.2f}. نتجاوز.")
+                break
 
             # أمر قائم؟
             if last_order:
@@ -420,13 +436,16 @@ def open_maker_buy(market: str, eur_amount: float):
                 while attempt < IB_BACKOFF_TRIES and remaining_eur >= (minq * 0.999):
                     amt_base = _calc_buy_amount_base(market, remaining_eur, cur_price)
                     if amt_base <= 0:
+                        need = _min_required_eur(market, cur_price)
+                        send_message(f"⛔ غير ممكن: أقل كلفة ≈ €{need:.2f} > المتاح €{remaining_eur:.2f}.")
+                        attempt = IB_BACKOFF_TRIES
                         break
 
                     exp_quote = amt_base * cur_price
-                    send_message(
-                        f"🧪 محاولة شراء #{attempt+1}: amount={_format_amount(market, amt_base)} "
-                        f"| سعر≈{_format_price(market, cur_price)} | EUR≈{exp_quote:.2f}"
-                    )
+                    send_message(f"🧪 محاولة شراء #{attempt+1}: "
+                                 f"amount={_format_amount(market, amt_base)} "
+                                 f"| سعر≈{_format_price(market, cur_price)} "
+                                 f"| EUR≈{exp_quote:.2f}")
 
                     res = _place_limit_postonly(market, "buy", cur_price, amount=amt_base)
                     orderId = (res or {}).get("orderId")
@@ -507,7 +526,8 @@ def close_maker_sell(market: str, amount: float):
 
             best_bid = float(ob["bids"][0][0])
             best_ask = float(ob["asks"][0][0])
-            price    = _round_price(market, max(best_ask, best_bid*(1.0+1e-6)))
+            raw_price = max(best_ask, best_bid*(1.0+1e-6))
+            price = _round_price(market, raw_price)
 
             if last_order:
                 st = _fetch_order(last_order); st_status = st.get("status")
