@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
-- شراء وبيع Maker (postOnly) فقط مع تجميع partial fills.
-- وقف ديناميكي متدرّج حسب القمة.
-- صفقة واحدة في نفس الوقت.
-- يستقبل الشراء فقط من بوت الإشارة عبر /hook
-- باقي الأوامر عبر تيليجرام /tg (بدون /buy في تيليجرام)
+- استقبال إشارة شراء من بوت الإشارات عبر /hook (POST JSON) فقط.
+- أوامر الإدارة عبر تيليجرام (/tg webhook): /summary /close /enable /disable.
+- Maker-only (postOnly) شراء وبيع مع تجميع partial fills.
+- سلّم وقف ديناميكي.
+- إصلاحات كاملة: precision، operatorId، عدم استخدام amountQuote في limit،
+  حمايات الرصيد + backoff عند insufficient balance، وalias للمسار '/'.
 """
 
 import os, re, time, json, math, traceback
@@ -20,7 +21,7 @@ load_dotenv()
 app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")  # (اختياري) حصر الأوامر على دردشة واحدة
+CHAT_ID     = os.getenv("CHAT_ID")
 API_KEY     = os.getenv("BITVAVO_API_KEY")
 API_SECRET  = os.getenv("BITVAVO_API_SECRET")
 REDIS_URL   = os.getenv("REDIS_URL")
@@ -68,7 +69,7 @@ enabled        = True
 active_trade   = None
 executed_trades= []
 MARKET_MAP     = {}   # "ADA" -> "ADA-EUR"
-MARKET_META    = {}   # "ADA-EUR" -> {"minQuote","minBase","tick","step"}
+MARKET_META    = {}   # "ADA-EUR" -> {"minQuote","minBase","tick","step","pp","ap"}
 _ws_prices     = {}
 _ws_lock       = Lock()
 
@@ -77,7 +78,7 @@ def send_message(text: str):
     try:
         if BOT_TOKEN and CHAT_ID:
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": CHAT_ID, "text": text}, timeout=8)
+                          data={"chat_id": CHAT_ID, "text": text}, timeout=8)
         else:
             print("TG:", text)
     except Exception as e:
@@ -129,16 +130,26 @@ def load_markets():
         rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
         m, meta = {}, {}
         for r0 in rows:
-            base = r0.get("base"); quote= r0.get("quote"); market = r0.get("market")
+            base  = r0.get("base"); quote = r0.get("quote"); market = r0.get("market")
             if base and quote == "EUR":
-                price_prec = float(r0.get("pricePrecision", 1e-6) or 1e-6)
-                amt_prec   = float(r0.get("amountPrecision", 1e-8) or 1e-8)
+                # Bitvavo يعيد digits وليس خطوات
+                pp = r0.get("pricePrecision", 6)
+                ap = r0.get("amountPrecision", 8)
+                try: pp = int(pp)
+                except: pp = 6
+                try: ap = int(ap)
+                except: ap = 8
+                tick = 10 ** (-pp)
+                step = 10 ** (-ap)
+
                 m[base.upper()] = market
                 meta[market] = {
                     "minQuote": float(r0.get("minOrderInQuoteAsset", 5) or 5.0),
                     "minBase":  float(r0.get("minOrderInBaseAsset",  0) or 0.0),
-                    "tick":     price_prec,
-                    "step":     amt_prec,
+                    "tick":     float(tick),
+                    "step":     float(step),
+                    "pp":       pp,
+                    "ap":       ap,
                 }
         if m: MARKET_MAP = m
         if meta: MARKET_META = meta
@@ -150,33 +161,33 @@ def coin_to_market(coin: str):
         load_markets()
     return MARKET_MAP.get(coin.upper())
 
-def _decimals_from_step(step: float) -> int:
-    try:
-        if step >= 1: return 0
-        return max(0, int(round(-math.log10(step))))
-    except Exception:
-        return 8
+def _price_digits(market) -> int:
+    pp = (MARKET_META.get(market, {}) or {}).get("pp", 6)
+    return int(pp) if pp is not None else 6
+
+def _amount_digits(market) -> int:
+    ap = (MARKET_META.get(market, {}) or {}).get("ap", 8)
+    return int(ap) if ap is not None else 8
 
 def _round_price(market, price):
-    tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
-    decs = _decimals_from_step(tick)
-    p = round(price, decs)
-    return max(tick, p)
+    decs = _price_digits(market)
+    tick = (MARKET_META.get(market, {}) or {}).get("tick", 10**(-decs))
+    p = round(float(price), decs)
+    snapped = math.floor(p / tick) * tick
+    return max(tick, round(snapped, decs))
 
 def _round_amount(market, amount):
-    step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
+    decs = _amount_digits(market)
+    step = (MARKET_META.get(market, {}) or {}).get("step", 10**(-decs))
     floored = math.floor(float(amount) / step) * step
-    decs = _decimals_from_step(step)
-    return round(max(step, floored), decs)
+    return max(step, round(floored, decs))
 
 def _format_price(market, price) -> str:
-    tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
-    decs = _decimals_from_step(tick)
+    decs = _price_digits(market)
     return f"{_round_price(market, price):.{decs}f}"
 
 def _format_amount(market, amount) -> str:
-    step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-    decs = _decimals_from_step(step)
+    decs = _amount_digits(market)
     return f"{_round_amount(market, amount):.{decs}f}"
 
 def _min_quote(market): return (MARKET_META.get(market, {}) or {}).get("minQuote", BUY_MIN_EUR)
@@ -217,8 +228,7 @@ def ws_sub(markets):
         payload = {"action":"subscribe","channels":[{"name":"ticker","markets":markets}]}
         ws = websocket.create_connection(WS_URL, timeout=5)
         ws.send(json.dumps(payload)); ws.close()
-    except Exception:
-        pass
+    except Exception: pass
 
 def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
     now = time.time()
@@ -233,8 +243,7 @@ def fetch_price_ws_first(market: str, staleness=WS_STALENESS_SEC):
         if p > 0:
             with _ws_lock: _ws_prices[market] = {"price": p, "ts": now}
             return p
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 def fetch_orderbook(market):
@@ -242,19 +251,23 @@ def fetch_orderbook(market):
         j = requests.get(f"{BASE_URL}/{market}/book", timeout=6).json()
         if j and j.get("bids") and j.get("asks"):
             return j
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 # ========= Maker-only Order Helpers =========
 def _place_limit_postonly(market, side, price, amount=None):
     if amount is None or float(amount) <= 0:
         raise ValueError("amount is required for limit postOnly")
-    body={"market":market,"side":side,"orderType":"limit","postOnly":True,
+
+    body={"market":market,
+          "side":side,
+          "orderType":"limit",
+          "postOnly":True,
           "clientOrderId":str(uuid4()),
           "price": _format_price(market, price),
           "amount": _format_amount(market, float(amount)),
           "operatorId": ""}   # إلزامي
+
     return bv_request("POST","/order", body)
 
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
@@ -274,22 +287,19 @@ def get_patience_sec(market):
         v = r.get(_patience_key(market))
         if v is not None:
             return min(MAKER_WAIT_MAX_SEC, max(MAKER_WAIT_BASE_SEC, int(v)))
-    except Exception:
-        pass
+    except Exception: pass
     return MAKER_WAIT_BASE_SEC
 def bump_patience_on_fail(market):
     try:
         cur = get_patience_sec(market)
         r.set(_patience_key(market), min(MAKER_WAIT_MAX_SEC, cur + MAKER_WAIT_STEP_UP))
-    except Exception:
-        pass
+    except Exception: pass
 def relax_patience_on_success(market):
     try:
         cur = get_patience_sec(market)
         base = MAKER_WAIT_BASE_SEC
         r.set(_patience_key(market), max(base, cur - MAKER_WAIT_STEP_DOWN))
-    except Exception:
-        pass
+    except Exception: pass
 
 # ========= Maker Buy =========
 def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> float:
@@ -300,7 +310,6 @@ def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> f
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع حماية رصيد + backoff."""
     eur_available = get_eur_available()
 
     if FIXED_EUR_PER_TRADE and FIXED_EUR_PER_TRADE > 0:
@@ -323,7 +332,10 @@ def open_maker_buy(market: str, eur_amount: float):
         )
         return None
 
-    send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} (هامش €{buffer_eur:.2f})")
+    send_message(
+        f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} "
+        f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f})"
+    )
 
     patience      = get_patience_sec(market)
     started       = time.time()
@@ -380,7 +392,7 @@ def open_maker_buy(market: str, eur_amount: float):
                     if last_order:
                         continue
 
-            # ضع أمر جديد (amount محسوبة من EUR) مع backoff
+            # ضع أمر جديد مع backoff
             if not last_order and remaining_eur >= (minq * 0.999):
                 attempt   = 0
                 placed    = False
@@ -388,13 +400,12 @@ def open_maker_buy(market: str, eur_amount: float):
 
                 while attempt < IB_BACKOFF_TRIES and remaining_eur >= (minq * 0.999):
                     amt_base = _calc_buy_amount_base(market, remaining_eur, cur_price)
-                    if amt_base <= 0:
-                        break
+                    if amt_base <= 0: break
 
                     exp_quote = amt_base * cur_price
                     send_message(
                         f"🧪 محاولة شراء #{attempt+1}: amount={_format_amount(market, amt_base)} "
-                        f"| سعر≈{_format_price(market, cur_price)} | EUR≈{exp_quote:.2f}"
+                        f"| سعر≈{_format_price(market, cur_price)} EUR | EUR≈{exp_quote:.2f}"
                     )
 
                     res = _place_limit_postonly(market, "buy", cur_price, amount=amt_base)
@@ -685,94 +696,25 @@ def build_summary():
     lines.append(f"\n⚙️ buy=Maker | sell=Maker | سلم الوقف: -2%→-1%→0%→+1%…")
     return "\n".join(lines)
 
-# ========= Telegram Webhook (بدون /buy) =========
-def _tg_reply(chat_id: str, text: str):
-    if not BOT_TOKEN:
-        print("TG OUT:", text); return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=8
-        )
-    except Exception as e:
-        print("TG send err:", e)
-
-def _auth_chat(chat_id: str) -> bool:
-    return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
-
-@app.route("/tg", methods=["POST"])
-def telegram_webhook():
-    try:
-        upd = request.get_json(silent=True) or {}
-        msg = upd.get("message") or upd.get("edited_message") or {}
-        chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id") or "")
-        text = (msg.get("text") or "").strip()
-        if not chat_id: return jsonify(ok=True)
-        if not _auth_chat(chat_id):
-            _tg_reply(chat_id, "⛔ غير مصرّح."); return jsonify(ok=True)
-
-        low = text.lower()
-        if low.startswith("/start"):
-            _tg_reply(chat_id,
-                "أهلًا! الأوامر (من تيليجرام فقط):\n"
-                "/summary — ملخّص\n"
-                "/enable — تفعيل\n"
-                "/disable — إيقاف\n"
-                "/close — إغلاق الصفقة\n\n"
-                "ملاحظة: الشراء يأتي فقط من بوت الإشارة."
-            )
-            return jsonify(ok=True)
-
-        if low.startswith("/summary"):
-            _tg_reply(chat_id, build_summary()); return jsonify(ok=True)
-
-        if low.startswith("/enable"):
-            global enabled; enabled = True
-            _tg_reply(chat_id, "✅ تم التفعيل."); return jsonify(ok=True)
-
-        if low.startswith("/disable"):
-            enabled = False
-            _tg_reply(chat_id, "🛑 تم الإيقاف."); return jsonify(ok=True)
-
-        if low.startswith("/close"):
-            with lk:
-                has_position = active_trade is not None
-            if has_position:
-                do_close_maker("Manual"); _tg_reply(chat_id, "⏳ جاري الإغلاق (Maker)…")
-            else:
-                _tg_reply(chat_id, "لا توجد صفقة لإغلاقها.")
-            return jsonify(ok=True)
-
-        _tg_reply(chat_id, "أوامر: /summary /enable /disable /close\n(الشراء فقط من بوت الإشارة)")
-        return jsonify(ok=True)
-
-    except Exception as e:
-        print("Telegram webhook err:", e)
-        return jsonify(ok=True)
-
-# ========= Webhook (Relay) — يستقبل شراء فقط من بوت الإشارة =========
+# ========= Webhooks =========
+# 1) Webhook بوت الإشارة — BUY فقط
 @app.route("/hook", methods=["POST"])
 def hook():
     """
-    يتوقّع JSON من البوت الخارجي:
-      {"cmd":"buy","coin":"ADA","eur":25.0}  # eur اختياري
-    أي أمر آخر سيُرفض هنا.
+    يتوقّع JSON:
+      {"cmd":"buy","coin":"ADA","eur":25.0}   # eur اختياري
     """
     try:
         data = request.get_json(silent=True) or {}
         cmd  = (data.get("cmd") or "").strip().lower()
         if cmd != "buy":
-            return jsonify({"ok":False,"err":"only_buy_allowed_here"}), 400
-
+            return jsonify({"ok":False,"err":"only_buy_allowed"})
         if not enabled:
             return jsonify({"ok":False,"err":"bot_disabled"})
 
         coin = (data.get("coin") or "").strip().upper()
         if not re.fullmatch(r"[A-Z0-9]{2,15}", coin or ""):
             return jsonify({"ok":False,"err":"bad_coin"})
-
         market = coin_to_market(coin)
         if not market:
             send_message(f"⛔ {coin}-EUR غير متاح على Bitvavo.")
@@ -781,21 +723,52 @@ def hook():
         eur = float(data.get("eur")) if data.get("eur") is not None else None
         do_open_maker(market, eur)
         return jsonify({"ok":True,"msg":"buy_started","market":market})
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({"ok":False,"err":str(e)}), 500
 
+# 2) Webhook تيليجرام — أوامر إدارة فقط
+@app.route("/tg", methods=["POST"])
+def telegram_webhook():
+    try:
+        upd = request.get_json(silent=True) or {}
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return jsonify(ok=True)
+
+        cmd = text.split()[0].lower()
+        if cmd in ("/enable","enable"):
+            global enabled; enabled=True
+            send_message("✅ تم التفعيل.")
+        elif cmd in ("/disable","disable"):
+            enabled=False
+            send_message("🛑 تم الإيقاف.")
+        elif cmd in ("/close","close","/sell","sell","/exit","exit"):
+            with lk:
+                has_position = active_trade is not None
+            if has_position:
+                do_close_maker("Manual")
+            else:
+                send_message("لا توجد صفقة لإغلاقها.")
+        elif cmd in ("/summary","summary"):
+            send_message(build_summary())
+        else:
+            send_message("أوامر: /summary | /close | /enable | /disable")
+        return jsonify(ok=True)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify(ok=False), 200
+
+# Alias: لو الويبهوك رايح على "/" بالخطأ مرّره لـ /tg
+@app.route("/", methods=["POST"])
+def root_post_alias():
+    return telegram_webhook()
+
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Maker-Only Relay Executor ✅"
-
-# (اختياري) ACK لو وصل POST على "/" بالخطأ
-@app.route("/", methods=["POST"])
-def root_post_alias():
-    # مرّر التحديث نفسه لدالة التيليجرام
-    return telegram_webhook()
+    return "Saqer Maker-Only Relay ✅"
 
 @app.route("/summary", methods=["GET"])
 def http_summary():
