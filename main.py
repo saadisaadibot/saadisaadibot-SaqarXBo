@@ -793,8 +793,9 @@ def home():
 
 # (اختياري) ACK لو وصل POST على "/" بالخطأ
 @app.route("/", methods=["POST"])
-def root_post_ack():
-    return jsonify(ok=True)
+def root_post_alias():
+    # مرّر التحديث نفسه لدالة التيليجرام
+    return telegram_webhook()
 
 @app.route("/summary", methods=["GET"])
 def http_summary():
