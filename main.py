@@ -5,7 +5,8 @@ Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
 - وقف ديناميكي متدرّج حسب القمة.
 - صفقة واحدة في نفس الوقت.
 - إصلاحات: operatorId، precision الصحيح (pricePrecision/amountPrecision قد تكون digits أو step),
-  عدم استخدام amountQuote مع limit، حماية رصيد + backoff، وفحص minQuote/minBase.
+  عدم استخدام amountQuote مع limit، حماية رصيد + backoff، فحص minQuote/minBase،
+  توضيح الماركت في الرسائل، و Fallback عبر قياس الرصيد إذا لم تُلتقط التعبئات.
 """
 
 import os, re, time, json, math, traceback
@@ -122,6 +123,18 @@ def get_eur_available() -> float:
             for b in bals:
                 if b.get("symbol") == "EUR":
                     return max(0.0, float(b.get("available",0) or 0))
+    except Exception:
+        pass
+    return 0.0
+
+def get_asset_available(symbol: str) -> float:
+    """أعد رصيد متاح لرمز (EUR أو BASE)."""
+    try:
+        bals = bv_request("GET", "/balance")
+        if isinstance(bals, list):
+            for b in bals:
+                if b.get("symbol") == symbol.upper():
+                    return max(0.0, float(b.get("available", 0) or 0))
     except Exception:
         pass
     return 0.0
@@ -355,7 +368,7 @@ def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> f
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع تجميع partial fills + حماية رصيد + backoff + فحص minBase/Quote."""
+    """Maker postOnly على أفضل Bid، مع تجميع partial fills + حماية رصيد + backoff + فحص minBase/Quote + Fallback بالرصيد."""
     eur_available = get_eur_available()
 
     # FIXED_EUR > eur_amount > available
@@ -379,8 +392,12 @@ def open_maker_buy(market: str, eur_amount: float):
                      f"| هامش €{buffer_eur:.2f} | المطلوب ≥ €{need:.2f}.")
         return None
 
+    # مراقبة رصيد الـ base قبل/بعد كـ fallback
+    base_sym = market.split("-")[0]
+    base_before = get_asset_available(base_sym)
+
     send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} "
-                 f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f})")
+                 f"(هامش €{buffer_eur:.2f} | هدف €{target_eur:.2f}) | ماركت: {market}")
 
     patience      = get_patience_sec(market)
     started       = time.time()
@@ -388,6 +405,7 @@ def open_maker_buy(market: str, eur_amount: float):
     last_bid      = None
     all_fills     = []
     remaining_eur = float(spendable)
+    last_seen_price = None
 
     try:
         while (time.time() - started) < patience and remaining_eur >= (minq * 0.999):
@@ -399,6 +417,7 @@ def open_maker_buy(market: str, eur_amount: float):
             best_ask = float(ob["asks"][0][0])
             raw_price = min(best_bid, best_ask*(1.0-1e-6))
             price = _round_price(market, raw_price)
+            last_seen_price = price
 
             # أقل تكلفة مسموحة بهذا السعر
             min_needed_eur = _min_required_eur(market, price)
@@ -461,10 +480,11 @@ def open_maker_buy(market: str, eur_amount: float):
                         break
 
                     exp_quote = amt_base * cur_price
-                    send_message(f"🧪 محاولة شراء #{attempt+1}: "
-                                 f"amount={_format_amount(market, amt_base)} "
-                                 f"| سعر≈{_format_price(market, cur_price)} "
-                                 f"| EUR≈{exp_quote:.2f}")
+                    send_message(
+                        f"🧪 محاولة شراء #{attempt+1} على {market}: "
+                        f"amount={_format_amount(market, amt_base)} "
+                        f"| سعر≈{_format_price(market, cur_price)} | EUR≈{exp_quote:.2f}"
+                    )
 
                     res = _place_limit_postonly(market, "buy", cur_price, amount=amt_base)
                     orderId = (res or {}).get("orderId")
@@ -513,7 +533,29 @@ def open_maker_buy(market: str, eur_amount: float):
     except Exception as e:
         print("open_maker_buy err:", e)
 
+    # ===== النهايات =====
     if not all_fills:
+        # تحقّق نهائي بالرصيد (fallback) — إذا زاد رصيد الـ base نعتبرها صفقة ناجحة
+        base_after   = get_asset_available(base_sym)
+        step         = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
+        delta_base   = base_after - base_before
+
+        if delta_base > (step * 0.5):
+            px = fetch_price_ws_first(market) or last_seen_price or 0.0
+            avg = float(px) if px and px > 0 else 0.0
+            cost_eur_est = delta_base * avg if avg > 0 else 0.0
+            send_message(
+                f"ℹ️ تم اكتشاف زيادة رصيد {base_sym} بمقدار ~{delta_base:.8f} "
+                f"بعد المحاولة، نعتبر الشراء ناجحًا (fallback)."
+            )
+            relax_patience_on_success(market)
+            return {
+                "amount": delta_base,
+                "avg": avg if avg > 0 else (last_seen_price or 0.0),
+                "cost_eur": cost_eur_est,
+                "fee_eur": 0.0
+            }
+
         bump_patience_on_fail(market)
         send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة (سنزيد الصبر تلقائيًا لهذا الماركت).")
         return None
