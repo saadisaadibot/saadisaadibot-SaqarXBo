@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
-- شراء/بيع Maker (postOnly) مع تجميع partial fills.
-- وقف ديناميكي متدرّج.
+- شراء/بيع Maker (postOnly) فقط مع تجميع partial fills.
+- وقف ديناميكي متدرّج حسب القمة.
 - صفقة واحدة في نفس الوقت.
-- إصلاحات: operatorId، precision صحيح (tick/step من pricePrecision/amountPrecision)،
-  لا amountQuote في limit، حماية رصيد + backoff، وفحص minQuote/minBase.
+- إصلاحات: operatorId، precision الصحيح (pricePrecision/amountPrecision قد تكون digits أو step),
+  عدم استخدام amountQuote مع limit، حماية رصيد + backoff، وفحص minQuote/minBase.
 """
 
 import os, re, time, json, math, traceback
@@ -27,7 +27,7 @@ REDIS_URL   = os.getenv("REDIS_URL")
 RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
 PORT        = int(os.getenv("PORT", "5000"))
 
-# حماية الرصيد (من .env)
+# حماية الرصيد (تُضبط من .env)
 EST_FEE_RATE        = float(os.getenv("FEE_RATE_EST", "0.0025"))   # ≈0.25%
 HEADROOM_EUR_MIN    = float(os.getenv("HEADROOM_EUR_MIN", "0.50")) # ≥ 0.50€
 MAX_SPEND_FRACTION  = float(os.getenv("MAX_SPEND_FRACTION", "0.90"))
@@ -77,8 +77,11 @@ _ws_lock       = Lock()
 def send_message(text: str):
     try:
         if BOT_TOKEN and CHAT_ID:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          data={"chat_id": CHAT_ID, "text": text}, timeout=8)
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": text},
+                timeout=8
+            )
         else:
             print("TG:", text)
     except Exception as e:
@@ -124,12 +127,42 @@ def get_eur_available() -> float:
     return 0.0
 
 # ========= Markets / Meta =========
+def _as_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _parse_step_from_precision(val, default_step):
+    """
+    Bitvavo قد يعيد:
+      - عدد خانات (int/str): 8  → step = 10^-8
+      - خطوة مباشرة (float): 0.000001 → step = 0.000001
+    """
+    try:
+        if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
+            d = int(val)
+            if 0 <= d <= 20:
+                return 10.0 ** (-d)
+        v = float(val)
+        if 0 < v < 1:
+            return v
+    except Exception:
+        pass
+    return default_step
+
+def _decimals_from_step(step: float) -> int:
+    """استخرج عدد الخانات من step حتى لو ليس قوة 10 تمامًا."""
+    try:
+        s = ("%.16f" % float(step)).rstrip("0").rstrip(".")
+        if "." in s:
+            return max(0, len(s.split(".")[1]))
+        return 0
+    except Exception:
+        return 8
+
 def load_markets():
-    """
-    Bitvavo /markets يعيد:
-      - pricePrecision/amountPrecision = عدد الخانات العشرية (integers)،
-        لذا نشتق tick/step هكذا: tick=10^-pricePrecision, step=10^-amountPrecision
-    """
+    """حمّل الماركتات وفسّر precision بشكل مرن."""
     global MARKET_MAP, MARKET_META
     try:
         rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
@@ -137,15 +170,12 @@ def load_markets():
         for r0 in rows:
             base = r0.get("base"); quote = r0.get("quote"); market = r0.get("market")
             if base and quote == "EUR":
-                # اشتقاق tick/step بشكل صحيح
-                pp = int(r0.get("pricePrecision", 6) or 6)
-                ap = int(r0.get("amountPrecision", 8) or 8)
-                tick = 10.0 ** (-pp)
-                step = 10.0 ** (-ap)
+                tick = _parse_step_from_precision(r0.get("pricePrecision", 6), 1e-6)
+                step = _parse_step_from_precision(r0.get("amountPrecision", 8), 1e-8)
                 m[base.upper()] = market
                 meta[market] = {
-                    "minQuote": float(r0.get("minOrderInQuoteAsset", 5) or 5.0),
-                    "minBase":  float(r0.get("minOrderInBaseAsset",  0) or 0.0),
+                    "minQuote": _as_float(r0.get("minOrderInQuoteAsset", 5.0), 5.0),
+                    "minBase":  _as_float(r0.get("minOrderInBaseAsset",  0.0), 0.0),
                     "tick":     tick,
                     "step":     step,
                 }
@@ -159,20 +189,11 @@ def coin_to_market(coin: str):
         load_markets()
     return MARKET_MAP.get(coin.upper())
 
-def _decimals_from_step(step: float) -> int:
-    try:
-        if step >= 1: return 0
-        return max(0, int(round(-math.log10(step))))
-    except Exception:
-        return 8
-
 def _round_price(market, price):
     tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
     decs = _decimals_from_step(tick)
-    p = round(float(price), decs)
-    # اضبط على مضاعفات tick بدلاً من مجرد round
-    p = math.floor(p / tick) * tick
-    return max(tick, round(p, decs))
+    p = math.floor(float(price) / tick) * tick
+    return round(max(tick, p), decs)
 
 def _round_amount(market, amount):
     step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
@@ -274,16 +295,17 @@ def _place_limit_postonly(market, side, price, amount=None):
     """Bitvavo limit/postOnly لا يقبل amountQuote — مرّر amount (base) + price."""
     if amount is None or float(amount) <= 0:
         raise ValueError("amount is required for limit postOnly")
-
-    body={"market":market,
-          "side":side,
-          "orderType":"limit",
-          "postOnly":True,
-          "clientOrderId":str(uuid4()),
-          "price": _format_price(market, price),
-          "amount": _format_amount(market, float(amount)),
-          "operatorId": ""}   # ✅ إلزامي (حتى لو فاضي)
-    return bv_request("POST","/order", body)
+    body = {
+        "market": market,
+        "side": side,
+        "orderType": "limit",
+        "postOnly": True,
+        "clientOrderId": str(uuid4()),
+        "price": _format_price(market, price),
+        "amount": _format_amount(market, float(amount)),
+        "operatorId": ""  # ✅ إلزامي (حتى لو فاضي)
+    }
+    return bv_request("POST", "/order", body)
 
 def _fetch_order(orderId):   return bv_request("GET",    f"/order?orderId={orderId}")
 def _cancel_order(orderId):  return bv_request("DELETE", f"/order?orderId={orderId}")
@@ -378,10 +400,7 @@ def open_maker_buy(market: str, eur_amount: float):
             raw_price = min(best_bid, best_ask*(1.0-1e-6))
             price = _round_price(market, raw_price)
 
-            # Debug بسيط للأسعار والدقة
-            # send_message(f"📊 {market}: bid={best_bid}, ask={best_ask}, price={price}")
-
-            # أقل تكلفة مسموحة لهذا السوق بهذا السعر
+            # أقل تكلفة مسموحة بهذا السعر
             min_needed_eur = _min_required_eur(market, price)
             if remaining_eur + 1e-9 < min_needed_eur:
                 send_message(f"⛔ الماركت يتطلب ≥ €{min_needed_eur:.2f} "
