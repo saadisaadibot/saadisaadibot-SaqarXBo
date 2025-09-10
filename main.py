@@ -865,6 +865,114 @@ def http_summary():
     txt = build_summary()
     return f"<pre>{txt}</pre>"
 
+# ========= Telegram Webhook (اختياري) =========
+def _tg_reply(chat_id: str, text: str):
+    if not BOT_TOKEN: 
+        print("TG OUT:", text); 
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=8
+        )
+    except Exception as e:
+        print("TG send err:", e)
+
+def _auth_chat(chat_id: str) -> bool:
+    """يقبل فقط CHAT_ID لو موجود؛ وإلا يقبل أي شات."""
+    return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
+
+@app.route("/tg", methods=["POST"])
+def telegram_webhook():
+    """
+    اربط تيليجرام على هذا المسار:
+    https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<railway-app>.up.railway.app/tg
+    """
+    try:
+        upd = request.get_json(silent=True) or {}
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        text = (msg.get("text") or "").strip()
+
+        if not chat_id:
+            return jsonify(ok=True)
+
+        if not _auth_chat(chat_id):
+            _tg_reply(chat_id, "⛔ غير مصرّح.")
+            return jsonify(ok=True)
+
+        # أوامر
+        low = text.lower()
+        if low.startswith("/start"):
+            _tg_reply(chat_id,
+                "أهلًا! الأوامر:\n"
+                "/summary — ملخّص\n"
+                "/enable — تفعيل\n"
+                "/disable — إيقاف\n"
+                "/close — إغلاق الصفقة\n"
+                "/buy COIN [EUR] — شراء Maker\n"
+            )
+            return jsonify(ok=True)
+
+        if low.startswith("/summary"):
+            _tg_reply(chat_id, build_summary())
+            return jsonify(ok=True)
+
+        if low.startswith("/enable"):
+            global enabled
+            enabled = True
+            _tg_reply(chat_id, "✅ تم التفعيل.")
+            return jsonify(ok=True)
+
+        if low.startswith("/disable"):
+            enabled = False
+            _tg_reply(chat_id, "🛑 تم الإيقاف.")
+            return jsonify(ok=True)
+
+        if low.startswith("/close"):
+            with lk:
+                has_position = active_trade is not None
+            if has_position:
+                do_close_maker("Manual")
+                _tg_reply(chat_id, "⏳ جاري الإغلاق (Maker)…")
+            else:
+                _tg_reply(chat_id, "لا توجد صفقة لإغلاقها.")
+            return jsonify(ok=True)
+
+        if low.startswith("/buy"):
+            if not enabled:
+                _tg_reply(chat_id, "⛔ البوت مُعطّل. استخدم /enable.")
+                return jsonify(ok=True)
+            # صيغة: /buy ADA 10
+            parts = text.split()
+            if len(parts) < 2:
+                _tg_reply(chat_id, "اكتب: /buy COIN [EUR]\nمثال: /buy ADA 10")
+                return jsonify(ok=True)
+            coin = parts[1].upper()
+            eur = None
+            if len(parts) >= 3:
+                try:
+                    eur = float(parts[2])
+                except:
+                    pass
+            market = coin_to_market(coin)
+            if not market:
+                _tg_reply(chat_id, f"⛔ {coin}-EUR غير متاح على Bitvavo.")
+                return jsonify(ok=True)
+            do_open_maker(market, eur)
+            _tg_reply(chat_id, f"🚀 تم بدء شراء Maker لـ {coin} (السوق {market})")
+            return jsonify(ok=True)
+
+        # غير معروف
+        _tg_reply(chat_id, "أوامر: /summary /enable /disable /close /buy COIN [EUR]")
+        return jsonify(ok=True)
+
+    except Exception as e:
+        print("Telegram webhook err:", e)
+        return jsonify(ok=True)
+
 # ========= Main =========
 if __name__ == "__main__" or RUN_LOCAL:
     load_markets()
