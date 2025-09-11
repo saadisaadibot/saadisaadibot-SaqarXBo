@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram Webhook with Repricing
-- /buy <COIN> [EUR]
-- /sell <COIN> [AMOUNT]
-- /bal
-منطق الشراء يضع أمر Maker ثم يعيد تسعيره تلقائيًا إذا تحرّك أفضل Bid بنسبة ملحوظة،
-مع التأكد من عدم تقاطع السعر مع الـ Ask (للبقاء Maker).
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram + Safe Repricing on Open Order
+- /buy  COIN [EUR]         → يفتح أمر Maker شراء (أو يرفض لو فيه أمر مفتوح لنفس الماركت)
+- /reprice COIN            → يعيد تسعير الأمر المفتوح لنفس الماركت (لا يعتمد على EUR المتاح)
+- /cancel COIN             → يلغي الأمر المفتوح لنفس الماركت
+- /sell COIN [AMOUNT]      → يبيع Maker (لا علاقة له بالأمر المفتوح للشراء)
+- /open                    → عرض الأوامر المفتوحة (مقتطف)
+- /bal                     → عرض الأرصدة
 """
 
 import os, re, time, json, hmac, hashlib, math, requests
@@ -18,24 +19,24 @@ load_dotenv()
 app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID     = os.getenv("CHAT_ID", "").strip()  # اختياري
+CHAT_ID     = os.getenv("CHAT_ID", "").strip()
 API_KEY     = os.getenv("BITVAVO_API_KEY", "").strip()
 API_SECRET  = os.getenv("BITVAVO_API_SECRET", "").strip()
 PORT        = int(os.getenv("PORT", "8080"))
 
 BASE_URL    = "https://api.bitvavo.com/v2"
 
-HEADROOM_EUR       = float(os.getenv("HEADROOM_EUR", "0.30"))  # يترك جزء صغير من الرصيد
+HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))
+REPRICE_EVERY_SEC   = float(os.getenv("REPRICE_EVERY_SEC", "2.0"))
+REPRICE_THRESH_PCT  = float(os.getenv("REPRICE_THRESH_PCT", "0.05"))/100.0  # 0.05%
+CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "6.0"))
 SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))
 
-# إعدادات إعادة التسعير
-MAKER_WAIT_SEC      = float(os.getenv("MAKER_WAIT_SEC", "45"))   # مهلة الصبر الكلية
-REPRICE_EVERY_SEC   = float(os.getenv("REPRICE_EVERY_SEC", "2"))  # كل كم ثانية نعيد الفحص
-REPRICE_THRESH_PCT  = float(os.getenv("REPRICE_THRESH_PCT", "0.05"))/100.0  # 0.05% افتراضي
-
-# كاش للماركتات
 MARKET_MAP  = {}
 MARKET_META = {}
+
+# تتبّع أوامر الشراء المفتوحة لكل ماركت (حتى لا نستخدم EUR مرة ثانية)
+OPEN_ORDERS = {}  # market -> {"orderId": str, "amount_init": float}
 
 # ========= Telegram =========
 def tg_send(text: str):
@@ -89,8 +90,7 @@ def load_markets_once():
         if not base or not market: continue
         priceSig = int(r.get("pricePrecision", 6) or 6)  # significant digits
         amt_prec = r.get("amountPrecision", 8)
-        # amountPrecision عادة رقم المنازل العشرية
-        step = 10.0 ** ( - int(amt_prec) ) if isinstance(amt_prec, int) else float(amt_prec or 1e-8)
+        step = 10.0 ** (-int(amt_prec)) if isinstance(amt_prec, int) else float(amt_prec or 1e-8)
         meta[market] = {
             "priceSig": priceSig,
             "step": float(step),
@@ -155,7 +155,7 @@ def get_best_bid_ask(market: str) -> tuple[float, float]:
     bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     return bid, ask
 
-def cancel_order_blocking(market: str, orderId: str, wait_sec=6.0):
+def cancel_order_blocking(market: str, orderId: str, wait_sec=CANCEL_WAIT_SEC):
     try:
         bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
     except Exception:
@@ -167,7 +167,6 @@ def cancel_order_blocking(market: str, orderId: str, wait_sec=6.0):
         if st_status in ("canceled","filled"): break
         time.sleep(0.2)
 
-# ========= Maker Orders (with repricing) =========
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
     body = {
         "market": market, "side": side, "orderType": "limit", "postOnly": True,
@@ -189,8 +188,12 @@ def place_limit_postonly(market: str, side: str, price: float, amount: float):
     except Exception:
         return body, {"error": r.text}
 
-def maker_buy_repricing(market: str, eur_amount: float | None):
-    """يشتري Maker مع إعادة تسعير حتى تنفّذ أو تنتهي مهلة الصبر."""
+# ========= BUY (open + reprice) =========
+def buy_open(market: str, eur_amount: float | None):
+    # لا تفتح أمر جديد إذا فيه أمر مفتوح لهذا الماركت
+    if market in OPEN_ORDERS:
+        return {"ok": False, "err": "order_already_open", "open": OPEN_ORDERS[market]}
+
     eur_avail = get_balance("EUR")
     spend = float(eur_avail) if (eur_amount is None or eur_amount <= 0) else float(eur_amount)
     spend = max(0.0, spend - HEADROOM_EUR)
@@ -201,62 +204,78 @@ def maker_buy_repricing(market: str, eur_amount: float | None):
     if spend < minq:
         return {"ok": False, "err": f"minQuote={minq:.4f} EUR, have {spend:.2f}"}
 
-    # حالة الأمر الحالي
-    orderId = None
-    last_bid = None
-    deadline = time.time() + MAKER_WAIT_SEC
-
-    # حساب أولي
     bid, ask = get_best_bid_ask(market)
-    price = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
+    price  = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
     amount = round_amount_down(market, spend/price)
     if amount < minb: return {"ok": False, "err": f"minBase={minb}"}
 
-    # ضع أول أمر
     body, resp = place_limit_postonly(market, "buy", price, amount)
-    if (resp or {}).get("error"):  # فشل مباشر
+    if (resp or {}).get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
 
-    orderId = resp.get("orderId"); last_bid = bid
+    oid = resp.get("orderId")
+    OPEN_ORDERS[market] = {"orderId": oid, "amount_init": amount}
+    return {"ok": True, "request": body, "response": resp, "open": OPEN_ORDERS[market]}
 
-    # متابعة + إعادة تسعير
-    while time.time() < deadline and orderId:
-        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
-        st_status = (st or {}).get("status","").lower()
-        if st_status == "filled":
-            return {"ok": True, "request": body, "response": st}
-        if st_status == "partiallyfilled":
-            # في النسخة الخفيفة: لا نعيد التسعير بعد جزئي (نتركه يُكمل حتى ينتهي الوقت)
-            time.sleep(REPRICE_EVERY_SEC); continue
+def buy_reprice(market: str):
+    info = OPEN_ORDERS.get(market)
+    if not info:
+        return {"ok": False, "err": "no_open_order"}
+    oid = info["orderId"]
 
-        # لم يُملأ بعد → افحص أفضل Bid، وأعد التسعير إن ابتعد بنسبة واضحة
-        bid, ask = get_best_bid_ask(market)
-        moved = (abs(bid/last_bid - 1.0) if last_bid else 0.0)
-        if moved >= REPRICE_THRESH_PCT:
-            # ألغِ ثم ضع بسعر جديد (لا نتجاوز الـ ask)
-            cancel_order_blocking(market, orderId)
-            orderId = None
-            new_price = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
-            # اجعل المبلغ المتبقي مساويًا للكمية المتبقية (إن أردت أدق: استخدم amountRemaining)
-            amt_rem = float(st.get("amountRemaining", st.get("amount","0")) or 0.0)
-            if amt_rem <= 0: amt_rem = amount
-            # إذا المبلغ أصغر من minBase بعد القصّ، أعده إلى minBase
-            amt_rem = max(amt_rem, minb)
-            body, resp = place_limit_postonly(market, "buy", new_price, amt_rem)
-            if (resp or {}).get("error"):
-                return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
-            orderId = resp.get("orderId"); last_bid = bid
-        else:
-            time.sleep(REPRICE_EVERY_SEC)
+    # حالة الطلب الحالي
+    st = bv_request("GET", f"/order?market={market}&orderId={oid}")
+    status = (st or {}).get("status","").lower()
+    if status == "filled":
+        OPEN_ORDERS.pop(market, None)
+        return {"ok": True, "msg": "already_filled"}
 
-    # انتهت المهلة بدون تعبئة كاملة
-    if orderId: cancel_order_blocking(market, orderId)
-    return {"ok": False, "err": "timeout", "request": body, "response": resp}
+    # كمية متبقية
+    try:
+        amt_rem = float((st or {}).get("amountRemaining", st.get("amount","0")) or 0.0)
+    except Exception:
+        amt_rem = info["amount_init"]
 
-def maker_sell_simple(market: str, amount: float | None):
+    if amt_rem <= 0:
+        amt_rem = info["amount_init"]
+
+    # ألغِ الحالي ثم أعِد الوضع بسعر جديد (لا نعتمد على رصيد EUR إطلاقًا)
+    cancel_order_blocking(market, oid, CANCEL_WAIT_SEC)
+
+    bid, ask = get_best_bid_ask(market)
+    new_price = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
+    amt_rem = max(amt_rem, _min_base(market))
+    body, resp = place_limit_postonly(market, "buy", new_price, amt_rem)
+    if (resp or {}).get("error"):
+        return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
+
+    # حدّث الـ OPEN_ORDERS
+    OPEN_ORDERS[market] = {"orderId": resp.get("orderId"), "amount_init": amt_rem}
+    return {"ok": True, "request": body, "response": resp, "open": OPEN_ORDERS[market]}
+
+def buy_cancel(market: str):
+    info = OPEN_ORDERS.get(market)
+    if not info:
+        return {"ok": False, "err": "no_open_order"}
+    oid = info["orderId"]
+    cancel_order_blocking(market, oid, CANCEL_WAIT_SEC)
+    OPEN_ORDERS.pop(market, None)
+    return {"ok": True, "msg": "canceled"}
+
+# ========= SELL =========
+def maker_sell(market: str, amount: float | None):
     base = market.split("-")[0]
-    amt  = get_balance(base) if (amount is None or amount <= 0) else float(amount)
-    amt  = round_amount_down(market, amt)
+    if amount is None or amount <= 0:
+        # بيع كل المتاح من العملة الأساسية
+        bals = bv_request("GET","/balance")
+        amt  = 0.0
+        if isinstance(bals, list):
+            for b in bals:
+                if b.get("symbol")==base.upper():
+                    amt = float(b.get("available",0) or 0.0); break
+    else:
+        amt = float(amount)
+    amt = round_amount_down(market, amt)
     if amt <= 0: return {"ok": False, "err": f"No {base} to sell"}
 
     minb = _min_base(market)
@@ -272,8 +291,17 @@ def maker_sell_simple(market: str, amount: float | None):
     while time.time()-t0 < SHORT_FOLLOW_SEC and oid:
         st = bv_request("GET", f"/order?market={market}&orderId={oid}")
         if (st or {}).get("status","").lower() in ("filled","partiallyfilled"): break
-        time.sleep(0.2)
+        time.sleep(0.25)
     return {"ok": True, "request": body, "response": resp}
+
+# ========= Commands =========
+COIN_RE = re.compile(r"^[A-Z0-9]{2,15}$")
+def _norm_market(arg: str) -> str | None:
+    s = (arg or "").strip().upper()
+    if not s: return None
+    if s.endswith("-EUR") and COIN_RE.match(s.split("-")[0]): return s
+    if COIN_RE.match(s): return f"{s}-EUR"
+    return None
 
 # ========= Telegram webhook =========
 @app.route("/tg", methods=["POST"])
@@ -288,8 +316,24 @@ def tg_webhook():
 
     low = text.lower()
     try:
-        if low.startswith("/start"):
-            tg_send("أهلًا 👋\nالأوامر:\n/buy COIN [EUR] — Maker مع إعادة تسعير\n/sell COIN [AMOUNT]\n/bal")
+        if low.startswith("/start") or low.startswith("/help"):
+            tg_send("أوامر:\n"
+                    "/buy COIN [EUR]  — فتح أمر شراء Maker (يرفض لو في أمر مفتوح لنفس الماركت)\n"
+                    "/reprice COIN    — إعادة تسعير الأمر المفتوح (لا يستخدم EUR)\n"
+                    "/cancel COIN     — إلغاء الأمر المفتوح\n"
+                    "/sell COIN [AMT] — بيع Maker\n"
+                    "/open            — عرض الأوامر المفتوحة\n"
+                    "/bal             — عرض الأرصدة")
+            return jsonify(ok=True)
+
+        if low.startswith("/open"):
+            if not OPEN_ORDERS:
+                tg_send("لا توجد أوامر شراء مفتوحة.")
+            else:
+                lines=[]
+                for m,info in OPEN_ORDERS.items():
+                    lines.append(f"{m}: {info}")
+                tg_send("أوامر مفتوحة:\n" + "\n".join(lines))
             return jsonify(ok=True)
 
         if low.startswith("/bal"):
@@ -307,14 +351,38 @@ def tg_webhook():
             parts = text.split()
             if len(parts)<2:
                 tg_send("صيغة: /buy COIN [EUR]"); return jsonify(ok=True)
-            coin=parts[1].upper(); market=coin_to_market(coin)
-            if not market: tg_send(f"⛔ {coin}-EUR غير متاح."); return jsonify(ok=True)
+            coin=parts[1].upper(); market=_norm_market(coin)
+            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+            if market in OPEN_ORDERS:
+                tg_send(f"⛔ يوجد أمر شراء مفتوح لهذا الماركت: {OPEN_ORDERS[market]}"); return jsonify(ok=True)
             eur=None
             if len(parts)>=3:
                 try: eur=float(parts[2])
                 except: eur=None
-            res = maker_buy_repricing(market, eur)
-            tg_send(("✅ BUY تم/قيد التنفيذ" if res.get("ok") else "⚠️ BUY فشل") + f" — {market}\n"
+            res = buy_open(market, eur)
+            tg_send(("✅ BUY تم الفتح" if res.get("ok") else "⚠️ BUY فشل") + f" — {market}\n"
+                    f"{json.dumps(res, ensure_ascii=False)}")
+            return jsonify(ok=True)
+
+        if low.startswith("/reprice"):
+            parts = text.split()
+            if len(parts)<2:
+                tg_send("صيغة: /reprice COIN"); return jsonify(ok=True)
+            market=_norm_market(parts[1].upper())
+            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+            res = buy_reprice(market)
+            tg_send(("✅ Repriced" if res.get("ok") else "⚠️ Reprice فشل") + f" — {market}\n"
+                    f"{json.dumps(res, ensure_ascii=False)}")
+            return jsonify(ok=True)
+
+        if low.startswith("/cancel"):
+            parts = text.split()
+            if len(parts)<2:
+                tg_send("صيغة: /cancel COIN"); return jsonify(ok=True)
+            market=_norm_market(parts[1].upper())
+            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+            res = buy_cancel(market)
+            tg_send(("✅ Canceled" if res.get("ok") else "⚠️ Cancel فشل") + f" — {market}\n"
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
@@ -322,18 +390,18 @@ def tg_webhook():
             parts = text.split()
             if len(parts)<2:
                 tg_send("صيغة: /sell COIN [AMOUNT]"); return jsonify(ok=True)
-            coin=parts[1].upper(); market=coin_to_market(coin)
-            if not market: tg_send(f"⛔ {coin}-EUR غير متاح."); return jsonify(ok=True)
+            market=_norm_market(parts[1].upper())
+            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
             amt=None
             if len(parts)>=3:
                 try: amt=float(parts[2])
                 except: amt=None
-            res = maker_sell_simple(market, amt)
+            res = maker_sell(market, amt)
             tg_send(("✅ SELL أُرسل" if res.get("ok") else "⚠️ SELL فشل") + f" — {market}\n"
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
-        tg_send("أوامر: /buy /sell /bal")
+        tg_send("أوامر: /buy /reprice /cancel /sell /open /bal")
         return jsonify(ok=True)
 
     except Exception as e:
@@ -342,7 +410,8 @@ def tg_webhook():
 
 # ========= Health =========
 @app.route("/", methods=["GET"])
-def home(): return "Saqer Maker Reprice ✅"
+def home():
+    return "Saqer Maker (open/reprice/cancel) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
