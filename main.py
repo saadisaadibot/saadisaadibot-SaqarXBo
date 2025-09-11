@@ -783,11 +783,12 @@ def _auth_chat(chat_id: str) -> bool:
     return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
 
 def _handle_tg_update(upd: dict):
+    global enabled  # ← ضع الـ global هنا مرة واحدة
     msg = upd.get("message") or upd.get("edited_message") or {}
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or "").strip()
-    if not chat_id: 
+    if not chat_id:
         return
     if not _auth_chat(chat_id):
         _tg_reply(chat_id, "⛔ غير مصرّح.")
@@ -808,11 +809,11 @@ def _handle_tg_update(upd: dict):
         _tg_reply(chat_id, build_summary()); return
 
     if low.startswith("/enable"):
-        global enabled; enabled = True
+        enabled = True
         _tg_reply(chat_id, "✅ تم التفعيل."); return
 
     if low.startswith("/disable"):
-        global enabled; enabled = False
+        enabled = False
         _tg_reply(chat_id, "🛑 تم الإيقاف."); return
 
     if low.startswith("/close"):
@@ -825,7 +826,6 @@ def _handle_tg_update(upd: dict):
         return
 
     _tg_reply(chat_id, "أوامر: /summary /enable /disable /close\n(الشراء فقط من بوت الإشارة)")
-
 # مسار تلغرام الرئيسي حسب نمطك الثابت
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
