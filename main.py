@@ -7,6 +7,7 @@ Minimal Maker BUY Relay (Bitvavo / EUR)
 
 import os, re, time, json, math, hmac, hashlib, requests
 from flask import Flask, request, jsonify
+from uuid import uuid4
 
 # ====== Config / ENV ======
 BITVAVO_API_KEY    = os.getenv("BITVAVO_API_KEY", "")
