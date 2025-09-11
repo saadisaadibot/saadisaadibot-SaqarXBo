@@ -1,350 +1,212 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only Relay (Bitvavo / EUR)
-- شراء Maker فقط (postOnly) مع تجميع fills.
-- كنس الأوامر المفتوحة قبل/بعد الشراء لمنع حجز الرصيد.
-- تنفيذ الشراء بثريد غير حاجب لمسار /hook (لا timeouts).
-- تصحيح precision للسعر/الكمية حسب market meta، مع fallback تلقائي.
+Minimal Maker BUY Relay (Bitvavo / EUR)
+- /hook: يستقبل {"cmd":"buy","coin":"ADA","eur":10.0}  (eur اختياري)
+- يضع أمر limit postOnly واحد على أفضل Bid الحالي ثم يرجع نتيجة واضحة.
 """
 
-import os, re, time, json, math, traceback, hmac, hashlib
-import requests, redis, websocket
-from threading import Thread, Lock
-from uuid import uuid4
+import os, re, time, json, math, hmac, hashlib, requests
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
 
-# ========== Boot / ENV ==========
-load_dotenv()
-app = Flask(__name__)
-
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
-API_KEY     = os.getenv("BITVAVO_API_KEY")
-API_SECRET  = os.getenv("BITVAVO_API_SECRET")
-REDIS_URL   = os.getenv("REDIS_URL")
-RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
-PORT        = int(os.getenv("PORT", "8080"))
+# ====== Config / ENV ======
+BITVAVO_API_KEY    = os.getenv("BITVAVO_API_KEY", "")
+BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET", "")
+PORT               = int(os.getenv("PORT", "8080"))
 
 BASE_URL = "https://api.bitvavo.com/v2"
-WS_URL   = "wss://ws.bitvavo.com/v2/"
 
-# ========== State ==========
-enabled          = True
-buy_in_progress  = False
-lk               = Lock()
-r                = redis.from_url(REDIS_URL) if REDIS_URL else redis.Redis()
-MARKET_META      = {}   # { "COIN-EUR": {"tick":..., "step":..., "minQuote":..., "minBase":...} }
+# ====== Flask ======
+app = Flask(__name__)
 
-# ========== Telegram ==========
-_last_notif = {}
-def send_message(text: str):
-    try:
-        if BOT_TOKEN and CHAT_ID:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": CHAT_ID, "text": text}, timeout=8)
-        else:
-            print("TG:", text)
-    except Exception:
-        pass
-
-def send_message_throttled(key: str, text: str, sec=5.0):
-    now = time.time()
-    if now - _last_notif.get(key, 0) >= sec:
-        _last_notif[key] = now
-        send_message(text)
-
-# ========== Bitvavo REST ==========
+# ====== Bitvavo REST helpers ======
 def _sig(ts, method, path, body_str=""):
     msg = f"{ts}{method}{path}{body_str}"
-    return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(BITVAVO_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def bv_request(method, path, body=None, timeout=12):
     url = f"{BASE_URL}{path}"
     ts  = str(int(time.time()*1000))
     body_str = "" if method=="GET" else json.dumps(body or {}, separators=(',',':'))
     headers = {
-        'Bitvavo-Access-Key': API_KEY,
-        'Bitvavo-Access-Timestamp': ts,
-        'Bitvavo-Access-Signature': _sig(ts, method, f"/v2{path}", body_str),
-        'Bitvavo-Access-Window': '10000'
+        "Bitvavo-Access-Key": BITVAVO_API_KEY,
+        "Bitvavo-Access-Timestamp": ts,
+        "Bitvavo-Access-Signature": _sig(ts, method, f"/v2{path}", body_str),
+        "Bitvavo-Access-Window": "10000",
     }
     resp = requests.request(method, url, headers=headers,
                             json=(body or {}) if method!="GET" else None,
                             timeout=timeout)
     return resp.json()
 
-def get_eur_available() -> float:
+# ====== Market metadata (precision / mins) ======
+MARKET_META = {}   # "GMX-EUR": {"tick":..., "step":..., "minQuote":..., "minBase":...}
+
+def _parse_step_from_precision(val, default_step):
     try:
-        for b in bv_request("GET", "/balance"):
+        # Bitvavo قد يرسلها كعدد خانات أو كخطوة
+        if isinstance(val, int) or (isinstance(val, str) and str(val).isdigit()):
+            d = int(val);  return 10.0 ** (-d) if 0 <= d <= 20 else default_step
+        v = float(val);  return v if 0 < v < 1 else default_step
+    except Exception:
+        return default_step
+
+def load_markets():
+    try:
+        rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
+        for r in rows:
+            if r.get("quote") != "EUR": 
+                continue
+            m = r.get("market")
+            tick = _parse_step_from_precision(r.get("pricePrecision", 6), 1e-6)
+            step = _parse_step_from_precision(r.get("amountPrecision", 8), 1e-8)
+            MARKET_META[m] = {
+                "tick":     tick or 1e-6,
+                "step":     step or 1e-8,
+                "minQuote": float(r.get("minOrderInQuoteAsset", 0) or 0.0),
+                "minBase":  float(r.get("minOrderInBaseAsset",  0) or 0.0),
+            }
+    except Exception as e:
+        print("load_markets error:", e)
+
+# حمّل الميتاداتا عند الاستيراد
+load_markets()
+
+def _tick(market): 
+    v=(MARKET_META.get(market, {}) or {}).get("tick"); 
+    return v if (v and v>0) else 1e-6
+
+def _step(market): 
+    v=(MARKET_META.get(market, {}) or {}).get("step"); 
+    return v if (v and v>0) else 1e-8
+
+def _decs(step):
+    s = ("%.16f" % float(step)).rstrip("0").rstrip(".")
+    return len(s.split(".")[1]) if "." in s else 0
+
+def _round_price_down(market, price):
+    tk=_tick(market); dec=_decs(tk)
+    p=math.floor(max(0.0,float(price))/tk)*tk
+    return round(max(tk,p), dec)
+
+def _round_amount_down(market, amount):
+    st=_step(market); dec=_decs(st)
+    a=math.floor(max(0.0,float(amount))/st)*st
+    return round(max(st,a), dec)
+
+def _min_required_eur(market, price):
+    meta = MARKET_META.get(market, {}) or {}
+    minq = float(meta.get("minQuote", 0) or 0)
+    minb = float(meta.get("minBase",  0) or 0)
+    return max(minq, minb * max(0.0, float(price)))
+
+# ====== Simple helpers ======
+def get_eur_available():
+    try:
+        bals = bv_request("GET","/balance")
+        for b in bals:
             if b.get("symbol")=="EUR":
                 return float(b.get("available",0) or 0)
     except Exception:
         pass
     return 0.0
 
-def get_asset_available(sym: str) -> float:
+def fetch_orderbook_best(market):
+    """رجّع (best_bid, best_ask) أو (None, None)."""
     try:
-        for b in bv_request("GET", "/balance"):
-            if b.get("symbol")==sym.upper():
-                return float(b.get("available",0) or 0)
+        j = requests.get(f"{BASE_URL}/{market}/book", timeout=6).json()
+        bid = float(j["bids"][0][0]); ask = float(j["asks"][0][0])
+        return bid, ask
     except Exception:
-        pass
-    return 0.0
+        return None, None
 
-# ========== Market meta ==========
-def _parse_step_from_precision(val, default_step):
-    try:
-        # bitvavo يعطي أحياناً precision كرقم خانات
-        if isinstance(val, int) or (isinstance(val, str) and str(val).isdigit()):
-            d = int(val)
-            if 0 <= d <= 20: return 10.0 ** (-d)
-        v = float(val)
-        if 0 < v < 1: return v
-    except Exception:
-        pass
-    return default_step
+# ====== Core: place ONE postOnly order ======
+def place_one_maker_buy(market: str, eur: float|None):
+    # 1) تأكيد وجود meta
+    if market not in MARKET_META:
+        return {"ok": False, "err": f"market_meta_missing:{market}"}
 
-def load_markets():
-    """حمّل precision والحدود؛ مع fallback آمن."""
-    try:
-        rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
-        meta = {}
-        for r0 in rows:
-            if r0.get("quote") != "EUR": continue
-            mkt  = r0.get("market")
-            tick = _parse_step_from_precision(r0.get("pricePrecision", 6), 1e-6)
-            step = _parse_step_from_precision(r0.get("amountPrecision", 8), 1e-8)
-            meta[mkt] = {
-                "tick": tick or 1e-6,
-                "step": step or 1e-8,
-                "minQuote": float(r0.get("minOrderInQuoteAsset", 0) or 0.0),
-                "minBase":  float(r0.get("minOrderInBaseAsset",  0) or 0.0)
-            }
-        if meta: MARKET_META.update(meta)
-    except Exception as e:
-        print("load_markets err:", e)
-
-def _tick(market):
-    v = (MARKET_META.get(market, {}) or {}).get("tick")
-    return v if (v and v>0) else 1e-6
-
-def _step(market):
-    v = (MARKET_META.get(market, {}) or {}).get("step")
-    return v if (v and v>0) else 1e-8
-
-def _decimals_from_step(step: float) -> int:
-    s = ("%.16f" % float(step)).rstrip("0").rstrip(".")
-    return len(s.split(".")[1]) if "." in s else 0
-
-def _round_amount(market, amount):
-    step=_step(market); decs=_decimals_from_step(step)
-    a = math.floor(max(0.0, float(amount))/step)*step
-    return round(max(step,a),decs)
-
-def _format_amount(market, amount) -> str:
-    decs=_decimals_from_step(_step(market))
-    return f"{_round_amount(market, amount):.{decs}f}"
-
-def _round_price_down(market, price):
-    tk=_tick(market); decs=_decimals_from_step(tk)
-    p=math.floor(max(0.0, float(price))/tk)*tk
-    return round(max(tk,p),decs)
-
-def _format_price(market, price) -> str:
-    tk=_tick(market); decs=_decimals_from_step(tk)
-    return f"{_round_price_down(market, price):.{decs}f}"
-
-# ========== Orders ==========
-def _place_limit_postonly(market, side, price, amount):
-    body = {
-        "market": market, "side": side, "orderType": "limit", "postOnly": True,
-        "clientOrderId": str(uuid4()), "price": _format_price(market, price),
-        "amount": _format_amount(market, amount)
-    }
-    return bv_request("POST", "/order", body)
-
-def _fetch_order(mkt, oid):  return bv_request("GET",    f"/order?market={mkt}&orderId={oid}")
-def _cancel_order(mkt, oid): return bv_request("DELETE", f"/order?market={mkt}&orderId={oid}")
-
-def _list_open_orders(market):
-    try: return bv_request("GET", f"/orders?market={market}") or []
-    except Exception: return []
-
-def _cancel_all_open_orders(market, wait_each=True):
-    """إلغاء جماعي + تأكيد الحالة (canceled/filled)."""
-    try:
-        opens=_list_open_orders(market)
-        for o in opens:
-            oid=o.get("orderId"); 
-            if not oid: continue
-            try: _cancel_order(market, oid)
-            except Exception: pass
-            if wait_each:
-                t0=time.time()
-                while time.time()-t0<6:
-                    st=_fetch_order(market, oid) or {}
-                    if (st.get("status") or "").lower() in ("canceled","filled"): break
-                    time.sleep(0.2)
-    except Exception as e:
-        print("cancel sweep err:", e)
-
-# ========== WS price ==========
-_ws_prices = {}; _ws_lock = Lock()
-
-def _ws_on_message(ws,msg):
-    try:
-        d=json.loads(msg)
-        if d.get("event")=="ticker":
-            m=d.get("market")
-            p=float(d.get("price", d.get("lastPrice", 0)) or 0)
-            if p>0:
-                with _ws_lock: _ws_prices[m]={"price":p,"ts":time.time()}
-    except Exception:
-        pass
-
-def _ws_thread():
-    while True:
-        try:
-            ws=websocket.WebSocketApp(WS_URL,on_message=_ws_on_message)
-            ws.run_forever(ping_interval=25, ping_timeout=10)
-        except Exception:
-            time.sleep(2)
-
-Thread(target=_ws_thread, daemon=True).start()
-
-def fetch_price_ws_first(market, staleness=2.0):
-    now=time.time()
-    with _ws_lock: rec=_ws_prices.get(market)
-    if rec and (now-rec["ts"])<=staleness: return rec["price"]
-    try:
-        j=requests.get(f"{BASE_URL}/ticker/price?market={market}",timeout=6).json()
-        p=float(j.get("price",0) or 0)
-        if p>0:
-            with _ws_lock: _ws_prices[market]={"price":p,"ts":now}
-            return p
-    except Exception:
-        pass
-    return None
-
-# ========== Buy flow ==========
-def open_maker_buy(market: str, eur_amount: float | None):
-    """شراء Maker مع كنس أوامر قديمة وحمايات None/الرصيد."""
+    # 2) حدد كم نصرف
     eur_avail = max(0.0, get_eur_available())
-
-    # eur_amount يمكن أن يكون None → استخدم كل المتاح
-    target = float(eur_amount) if (eur_amount is not None and eur_amount > 0) else eur_avail
-
-    # لا نتجاوز المتاح، ونخصم هامش بسيط للرسوم/الانزلاق
+    target = float(eur) if (eur is not None and eur>0) else eur_avail
     buffer = 0.05
     target = min(target, eur_avail)
     spend  = max(0.0, target - buffer)
     if spend <= 0:
-        send_message("⛔ لا يوجد رصيد كافٍ بعد الهامش."); return None
+        return {"ok": False, "err": "insufficient_eur_after_buffer", "eur_avail": eur_avail}
 
-    # كنس قبل البدء
-    _cancel_all_open_orders(market, wait_each=True)
+    # 3) سعر Maker: على أفضل Bid (أو أسفل الـ Ask بشعرة لو لزم)
+    best_bid, best_ask = fetch_orderbook_best(market)
+    if not best_bid or not best_ask:
+        return {"ok": False, "err": "no_orderbook"}
 
-    patience = 45
-    deadline = time.time() + patience
-    last_order = None
-    all_fills  = []
+    raw_price = min(best_bid, best_ask*(1.0-1e-6))
+    price     = _round_price_down(market, raw_price)
 
-    try:
-        while time.time() < deadline:
-            price = fetch_price_ws_first(market)
-            if not price or price <= 0:
-                time.sleep(0.3); continue
+    # 4) تحقق الحد الأدنى للمنصة
+    need_eur = _min_required_eur(market, price)
+    if spend + 1e-12 < need_eur:
+        return {"ok": False, "err": "below_min_order", "need_eur": need_eur, "spend": spend}
 
-            amt = _round_amount(market, spend / price)
-            if amt <= 0:
-                send_message("⛔ الكمية المحسوبة صفرية بعد التقريب."); break
+    # 5) احسب الكمية ودوّرها للأسفل
+    amount = _round_amount_down(market, spend / price)
+    if amount <= 0:
+        return {"ok": False, "err": "amount_zero_after_round", "step": _step(market)}
 
-            res = _place_limit_postonly(market, "buy", price, amt)
-            oid = res.get("orderId")
-            err = str(res.get("error","")).lower()
+    # 6) ضع طلب postOnly واحد
+    body = {
+        "market": market,
+        "side": "buy",
+        "orderType": "limit",
+        "postOnly": True,
+        "clientOrderId": str(uuid4()),
+        "price": f"{price:.{_decs(_tick(market))}f}",
+        "amount": f"{amount:.{_decs(_step(market))}f}",
+    }
+    res = bv_request("POST","/order", body)
 
-            if oid:
-                last_order = oid
-                st = _fetch_order(market, oid) or {}
-                st_status = (st.get("status") or "").lower()
-                if st_status in ("filled","partiallyfilled"):
-                    all_fills += st.get("fills", []) or []
-                    break
+    # 7) ارجع النتيجة كما هي مع بعض المعلومات المفيدة
+    out = {"request": body, "response": res}
+    oid = (res or {}).get("orderId")
+    if oid:
+        # اجلب الحالة مرة واحدة (اختياري)
+        st = bv_request("GET", f"/order?market={market}&orderId={oid}")
+        out["status"] = st
+        out["ok"] = True
+    else:
+        out["ok"] = False
+        out["err"] = str((res or {}).get("error","unknown"))
+    return out
 
-            elif "insufficient" in err:
-                # أمر قديم يحجز الرصيد؟ كنس ثم حدّث spend
-                _cancel_all_open_orders(market, wait_each=True)
-                eur_avail = max(0.0, get_eur_available())
-                target = min(target, eur_avail)
-                spend  = max(0.0, target - buffer)
-                if spend <= 0:
-                    send_message("⛔ الرصيد غير كافٍ بعد الكنس."); break
-
-            time.sleep(1.0)
-
-        # تنظيف نهائي
-        _cancel_all_open_orders(market, wait_each=True)
-
-    except Exception as e:
-        print("open_maker_buy err:", e)
-
-    if all_fills:
-        # بإمكانك جمعها وحساب المتوسط إن أردت
-        send_message_throttled("buy_ok", f"✅ تم شراء {market} (fills={len(all_fills)})", 2.0)
-        return {"fills": all_fills}
-
-    send_message_throttled("buy_fail", "⚠️ لم يكتمل شراء Maker ضمن المهلة.", 2.0)
-    return None
-
-# ========== Async runner ==========
-def _run_buy_async(market: str, eur: float | None):
-    global buy_in_progress
-    try:
-        open_maker_buy(market, eur)
-    except Exception as e:
-        traceback.print_exc()
-        send_message(f"🐞 خطأ أثناء الشراء: {e}")
-    finally:
-        buy_in_progress = False
-
-# ========== HTTP ==========
+# ====== HTTP endpoints ======
 @app.route("/hook", methods=["POST"])
 def hook():
-    global buy_in_progress, enabled
+    """
+    JSON:
+      { "cmd":"buy", "coin":"GMX", "eur": 8.85 }
+      - eur اختياري، إذا غاب يشتري بكل رصيد EUR المتاح (مع خصم هامش صغير).
+    """
     try:
-        if not enabled:
-            return jsonify({"ok": False, "err": "disabled"}), 403
-
         data = request.get_json(silent=True) or {}
-        cmd  = (data.get("cmd") or "").strip().lower()
-        if cmd != "buy":
-            return jsonify({"ok": False, "err": "only_buy"}), 400
+        if (data.get("cmd") or "").lower() != "buy":
+            return jsonify({"ok": False, "err": "only_buy_supported"}), 400
 
         coin = (data.get("coin") or "").strip().upper()
         if not re.fullmatch(r"[A-Z0-9]{2,15}", coin or ""):
             return jsonify({"ok": False, "err": "bad_coin"}), 400
-        market = f"{coin}-EUR"
 
         eur = data.get("eur")
         eur = float(eur) if eur is not None else None
 
-        if buy_in_progress:
-            return jsonify({"ok": False, "err": "busy"}), 429
-
-        buy_in_progress = True
-        Thread(target=_run_buy_async, args=(market, eur), daemon=True).start()
-        return jsonify({"ok": True, "msg": "buy_started", "market": market})
+        market = f"{coin}-EUR"
+        result = place_one_maker_buy(market, eur)
+        return jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        buy_in_progress = False
         return jsonify({"ok": False, "err": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker Relay ✅"
+    return "Minimal Maker BUY Relay ✅"
 
-# ========== Main ==========
-if __name__ == "__main__" or RUN_LOCAL:
-    load_markets()
+# ====== Main ======
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
