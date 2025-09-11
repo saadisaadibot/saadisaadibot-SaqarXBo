@@ -5,12 +5,15 @@ Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
 - وقف ديناميكي متدرّج حسب القمة.
 - صفقة واحدة في نفس الوقت.
 - الشراء فقط من بوت الإشارة عبر /hook
-- أوامر تيليغرام: /summary /enable /disable /close عبر /webhook (وأيضاً /tg كمسار بديل).
-- تحسينات:
-   * تمرير market لكل _fetch_order/_cancel_order.
-   * مهلة دنيا قبل إعلان الفشل + إلغاء مؤكد Blocking.
-   * التقاط تنفيذ متأخر عبر استطلاع الرصيد.
-   * مطاردة الـ Bid وإعادة تسعير دورية/عند الابتعاد بعدد ticks.
+- أوامر تيليغرام: /summary /enable /disable /close عبر /webhook (وأيضاً /tg مسار بديل).
+
+تحسينات رئيسية:
+- تمرير market دائمًا إلى _fetch_order/_cancel_order.
+- مهلة دنيا قبل إعلان الفشل + إلغاء مؤكَّد blocking.
+- التقاط تنفيذ متأخر (late fill) بعد الفشل.
+- مطاردة الـ Bid مع إعادة تسعير بالـ ticks أو بالعمر.
+- مضاد سبام للإشعارات + هدنة بعد الأخطاء.
+- قفل منع شراء متوازي + تجاهل تكرار /hook لنفس الماركت.
 """
 
 import os, re, time, json, math, traceback
@@ -52,22 +55,22 @@ WS_URL   = "wss://ws.bitvavo.com/v2/"
 MAX_TRADES            = 1
 MAKER_REPRICE_EVERY   = 2.0
 MAKER_REPRICE_THRESH  = 0.0005   # 0.05%
-MAKER_WAIT_BASE_SEC   = 45
-MAKER_WAIT_MAX_SEC    = 300
+MAKER_WAIT_BASE_SEC   = int(os.getenv("MAKER_WAIT_BASE_SEC", "45"))
+MAKER_WAIT_MAX_SEC    = int(os.getenv("MAKER_WAIT_MAX_SEC", "300"))
 MAKER_WAIT_STEP_UP    = 15
 MAKER_WAIT_STEP_DOWN  = 10
 BUY_MIN_EUR           = 0.0
 WS_STALENESS_SEC      = 2.0
 
 # مهلة دنيا + إلغاء مؤكد + مراقبة لاحقة
-MAKER_GIVEUP_MIN_SEC  = float(os.getenv("MAKER_GIVEUP_MIN_SEC", 12))  # لا نعلن فشل قبل هالمدة بعد وضع أول أمر
-CANCEL_WAIT_SEC       = float(os.getenv("CANCEL_WAIT_SEC", 8))        # ننتظر إلغاء مؤكد
-ORDER_CHECK_EVERY     = float(os.getenv("ORDER_CHECK_EVERY", 0.6))    # فاصل فحص الطلب
+MAKER_GIVEUP_MIN_SEC  = float(os.getenv("MAKER_GIVEUP_MIN_SEC", 12))   # لا نعلن فشل قبل هذه المدة من أول وضع أمر
+CANCEL_WAIT_SEC       = float(os.getenv("CANCEL_WAIT_SEC", 8))         # ننتظر إلغاء مؤكّد
+ORDER_CHECK_EVERY     = float(os.getenv("ORDER_CHECK_EVERY", 0.6))     # فاصل فحص الطلب
 
 # مطاردة الـ bid (Maker Buy)
-BID_CHASE_TICKS       = int(os.getenv("BID_CHASE_TICKS", 0))          # 0 = على أفضل Bid تماماً
-REPRICE_ON_TICKS      = int(os.getenv("REPRICE_ON_TICKS", 1))         # إذا ابتعدنا ≥ 1 tick عن القمة → أعد التسعير
-REPRICE_MAX_AGE_SEC   = float(os.getenv("REPRICE_MAX_AGE_SEC", 4.0))  # أعِد التسعير دوريّاً
+BID_CHASE_TICKS       = int(os.getenv("BID_CHASE_TICKS", 0))           # 0 = على أفضل Bid تماماً
+REPRICE_ON_TICKS      = int(os.getenv("REPRICE_ON_TICKS", 1))          # إذا ابتعدنا ≥ 1 tick عن القمة → أعد التسعير
+REPRICE_MAX_AGE_SEC   = float(os.getenv("REPRICE_MAX_AGE_SEC", 4.0))   # أعِد التسعير دوريّاً
 
 STOP_LADDER = [
     (0.0,  -2.0),
@@ -79,13 +82,15 @@ STOP_LADDER = [
 ]
 
 # ========= Runtime =========
-enabled        = True
-active_trade   = None
-executed_trades= []
-MARKET_MAP     = {}   # "ADA" -> "ADA-EUR"
-MARKET_META    = {}   # "ADA-EUR" -> {"minQuote","minBase","tick","step"}
-_ws_prices     = {}
-_ws_lock       = Lock()
+enabled          = True
+active_trade     = None
+executed_trades  = []
+MARKET_MAP       = {}   # "ADA" -> "ADA-EUR"
+MARKET_META      = {}   # "ADA-EUR" -> {"minQuote","minBase","tick","step"}
+_ws_prices       = {}
+_ws_lock         = Lock()
+buy_in_progress  = False         # قفل منع شراء متوازي
+_last_hook       = {}            # تجاهل تكرار /hook لنفس الماركت
 
 # ========= Utils =========
 def send_message(text: str):
@@ -100,6 +105,15 @@ def send_message(text: str):
             print("TG:", text)
     except Exception as e:
         print("TG err:", e)
+
+# مضاد سبام بسيط
+_last_notif = {}
+def send_message_throttled(key: str, text: str, min_interval=3.0):
+    now = time.time()
+    last = _last_notif.get(key, 0.0)
+    if now - last >= min_interval:
+        _last_notif[key] = now
+        send_message(text)
 
 def create_sig(ts, method, path, body_str=""):
     import hmac, hashlib
@@ -221,9 +235,6 @@ def _format_amount(market, amount) -> str:
 
 def _min_quote(market): return (MARKET_META.get(market, {}) or {}).get("minQuote", 0.0)
 def _min_base(market):  return (MARKET_META.get(market, {}) or {}).get("minBase",  0.0)
-
-def _min_required_eur(market: str, price: float) -> float:
-    return max(_min_quote(market), _min_base(market) * float(price))
 
 def _tick(market: str) -> float:
     return (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
@@ -410,7 +421,7 @@ def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> f
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، بصبر أدنى صلب + تنظيف/Fallback موثوق + مطاردة Bid."""
+    """Maker postOnly على أفضل Bid، بصبر أدنى صلب + تنظيف/Fallback + مطاردة Bid + مضاد سبام."""
     eur_available = get_eur_available()
 
     # تحديد المبلغ الهدف
@@ -478,7 +489,7 @@ def open_maker_buy(market: str, eur_amount: float):
                     if st_status == "filled":
                         break
 
-                # نعيد التسعير إذا ابتعدنا ticks أو صار الطلب قديم
+                # إعادة تسعير إذا ابتعدنا بالـ ticks أو صار الطلب قديم
                 need_reprice = False
                 if my_price is not None:
                     ticks_away = int(round((best_bid - my_price) / tk))
@@ -511,13 +522,14 @@ def open_maker_buy(market: str, eur_amount: float):
                 break
 
             exp_quote = amt_base * target_price
-            send_message(
-                f"🧪 محاولة شراء #1 على {market}: "
-                f"amount={_format_amount(market, amt_base)} | سعر≈{_format_price(market, target_price)} | EUR≈{exp_quote:.2f}"
+            send_message_throttled(f"try:{market}",
+                f"🧪 محاولة شراء على {market}: amount={_format_amount(market, amt_base)} "
+                f"| سعر≈{_format_price(market, target_price)} | EUR≈{exp_quote:.2f}",
+                min_interval=5.0
             )
             res = _place_limit_postonly(market, "buy", target_price, amount=amt_base)
             orderId = (res or {}).get("orderId")
-            err_txt = str((res or {}).get("error","")).lower()
+            err_txt = str((res or {}).get("error","")).strip().lower()
 
             if orderId:
                 last_order = orderId
@@ -527,13 +539,16 @@ def open_maker_buy(market: str, eur_amount: float):
                 time.sleep(ORDER_CHECK_EVERY)
                 continue
 
-            if "insufficient balance" in err_txt or "not have sufficient balance" in err_txt:
-                remaining_eur = remaining_eur * IB_BACKOFF_FACTOR
-                time.sleep(0.2)
-                continue
+            # ← فشل إنشاء الأمر: لا نعيد السبام
+            if err_txt:
+                send_message_throttled(f"err:{market}",
+                    f"⚠️ تعذّر وضع أمر Maker: {err_txt}", min_interval=10.0)
+            else:
+                send_message_throttled(f"err:{market}",
+                    "⚠️ تعذّر وضع أمر Maker (سبب غير معروف).", min_interval=10.0)
 
-            # أي خطأ آخر → جرّب الدور القادم
-            time.sleep(0.3)
+            time.sleep(0.8)  # هدنة تمنع الدوران السريع
+            continue
 
         # خرجنا من الحلقة: نظّف الطلب إن وُجد
         if last_order:
@@ -587,8 +602,8 @@ def close_maker_sell(market: str, amount: float):
             price    = _round_price(market, max(best_ask, best_bid*(1.0+1e-6)))
 
             if last_order:
-                st = _fetch_order(market, last_order); st_status = st.get("status")
-                if st_status in ("filled","partiallyFilled"):
+                st = _fetch_order(market, last_order); st_status = (st.get("status") or "").lower()
+                if st_status in ("filled","partiallyfilled"):
                     fills = st.get("fills", []) or []
                     if fills:
                         sold_base, _, _ = totals_from_fills(fills)
@@ -613,8 +628,8 @@ def close_maker_sell(market: str, amount: float):
                 else:
                     t0 = time.time()
                     while time.time() - t0 < MAKER_REPRICE_EVERY:
-                        st = _fetch_order(market, last_order); st_status = st.get("status")
-                        if st_status in ("filled","partiallyFilled"):
+                        st = _fetch_order(market, last_order); st_status = (st.get("status") or "").lower()
+                        if st_status in ("filled","partiallyfilled"):
                             fills = st.get("fills", []) or []
                             if fills:
                                 sold_base, _, _ = totals_from_fills(fills)
@@ -644,8 +659,8 @@ def close_maker_sell(market: str, amount: float):
 
                 t0 = time.time()
                 while time.time() - t0 < MAKER_REPRICE_EVERY:
-                    st = _fetch_order(market, last_order); st_status = st.get("status")
-                    if st_status in ("filled","partiallyFilled"):
+                    st = _fetch_order(market, last_order); st_status = (st.get("status") or "").lower()
+                    if st_status in ("filled","partiallyfilled"):
                         fills = st.get("fills", []) or []
                         if fills:
                             sold_base, _, _ = totals_from_fills(fills)
@@ -733,11 +748,14 @@ Thread(target=monitor_loop, daemon=True).start()
 # ========= Trade Flow =========
 def do_open_maker(market: str, eur: float):
     def _runner():
-        global active_trade
+        global active_trade, buy_in_progress
         try:
             with lk:
                 if active_trade:
                     send_message("⛔ توجد صفقة نشطة. أغلقها أولاً."); return
+                if buy_in_progress:
+                    send_message("⛔ عملية شراء جارية بالفعل."); return
+                buy_in_progress = True
 
             # لقطة رصيد قبل الشراء + تلميح سعر
             base_sym     = market.split("-")[0]
@@ -768,6 +786,9 @@ def do_open_maker(market: str, eur: float):
         except Exception as e:
             traceback.print_exc()
             send_message(f"🐞 خطأ أثناء الفتح: {e}")
+        finally:
+            with lk:
+                buy_in_progress = False
     Thread(target=_runner, daemon=True).start()
 
 def do_close_maker(reason=""):
@@ -874,7 +895,7 @@ def _handle_tg_update(upd: dict):
 
     _tg_reply(chat_id, "أوامر: /summary /enable /disable /close\n(الشراء فقط من بوت الإشارة)")
 
-# مسار تيليغرام الرئيسي حسب نمطك
+# مسار تيليغرام الرئيسي
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     try:
@@ -912,6 +933,13 @@ def hook():
         if not market:
             send_message(f"⛔ {coin}-EUR غير متاح على Bitvavo.")
             return jsonify({"ok":False,"err":"market_unavailable"})
+
+        # تجاهل تكرار الإشارة لنفس الماركت ضمن نافذة قصيرة
+        now = time.time()
+        last = _last_hook.get(market, 0.0)
+        if now - last < 20:
+            return jsonify({"ok":True,"msg":"ignored_duplicate","market":market})
+        _last_hook[market] = now
 
         eur = float(data.get("eur")) if data.get("eur") is not None else None
         do_open_maker(market, eur)
