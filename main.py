@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
-- Maker-only buy/sell (postOnly) مع تجميع partial fills.
+- Maker-only buy/sell (postOnly) مع تجميع partial fills + fallback بفحص الرصيد.
 - وقف ديناميكي متدرّج حسب القمة.
 - صفقة واحدة في نفس الوقت.
 - الشراء فقط من بوت الإشارة عبر /hook
-- أوامر تيليجرام: /summary /enable /disable /close عبر /tg
-- Fix: استدعاءات /order تتطلّب market (fetch/cancel), مع تأكيد إلغاء سريع.
+- أوامر تيليجرام: /summary /enable /disable /close عبر /webhook (وأيضاً /tg كمسار بديل).
+- Fixes:
+   * تمّ تمرير market إلى _fetch_order/_cancel_order داخل open_maker_buy (كان سبب عدم معرفة نجاح الشراء).
+   * تصحيح /disable بإضافة global enabled.
 """
 
 import os, re, time, json, math, traceback
@@ -21,7 +23,7 @@ load_dotenv()
 app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")  # (اختياري) حصر أوامر تيليجرام على دردشة واحدة
+CHAT_ID     = os.getenv("CHAT_ID")  # (اختياري) قصر أوامر تيليغرام على دردشة واحدة
 API_KEY     = os.getenv("BITVAVO_API_KEY")
 API_SECRET  = os.getenv("BITVAVO_API_SECRET")
 REDIS_URL   = os.getenv("REDIS_URL")
@@ -30,8 +32,8 @@ PORT        = int(os.getenv("PORT", "5000"))
 
 # حماية الرصيد (تُضبط من .env)
 EST_FEE_RATE        = float(os.getenv("FEE_RATE_EST", "0.0025"))   # ≈0.25%
-HEADROOM_EUR_MIN    = float(os.getenv("HEADROOM_EUR_MIN", "0.30")) # هامش آمن افتراضي
-MAX_SPEND_FRACTION  = float(os.getenv("MAX_SPEND_FRACTION", "1.0"))# ✅ اشترِ كل الرصيد
+HEADROOM_EUR_MIN    = float(os.getenv("HEADROOM_EUR_MIN", "0.30")) # هامش أمان
+MAX_SPEND_FRACTION  = float(os.getenv("MAX_SPEND_FRACTION", "1.0"))# اشترِ كل الرصيد
 FIXED_EUR_PER_TRADE = float(os.getenv("FIXED_EUR", "0"))           # 0=معطّل، >0=مبلغ ثابت
 
 # Backoff عند رفض الرصيد
@@ -52,7 +54,7 @@ MAKER_WAIT_BASE_SEC   = 45
 MAKER_WAIT_MAX_SEC    = 300
 MAKER_WAIT_STEP_UP    = 15
 MAKER_WAIT_STEP_DOWN  = 10
-BUY_MIN_EUR           = 0.0      # ✅ لا حد داخلي (نبقى نحترم minQuote/minBase من المنصة)
+BUY_MIN_EUR           = 0.0
 WS_STALENESS_SEC      = 2.0
 
 STOP_LADDER = [
@@ -286,11 +288,10 @@ def _place_limit_postonly(market, side, price, amount=None):
         "clientOrderId": str(uuid4()),
         "price": _format_price(market, price),
         "amount": _format_amount(market, float(amount)),
-        "operatorId": ""  # Bitvavo يقبل حقل موجود حتى لو فارغ
+        "operatorId": ""  # Bitvavo يقبل وجود الحقل حتى لو فارغ
     }
     return bv_request("POST", "/order", body)
 
-# ✅ Fix: Bitvavo يحتاج market مع orderId في الاستعلام
 def _fetch_order(market, orderId):
     return bv_request("GET",    f"/order?market={market}&orderId={orderId}")
 
@@ -392,7 +393,7 @@ def open_maker_buy(market: str, eur_amount: float):
 
             # أمر قائم؟
             if last_order:
-                st = _fetch_order(last_order); st_status = st.get("status")
+                st = _fetch_order(market, last_order); st_status = st.get("status")
                 if st_status in ("filled","partiallyFilled"):
                     fills = st.get("fills", []) or []
                     if fills:
@@ -400,19 +401,19 @@ def open_maker_buy(market: str, eur_amount: float):
                         base, quote_eur, fee_eur = totals_from_fills(fills)
                         remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
                 if st_status == "filled" or remaining_eur < (minq * 0.999):
-                    try: _cancel_order(last_order)
+                    try: _cancel_order(market, last_order)
                     except: pass
                     last_order = None
                     break
 
                 if (last_bid is None) or (abs(best_bid/last_bid - 1.0) >= MAKER_REPRICE_THRESH):
-                    try: _cancel_order(last_order)
+                    try: _cancel_order(market, last_order)
                     except: pass
                     last_order = None
                 else:
                     t0 = time.time()
                     while time.time() - t0 < MAKER_REPRICE_EVERY:
-                        st = _fetch_order(last_order); st_status = st.get("status")
+                        st = _fetch_order(market, last_order); st_status = st.get("status")
                         if st_status in ("filled","partiallyFilled"):
                             fills = st.get("fills", []) or []
                             if fills:
@@ -420,7 +421,7 @@ def open_maker_buy(market: str, eur_amount: float):
                                 base, quote_eur, fee_eur = totals_from_fills(fills)
                                 remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
                             if st_status == "filled" or remaining_eur < (minq * 0.999):
-                                try: _cancel_order(last_order)
+                                try: _cancel_order(market, last_order)
                                 except: pass
                                 last_order = None
                                 break
@@ -472,7 +473,7 @@ def open_maker_buy(market: str, eur_amount: float):
                 # متابعة قصيرة
                 t0 = time.time()
                 while time.time() - t0 < MAKER_REPRICE_EVERY:
-                    st = _fetch_order(last_order); st_status = st.get("status")
+                    st = _fetch_order(market, last_order); st_status = st.get("status")
                     if st_status in ("filled","partiallyFilled"):
                         fills = st.get("fills", []) or []
                         if fills:
@@ -480,14 +481,14 @@ def open_maker_buy(market: str, eur_amount: float):
                             base, quote_eur, fee_eur = totals_from_fills(fills)
                             remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
                         if st_status == "filled" or remaining_eur < (minq * 0.999):
-                            try: _cancel_order(last_order)
+                            try: _cancel_order(market, last_order)
                             except: pass
                             last_order = None
                             break
                     time.sleep(0.35)
 
         if last_order:
-            try: _cancel_order(last_order)
+            try: _cancel_order(market, last_order)
             except: pass
 
     except Exception as e:
@@ -528,6 +529,7 @@ def open_maker_buy(market: str, eur_amount: float):
     relax_patience_on_success(market)
     avg = (quote_eur + fee_eur) / base_amt
     return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
+
 # ========= Maker Sell =========
 def close_maker_sell(market: str, amount: float):
     patience = get_patience_sec(market)
@@ -780,55 +782,65 @@ def _tg_reply(chat_id: str, text: str):
 def _auth_chat(chat_id: str) -> bool:
     return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
 
-@app.route("/tg", methods=["POST"])
+def _handle_tg_update(upd: dict):
+    msg = upd.get("message") or upd.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    text = (msg.get("text") or "").strip()
+    if not chat_id: 
+        return
+    if not _auth_chat(chat_id):
+        _tg_reply(chat_id, "⛔ غير مصرّح.")
+        return
+
+    low = text.lower()
+    if low.startswith("/start"):
+        _tg_reply(chat_id,
+            "أهلًا! الأوامر:\n"
+            "/summary — ملخّص\n"
+            "/enable — تفعيل\n"
+            "/disable — إيقاف\n"
+            "/close — إغلاق الصفقة\n\n"
+            "ملاحظة: الشراء يأتي فقط من بوت الإشارة."
+        ); return
+
+    if low.startswith("/summary"):
+        _tg_reply(chat_id, build_summary()); return
+
+    if low.startswith("/enable"):
+        global enabled; enabled = True
+        _tg_reply(chat_id, "✅ تم التفعيل."); return
+
+    if low.startswith("/disable"):
+        global enabled; enabled = False
+        _tg_reply(chat_id, "🛑 تم الإيقاف."); return
+
+    if low.startswith("/close"):
+        with lk:
+            has_position = active_trade is not None
+        if has_position:
+            do_close_maker("Manual"); _tg_reply(chat_id, "⏳ جاري الإغلاق (Maker)…")
+        else:
+            _tg_reply(chat_id, "لا توجد صفقة لإغلاقها.")
+        return
+
+    _tg_reply(chat_id, "أوامر: /summary /enable /disable /close\n(الشراء فقط من بوت الإشارة)")
+
+# مسار تلغرام الرئيسي حسب نمطك الثابت
+@app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     try:
         upd = request.get_json(silent=True) or {}
-        msg = upd.get("message") or upd.get("edited_message") or {}
-        chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id") or "")
-        text = (msg.get("text") or "").strip()
-        if not chat_id: return jsonify(ok=True)
-        if not _auth_chat(chat_id):
-            _tg_reply(chat_id, "⛔ غير مصرّح."); return jsonify(ok=True)
-
-        low = text.lower()
-        if low.startswith("/start"):
-            _tg_reply(chat_id,
-                "أهلًا! الأوامر:\n"
-                "/summary — ملخّص\n"
-                "/enable — تفعيل\n"
-                "/disable — إيقاف\n"
-                "/close — إغلاق الصفقة\n\n"
-                "ملاحظة: الشراء يأتي فقط من بوت الإشارة."
-            ); return jsonify(ok=True)
-
-        if low.startswith("/summary"):
-            _tg_reply(chat_id, build_summary()); return jsonify(ok=True)
-
-        if low.startswith("/enable"):
-            global enabled; enabled = True
-            _tg_reply(chat_id, "✅ تم التفعيل."); return jsonify(ok=True)
-
-        if low.startswith("/disable"):
-            enabled = False
-            _tg_reply(chat_id, "🛑 تم الإيقاف."); return jsonify(ok=True)
-
-        if low.startswith("/close"):
-            with lk:
-                has_position = active_trade is not None
-            if has_position:
-                do_close_maker("Manual"); _tg_reply(chat_id, "⏳ جاري الإغلاق (Maker)…")
-            else:
-                _tg_reply(chat_id, "لا توجد صفقة لإغلاقها.")
-            return jsonify(ok=True)
-
-        _tg_reply(chat_id, "أوامر: /summary /enable /disable /close\n(الشراء فقط من بوت الإشارة)")
+        _handle_tg_update(upd)
         return jsonify(ok=True)
-
     except Exception as e:
         print("Telegram webhook err:", e)
         return jsonify(ok=True)
+
+# مسار بديل متوافق (اختياري)
+@app.route("/tg", methods=["POST"])
+def telegram_webhook_alias():
+    return telegram_webhook()
 
 # ========= Relay Webhook — شراء فقط من بوت الإشارة =========
 @app.route("/hook", methods=["POST"])
