@@ -45,7 +45,10 @@ lk = Lock()
 
 BASE_URL = "https://api.bitvavo.com/v2"
 WS_URL   = "wss://ws.bitvavo.com/v2/"
-
+MAKER_GIVEUP_MIN_SEC = float(os.getenv("MAKER_GIVEUP_MIN_SEC", 12))  # لا نعلن فشل قبل هالمدة
+CANCEL_WAIT_SEC      = float(os.getenv("CANCEL_WAIT_SEC", 8))        # ننتظر إلغاء مؤكد
+ORDER_CHECK_EVERY    = float(os.getenv("ORDER_CHECK_EVERY", 0.6))    # فاصل فحص الطلب
+STATUS_OPEN_SET      = {"new", "open", "awaitingMarket"}             # حالات “مفتوح”
 # ========= Settings =========
 MAX_TRADES            = 1
 MAKER_REPRICE_EVERY   = 2.0
@@ -339,10 +342,10 @@ def _calc_buy_amount_base(market: str, target_eur: float, use_price: float) -> f
     return _round_amount(market, base_amt)
 
 def open_maker_buy(market: str, eur_amount: float):
-    """Maker postOnly على أفضل Bid، مع حماية رصيد + backoff + Fallback بالرصيد."""
+    """Maker postOnly على أفضل Bid، بصبر أدنى صلب + تنظيف/Fallback موثوق."""
     eur_available = get_eur_available()
 
-    # نحدد المبلغ الهدف: دائماً كل الرصيد (أو FIXED_EUR إذا مفعّل)
+    # تحديد المبلغ الهدف
     if FIXED_EUR_PER_TRADE and FIXED_EUR_PER_TRADE > 0:
         target_eur = float(FIXED_EUR_PER_TRADE)
     elif eur_amount is None or eur_amount <= 0:
@@ -353,7 +356,6 @@ def open_maker_buy(market: str, eur_amount: float):
     target_eur = min(target_eur, eur_available * MAX_SPEND_FRACTION)
     minq = _min_quote(market)
 
-    # هامش أمان للرسوم إلخ
     buffer_eur = max(HEADROOM_EUR_MIN, target_eur * EST_FEE_RATE * 2.0, 0.05)
     spendable  = min(target_eur, max(0.0, eur_available - buffer_eur))
 
@@ -365,22 +367,22 @@ def open_maker_buy(market: str, eur_amount: float):
         )
         return None
 
-    # رصيد الـ base قبل العملية (لاستعماله كـ fallback)
     base_sym    = market.split("-")[0]
     base_before = get_asset_available(base_sym)
 
     send_message(f"💰 EUR متاح: €{eur_available:.2f} | سننفق: €{spendable:.2f} (هامش €{buffer_eur:.2f}) | ماركت: {market}")
 
-    patience      = get_patience_sec(market)
-    started       = time.time()
-    last_order    = None
-    last_bid      = None
-    all_fills     = []
-    remaining_eur = float(spendable)
+    patience        = get_patience_sec(market)
+    hard_deadline   = time.time() + patience
+    placed_at       = None
+    last_order      = None
+    last_bid        = None
+    all_fills       = []
+    remaining_eur   = float(spendable)
     last_seen_price = None
 
     try:
-        while (time.time() - started) < patience and remaining_eur >= (minq * 0.999):
+        while time.time() < hard_deadline:
             ob = fetch_orderbook(market)
             if not ob or not ob.get("bids") or not ob.get("asks"):
                 time.sleep(0.25); continue
@@ -391,144 +393,119 @@ def open_maker_buy(market: str, eur_amount: float):
             price = _round_price(market, raw_price)
             last_seen_price = price
 
-            # أمر قائم؟
+            # إذا لدينا أمر مفتوح: راقبه فقط (لا نعلن الفشل قبل مهلة دنيا)
             if last_order:
-                st = _fetch_order(market, last_order); st_status = st.get("status")
-                if st_status in ("filled","partiallyFilled"):
+                st = _fetch_order(market, last_order) or {}
+                st_status = (st.get("status") or "").lower()
+                if st_status in ("filled", "partiallyfilled"):
                     fills = st.get("fills", []) or []
                     if fills:
                         all_fills += fills
                         base, quote_eur, fee_eur = totals_from_fills(fills)
                         remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
-                if st_status == "filled" or remaining_eur < (minq * 0.999):
-                    try: _cancel_order(market, last_order)
-                    except: pass
+                    if st_status == "filled":
+                        break  # اكتمل الشراء
+
+                # إعادة التسعير فقط إذا ابتعد الـ bid بما يكفي
+                if (last_bid is not None) and (abs(best_bid/last_bid - 1.0) >= MAKER_REPRICE_THRESH):
+                    _cancel_order_blocking(market, last_order)
                     last_order = None
-                    break
-
-                if (last_bid is None) or (abs(best_bid/last_bid - 1.0) >= MAKER_REPRICE_THRESH):
-                    try: _cancel_order(market, last_order)
-                    except: pass
-                    last_order = None
-                else:
-                    t0 = time.time()
-                    while time.time() - t0 < MAKER_REPRICE_EVERY:
-                        st = _fetch_order(market, last_order); st_status = st.get("status")
-                        if st_status in ("filled","partiallyFilled"):
-                            fills = st.get("fills", []) or []
-                            if fills:
-                                all_fills += fills
-                                base, quote_eur, fee_eur = totals_from_fills(fills)
-                                remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
-                            if st_status == "filled" or remaining_eur < (minq * 0.999):
-                                try: _cancel_order(market, last_order)
-                                except: pass
-                                last_order = None
-                                break
-                        time.sleep(0.35)
-                    if last_order:
-                        continue
-
-            # ضع أمر جديد (amount محسوبة من EUR) مع backoff
-            if not last_order and remaining_eur >= (minq * 0.999):
-                attempt   = 0
-                placed    = False
-                cur_price = price
-
-                while attempt < IB_BACKOFF_TRIES and remaining_eur >= (minq * 0.999):
-                    amt_base = _calc_buy_amount_base(market, remaining_eur, cur_price)
-                    if amt_base <= 0:
-                        break
-
-                    exp_quote = amt_base * cur_price
-                    send_message(
-                        f"🧪 محاولة شراء #{attempt+1} على {market}: "
-                        f"amount={_format_amount(market, amt_base)} "
-                        f"| سعر≈{_format_price(market, cur_price)} | EUR≈{exp_quote:.2f}"
-                    )
-
-                    res = _place_limit_postonly(market, "buy", cur_price, amount=amt_base)
-                    orderId = (res or {}).get("orderId")
-                    err_txt = str((res or {}).get("error","")).lower()
-
-                    if orderId:
-                        last_order = orderId
-                        last_bid   = best_bid
-                        placed     = True
-                        break
-
-                    if "insufficient balance" in err_txt or "not have sufficient balance" in err_txt:
-                        remaining_eur = remaining_eur * IB_BACKOFF_FACTOR
-                        attempt += 1
-                        time.sleep(0.15)
-                        continue
-
-                    attempt = IB_BACKOFF_TRIES
-                    break
-
-                if not placed:
-                    time.sleep(0.3)
                     continue
 
-                # متابعة قصيرة
-                t0 = time.time()
-                while time.time() - t0 < MAKER_REPRICE_EVERY:
-                    st = _fetch_order(market, last_order); st_status = st.get("status")
-                    if st_status in ("filled","partiallyFilled"):
-                        fills = st.get("fills", []) or []
-                        if fills:
-                            all_fills += fills
-                            base, quote_eur, fee_eur = totals_from_fills(fills)
-                            remaining_eur = max(0.0, remaining_eur - (quote_eur + fee_eur))
-                        if st_status == "filled" or remaining_eur < (minq * 0.999):
-                            try: _cancel_order(market, last_order)
-                            except: pass
-                            last_order = None
-                            break
-                    time.sleep(0.35)
+                # لا تيأس قبل مهلة دنيا من لحظة أول وضع للأمر
+                if placed_at and (time.time() - placed_at) < MAKER_GIVEUP_MIN_SEC:
+                    time.sleep(ORDER_CHECK_EVERY); continue
 
+                # إذا وصلنا للحد الأقصى للصبر ولم يكتمل: نكسر الحلقة
+                if time.time() >= hard_deadline:
+                    break
+
+                time.sleep(ORDER_CHECK_EVERY)
+                continue
+
+            # لا يوجد أمر → ضع أمر جديد بقدر المتبقي
+            if remaining_eur < (minq * 0.999):
+                break
+
+            amt_base = _calc_buy_amount_base(market, remaining_eur, price)
+            if amt_base <= 0:
+                break
+
+            exp_quote = amt_base * price
+            send_message(
+                f"🧪 محاولة شراء #1 على {market}: "
+                f"amount={_format_amount(market, amt_base)} | سعر≈{_format_price(market, price)} | EUR≈{exp_quote:.2f}"
+            )
+            res = _place_limit_postonly(market, "buy", price, amount=amt_base)
+            orderId = (res or {}).get("orderId")
+            err_txt = str((res or {}).get("error","")).lower()
+
+            if orderId:
+                last_order = orderId
+                last_bid   = best_bid
+                placed_at  = time.time()
+                # بعد الوضع، نراقب فقط دون أي إعلان فشل قبل MAKER_GIVEUP_MIN_SEC
+                time.sleep(ORDER_CHECK_EVERY)
+                continue
+
+            if "insufficient balance" in err_txt or "not have sufficient balance" in err_txt:
+                remaining_eur = remaining_eur * IB_BACKOFF_FACTOR
+                time.sleep(0.2)
+                continue
+
+            # أي خطأ آخر → جرّب الدور القادم (قد يكون book/precision)
+            time.sleep(0.3)
+
+        # خرجنا من الحلقة: نظّف الطلب إن وُجد
         if last_order:
-            try: _cancel_order(market, last_order)
-            except: pass
+            _cancel_order_blocking(market, last_order)
 
     except Exception as e:
         print("open_maker_buy err:", e)
 
-    # ===== النهاية: تحقق Fallback بالرصيد =====
-    if not all_fills:
-        base_after = get_asset_available(base_sym)
-        step       = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-        delta_base = base_after - base_before
-
-        if delta_base > (step * 0.5):
-            # تم الشراء لكن API ما رجّعت fills — احسب متوسط تقريبي
-            px  = fetch_price_ws_first(market) or last_seen_price or 0.0
-            avg = float(px) if px and px > 0 else 0.0
-            cost_eur_est = delta_base * avg if avg > 0 else 0.0
-            send_message(
-                f"ℹ️ تم اكتشاف زيادة رصيد {base_sym} بمقدار ~{delta_base:.8f} "
-                f"بعد المحاولة، نعتبر الشراء ناجحًا (fallback)."
-            )
+    # ===== خلاصة: حدد النتيجة من الفلز أو الرصيد =====
+    if all_fills:
+        base_amt, quote_eur, fee_eur = totals_from_fills(all_fills)
+        if base_amt > 0:
             relax_patience_on_success(market)
-            return {
-                "amount": delta_base,
-                "avg": avg if avg > 0 else (last_seen_price or 0.0),
-                "cost_eur": cost_eur_est,
-                "fee_eur": 0.0
-            }
+            avg = (quote_eur + fee_eur) / base_amt
+            return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
 
-        bump_patience_on_fail(market)
-        send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة (سنزيد الصبر تلقائيًا لهذا الماركت).")
-        return None
+    # لو ما في fills، افحص الرصيد (قد يكون تمّ تنفيذ الأمر بعد آخر فحص)
+    base_after = get_asset_available(base_sym)
+    step       = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
+    delta_base = base_after - base_before
+    if delta_base > (step * 0.5):
+        px  = fetch_price_ws_first(market) or last_seen_price or 0.0
+        avg = float(px) if px and px > 0 else 0.0
+        cost_eur_est = delta_base * avg if avg > 0 else 0.0
+        send_message(
+            f"ℹ️ اكتشفنا شراء فعلي: زاد رصيد {base_sym} ~{delta_base:.8f}. نعتبر الشراء ناجحًا (fallback)."
+        )
+        relax_patience_on_success(market)
+        return {"amount": delta_base, "avg": avg if avg > 0 else (last_seen_price or 0.0),
+                "cost_eur": cost_eur_est, "fee_eur": 0.0}
 
-    base_amt, quote_eur, fee_eur = totals_from_fills(all_fills)
-    if base_amt <= 0:
-        bump_patience_on_fail(market)
-        return None
+    # لم يتم → زد الصبر وأبلغ برسالة واحدة
+    bump_patience_on_fail(market)
+    send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة (سنزيد الصبر تلقائيًا لهذا الماركت).")
+    return None
 
-    relax_patience_on_success(market)
-    avg = (quote_eur + fee_eur) / base_amt
-    return {"amount": base_amt, "avg": avg, "cost_eur": quote_eur + fee_eur, "fee_eur": fee_eur}
+def _cancel_order_blocking(market, orderId, wait_sec=CANCEL_WAIT_SEC):
+    try:
+        _cancel_order(market, orderId)
+    except Exception:
+        pass
+    t0 = time.time()
+    while time.time() - t0 < wait_sec:
+        try:
+            st = _fetch_order(market, orderId) or {}
+            if (st.get("status") or "").lower() in ("canceled", "filled"):
+                return st.get("status")
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return None
 
 # ========= Maker Sell =========
 def close_maker_sell(market: str, amount: float):
