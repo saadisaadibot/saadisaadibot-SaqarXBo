@@ -14,7 +14,8 @@ Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
 - مطاردة الـ Bid مع إعادة تسعير بالـ ticks أو بالعمر.
 - مضاد سبام للإشعارات + هدنة بعد الأخطاء.
 - قفل منع شراء متوازي + تجاهل تكرار /hook لنفس الماركت.
-- ✅ إصلاح دقيق لكمية الأمر (amount) وفق amountPrecision لكل سوق.
+- ✅ إصلاح دقيق لكمية الأمر (amount) وفق amountPrecision؛
+  وإذا رجعت المنصة خطأ "too many decimal digits" نقرأ المسموح من نص الخطأ ونعدّل step ديناميكيًا ثم نعيد المحاولة.
 """
 
 import os, re, time, json, math, traceback
@@ -310,6 +311,21 @@ def fetch_orderbook(market):
         pass
     return None
 
+# ========= Helper: استنتاج precision من رسالة الخطأ =========
+def _digits_from_error(err_txt: str):
+    """
+    يحاول استخراج عدد المنازل العشرية المسموحة من نصّ خطأ Bitvavo:
+    "... numbers with 2 decimal digits ..." → 2
+    يرجّع int أو None لو ما قدر.
+    """
+    try:
+        m = re.search(r"numbers with\s+(\d+)\s+decimal", err_txt, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
 # ========= Maker-only Order Helpers =========
 def _place_limit_postonly(market, side, price, amount=None):
     if amount is None or float(amount) <= 0:
@@ -537,7 +553,8 @@ def open_maker_buy(market: str, eur_amount: float):
             )
             res = _place_limit_postonly(market, "buy", target_price, amount=amt_base)
             orderId = (res or {}).get("orderId")
-            err_txt = str((res or {}).get("error","")).strip().lower()
+            raw_err = (res or {}).get("error","")
+            err_txt = str(raw_err).strip().lower()
 
             if orderId:
                 last_order = orderId
@@ -547,14 +564,37 @@ def open_maker_buy(market: str, eur_amount: float):
                 time.sleep(ORDER_CHECK_EVERY)
                 continue
 
-            # ← فشل إنشاء الأمر: لا نعيد السبام
+            # معالجة خاصة لخطأ المنازل العشرية للكمية
+            if "too many decimal digits" in err_txt and "amount" in err_txt:
+                d = _digits_from_error(str(raw_err))
+                if d is not None:
+                    new_step = 10.0 ** (-d)
+                    # حدّث الميتا وخفّض الكمية وفق الـ step الجديد
+                    meta = (MARKET_META.get(market) or {})
+                    meta["step"] = new_step
+                    MARKET_META[market] = meta
+                    amt_base = _calc_buy_amount_base(market, remaining_eur, target_price)
+                    # أعد المحاولة فوراً بكمية مقصوصة
+                    res2 = _place_limit_postonly(market, "buy", target_price, amount=amt_base)
+                    orderId2 = (res2 or {}).get("orderId")
+                    if orderId2:
+                        last_order = orderId2
+                        last_bid   = best_bid
+                        my_price   = target_price
+                        placed_at  = time.time()
+                        time.sleep(ORDER_CHECK_EVERY)
+                        continue
+                    else:
+                        raw_err = (res2 or {}).get("error","")
+                        err_txt = str(raw_err).strip().lower()
+
+            # المعالجة العامة للأخطاء (بدون سبام)
             if err_txt:
                 send_message_throttled(f"err:{market}",
-                    f"⚠️ تعذّر وضع أمر Maker: {err_txt}", min_interval=10.0)
+                    f"⚠️ تعذّر وضع أمر Maker: {raw_err}", min_interval=10.0)
             else:
                 send_message_throttled(f"err:{market}",
                     "⚠️ تعذّر وضع أمر Maker (سبب غير معروف).", min_interval=10.0)
-
             time.sleep(0.8)
             continue
 
