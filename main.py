@@ -166,9 +166,12 @@ def _decimals_from_step(step: float) -> int:
         return len(s.split(".")[1]) if "." in s else 0
     except: return 8
 
-def _tick(market):  return (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
-def _step(market):  return (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-
+def _tick(market):
+    v = (MARKET_META.get(market, {}) or {}).get("tick")
+    return v if (v and v > 0) else 1e-6
+def _step(market):
+    v = (MARKET_META.get(market, {}) or {}).get("step")
+    return v if (v and v > 0) else 1e-8
 # ===== price rounding (significant digits aware) =====
 def _round_price_sig(p, sig, direction="down"):
     p = float(p)
