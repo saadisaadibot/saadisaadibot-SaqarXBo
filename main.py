@@ -25,7 +25,7 @@ API_SECRET  = os.getenv("BITVAVO_API_SECRET")
 REDIS_URL   = os.getenv("REDIS_URL")
 RUN_LOCAL   = os.getenv("RUN_LOCAL", "0") == "1"
 PORT        = int(os.getenv("PORT", "5000"))
-
+buy_in_progress = False
 enabled         = True
 active_trade    = None
 executed_trades = []
@@ -153,7 +153,20 @@ def _cancel_all_open_orders(market, wait_each=True):
                         break
                     time.sleep(0.2)
     except: pass
-
+def _run_buy_async(market: str, eur: float):
+    global buy_in_progress
+    try:
+        res = open_maker_buy(market, eur)
+        if res:
+            # … لو بدك أرسل رسالة تلغرام هنا بتفاصيل النجاح
+            send_message(f"✅ تمت عملية شراء {market}.")
+        else:
+            send_message("⚠️ لم يكتمل شراء Maker ضمن المهلة.")
+    except Exception as e:
+        traceback.print_exc()
+        send_message(f"🐞 خطأ أثناء الشراء: {e}")
+    finally:
+        buy_in_progress = False
 # ========= Buy flow =========
 def open_maker_buy(market: str, eur_amount: float):
     eur_avail=get_eur_available()
@@ -230,14 +243,32 @@ def fetch_price_ws_first(market):
     except: return None
 
 # ========= Telegram & Flask =========
-@app.route("/hook",methods=["POST"])
+@app.route("/hook", methods=["POST"])
 def hook():
-    data=request.get_json(silent=True) or {}
-    coin=(data.get("coin") or "").upper()
-    market=f"{coin}-EUR"
-    eur=float(data.get("eur",5))
-    res=open_maker_buy(market,eur)
-    return jsonify({"ok":bool(res)})
+    global buy_in_progress
+    try:
+        data = request.get_json(silent=True) or {}
+        cmd  = (data.get("cmd") or "").strip().lower()
+        if cmd != "buy":
+            return jsonify({"ok": False, "err": "only_buy"}), 400
+
+        coin = (data.get("coin") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,15}", coin or ""):
+            return jsonify({"ok": False, "err": "bad_coin"}), 400
+        market = f"{coin}-EUR"
+
+        eur = float(data.get("eur")) if data.get("eur") is not None else None
+
+        if buy_in_progress:
+            return jsonify({"ok": False, "err": "busy"}), 429
+
+        buy_in_progress = True
+        Thread(target=_run_buy_async, args=(market, eur), daemon=True).start()
+        return jsonify({"ok": True, "msg": "buy_started", "market": market})
+    except Exception as e:
+        traceback.print_exc()
+        buy_in_progress = False
+        return jsonify({"ok": False, "err": str(e)}), 500
 
 @app.route("/",methods=["GET"])
 def home(): return "Saqer Maker Relay ✅"
