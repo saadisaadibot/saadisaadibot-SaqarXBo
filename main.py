@@ -14,6 +14,7 @@ Saqer — Maker-Only Relay Executor (Bitvavo / EUR)
 - مطاردة الـ Bid مع إعادة تسعير بالـ ticks أو بالعمر.
 - مضاد سبام للإشعارات + هدنة بعد الأخطاء.
 - قفل منع شراء متوازي + تجاهل تكرار /hook لنفس الماركت.
+- ✅ إصلاح دقيق لكمية الأمر (amount) وفق amountPrecision لكل سوق.
 """
 
 import os, re, time, json, math, traceback
@@ -63,14 +64,14 @@ BUY_MIN_EUR           = 0.0
 WS_STALENESS_SEC      = 2.0
 
 # مهلة دنيا + إلغاء مؤكد + مراقبة لاحقة
-MAKER_GIVEUP_MIN_SEC  = float(os.getenv("MAKER_GIVEUP_MIN_SEC", 12))   # لا نعلن فشل قبل هذه المدة من أول وضع أمر
-CANCEL_WAIT_SEC       = float(os.getenv("CANCEL_WAIT_SEC", 8))         # ننتظر إلغاء مؤكّد
-ORDER_CHECK_EVERY     = float(os.getenv("ORDER_CHECK_EVERY", 0.6))     # فاصل فحص الطلب
+MAKER_GIVEUP_MIN_SEC  = float(os.getenv("MAKER_GIVEUP_MIN_SEC", 12))
+CANCEL_WAIT_SEC       = float(os.getenv("CANCEL_WAIT_SEC", 8))
+ORDER_CHECK_EVERY     = float(os.getenv("ORDER_CHECK_EVERY", 0.6))
 
 # مطاردة الـ bid (Maker Buy)
-BID_CHASE_TICKS       = int(os.getenv("BID_CHASE_TICKS", 0))           # 0 = على أفضل Bid تماماً
-REPRICE_ON_TICKS      = int(os.getenv("REPRICE_ON_TICKS", 1))          # إذا ابتعدنا ≥ 1 tick عن القمة → أعد التسعير
-REPRICE_MAX_AGE_SEC   = float(os.getenv("REPRICE_MAX_AGE_SEC", 4.0))   # أعِد التسعير دوريّاً
+BID_CHASE_TICKS       = int(os.getenv("BID_CHASE_TICKS", 0))          # 0 = على أفضل Bid تماماً
+REPRICE_ON_TICKS      = int(os.getenv("REPRICE_ON_TICKS", 1))         # إعادة التسعير إذا ابتعدنا ≥ 1 tick
+REPRICE_MAX_AGE_SEC   = float(os.getenv("REPRICE_MAX_AGE_SEC", 4.0))  # إعادة تسعير دورية
 
 STOP_LADDER = [
     (0.0,  -2.0),
@@ -217,11 +218,15 @@ def _round_price(market, price):
     p = math.floor(float(price) / tick) * tick
     return round(max(tick, p), decs)
 
+# ✅ إصلاح amount بدقّة حسب amountPrecision
 def _round_amount(market, amount):
     step = (MARKET_META.get(market, {}) or {}).get("step", 1e-8)
-    a = math.floor(float(amount) / step) * step
     decs = _decimals_from_step(step)
-    return round(max(step, a), decs)
+    try:
+        a = math.floor(float(amount) / step) * step
+        return round(max(step, a), decs)
+    except Exception:
+        return round(float(amount), decs)
 
 def _format_price(market, price) -> str:
     tick = (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
@@ -235,6 +240,9 @@ def _format_amount(market, amount) -> str:
 
 def _min_quote(market): return (MARKET_META.get(market, {}) or {}).get("minQuote", 0.0)
 def _min_base(market):  return (MARKET_META.get(market, {}) or {}).get("minBase",  0.0)
+
+def _min_required_eur(market: str, price: float) -> float:
+    return max(_min_quote(market), _min_base(market) * float(price))
 
 def _tick(market: str) -> float:
     return (MARKET_META.get(market, {}) or {}).get("tick", 1e-6)
@@ -547,7 +555,7 @@ def open_maker_buy(market: str, eur_amount: float):
                 send_message_throttled(f"err:{market}",
                     "⚠️ تعذّر وضع أمر Maker (سبب غير معروف).", min_interval=10.0)
 
-            time.sleep(0.8)  # هدنة تمنع الدوران السريع
+            time.sleep(0.8)
             continue
 
         # خرجنا من الحلقة: نظّف الطلب إن وُجد
