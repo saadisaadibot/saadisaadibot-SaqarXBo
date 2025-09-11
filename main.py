@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-صقر — Mini Maker-Buy Executor (Bitvavo)
-- يستقبل أمر شراء من بوت الإشارة ويضع أمر Maker (postOnly) واحد.
-- يقبل:
-  {"market":"FLOKI-EUR","eur":5}
-  أو
-  {"cmd":"buy","coin":"FLOKI","eur":5}
+Saqer — Mini Maker-Buy (Bitvavo)
+- /hook: يستقبل أمر شراء من بوت الإشارة ويضع أمر Maker (postOnly) واحد.
+- صيغ مقبولة:
+  {"market":"GMX-EUR","eur":5}
+  {"cmd":"buy","coin":"GMX","eur":5}
+  {"coin":"GMX","eur":5}
+  {"symbol":"GMX"}
 """
 
 import os, time, hmac, hashlib, json, requests
 from flask import Flask, request, jsonify
 from uuid import uuid4
 
-# ========= ENV / App =========
 API_KEY    = os.getenv("BITVAVO_API_KEY", "")
 API_SECRET = os.getenv("BITVAVO_API_SECRET", "")
 BASE_URL   = "https://api.bitvavo.com/v2"
@@ -20,13 +20,8 @@ PORT       = int(os.getenv("PORT", "8080"))
 
 app = Flask(__name__)
 
-# ========= Bitvavo signing =========
+# ----- Bitvavo signing -----
 def sign_headers(method: str, path: str, body_str: str = "") -> dict:
-    """
-    method: "POST"|"GET"|...
-    path:   "/v2/order" يجب أن نمرر "/v2" داخل التوقيع (حسب توثيق Bitvavo)
-            بما أننا نرسل path بدون BASE_URL هنا، نمرر "/v2" + path_in_func.
-    """
     ts  = str(int(time.time() * 1000))
     msg = ts + method + ("/v2" + path) + body_str
     sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
@@ -38,7 +33,7 @@ def sign_headers(method: str, path: str, body_str: str = "") -> dict:
         "Content-Type": "application/json",
     }
 
-# ========= Core =========
+# ----- Helpers -----
 def fetch_best_bid_ask(market: str):
     try:
         j = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=6).json()
@@ -48,16 +43,13 @@ def fetch_best_bid_ask(market: str):
         return None, None
 
 def place_one_maker_buy(market: str, eur_amount: float):
-    # 1) سعر من الـ orderbook
     bid, ask = fetch_best_bid_ask(market)
     if not bid or not ask:
         return {"ok": False, "err": "no_orderbook"}
 
-    # نشتري على أفضل Bid
     price  = bid
     amount = eur_amount / price
 
-    # حضّر الجسم بصيغة JSON مضبوطة (نفسها للتوقيع والإرسال)
     body = {
         "market": market,
         "side": "buy",
@@ -66,15 +58,12 @@ def place_one_maker_buy(market: str, eur_amount: float):
         "clientOrderId": str(uuid4()),
         "price": f"{price:.8f}",
         "amount": f"{amount:.8f}",
-        "operatorId": ""  # تتركه فاضي كما طلبت
+        "operatorId": ""  # فارغ كما طلبت
     }
-    body_str = json.dumps(body, separators=(',', ':'))
+    body_str = json.dumps(body, separators=(',',':'))
+    headers  = sign_headers("POST", "/order", body_str)
+    resp     = requests.post(f"{BASE_URL}/order", headers=headers, data=body_str, timeout=10)
 
-    # 2) إرسال الطلب
-    headers = sign_headers("POST", "/order", body_str)
-    resp = requests.post(f"{BASE_URL}/order", headers=headers, data=body_str, timeout=10)
-
-    # 3) نتيجة واضحة
     try:
         j = resp.json()
     except Exception:
@@ -83,50 +72,44 @@ def place_one_maker_buy(market: str, eur_amount: float):
     if j.get("orderId"):
         return {"ok": True, "request": body, "response": j}
     else:
-        return {"ok": False, "request": body, "response": j, "err": j.get("error", "unknown")}
+        return {"ok": False, "request": body, "response": j, "err": j.get("error","unknown")}
 
-# ========= HTTP =========
+# ----- HTTP -----
 @app.route("/", methods=["GET"])
 def home():
     return "Saqer Mini Maker-Buy ✅"
 
 @app.route("/hook", methods=["POST"])
 def hook():
-    """
-    يقبل:
-      {"market":"FLOKI-EUR","eur":5}
-      أو {"cmd":"buy","coin":"FLOKI","eur":5}
-    """
     data = request.get_json(silent=True) or {}
+    raw  = {"received": data}  # نرجّعها للتشخيص
 
-    # تطبيع الإدخال
+    # استخرج الماركت من أي صيغة
     market = (data.get("market") or "").strip().upper()
     if not market:
-        # نمط بوت الإشارة
+        coin = (data.get("coin") or data.get("symbol") or data.get("asset") or "").strip().upper()
         cmd  = (data.get("cmd") or "").strip().lower()
-        coin = (data.get("coin") or "").strip().upper()
-        if cmd == "buy" and coin:
+        if coin:
+            market = f"{coin}-EUR"
+        elif cmd == "buy" and coin:
             market = f"{coin}-EUR"
 
-    if not market.endswith("-EUR"):
-        return jsonify({"ok": False, "err": "bad_or_missing_market"}), 400
+    if not market or not market.endswith("-EUR"):
+        return jsonify({"ok": False, "err": "no_market_detected", **raw}), 200
 
+    # EUR
     try:
         eur = float(data.get("eur")) if data.get("eur") is not None else 5.0
-        if eur <= 0: 
-            return jsonify({"ok": False, "err": "eur_must_be_positive"}), 400
+        if eur <= 0:
+            return jsonify({"ok": False, "err": "eur_must_be_positive", **raw}), 200
     except Exception:
-        return jsonify({"ok": False, "err": "eur_not_numeric"}), 400
+        return jsonify({"ok": False, "err": "eur_not_numeric", **raw}), 200
 
     if not API_KEY or not API_SECRET:
-        return jsonify({"ok": False, "err": "missing_api_keys"}), 500
+        return jsonify({"ok": False, "err": "missing_api_keys", **raw}), 200
 
-    try:
-        result = place_one_maker_buy(market, eur)
-        return jsonify(result), (200 if result.get("ok") else 200)
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)}), 500
+    result = place_one_maker_buy(market, eur)
+    return jsonify({**raw, **result}), 200
 
-# ========= Main =========
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
