@@ -4,10 +4,6 @@ Saqer — Maker-Only (Bitvavo / EUR) — Telegram (BUY / SELL / CANCEL فقط)
 - /buy COIN     → فتح أمر شراء Maker (كل الرصيد المتاح مع هامش بسيط)
 - /sell COIN    → بيع Maker (كل الرصيد المتاح من العملة)
 - /cancel       → إلغاء واحد يلغي كل أوامر العملة النشطة الحالية
-
-ملاحظات:
-- صفقة واحدة فقط في نفس الوقت (نتتبعها في OPEN_ORDERS).
-- تصحيح amountPrecision باستخدام Decimal لالتزام عدد الخانات الصحيح (مثل PUMP-EUR = خانتين).
 """
 
 import os, re, time, json, hmac, hashlib, math, requests
@@ -28,15 +24,15 @@ PORT        = int(os.getenv("PORT", "8080"))
 
 BASE_URL    = "https://api.bitvavo.com/v2"
 
-HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))        # اترك هامش بسيط من EUR
-CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "8.0"))      # مهلة تأكيد الإلغاء
-SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))     # متابعة قصيرة بعد الإرسال
+HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))
+CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "8.0"))
+SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))
 
 # كاش للماركتات
 MARKET_MAP  = {}   # "GMX" -> "GMX-EUR"
 MARKET_META = {}   # "GMX-EUR" -> {"priceSig","amountDecimals","minQuote","minBase"}
 
-# تتبع أمر واحد نشط (شراء) لكل ماركت — نحصرها بواحدة فعليًا
+# تتبع أمر واحد نشط
 OPEN_ORDERS = {}   # market -> {"orderId": "...", "clientOrderId": "...", "amount_init": float}
 
 # ========= Telegram =========
@@ -79,25 +75,22 @@ def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
         return {"error": r.text}
 
 # ========= Markets / Meta =========
-def _infer_amount_decimals(ap_val, step_val):
-    # ap_val قد يكون int أو "2" كنص. step_val قد يكون 0.01 أو "0.01".
+def _as_int(v, default=None):
     try:
-        if ap_val is not None:
-            ap_int = int(str(ap_val))
-            if 0 <= ap_int <= 18:
-                return ap_int
+        if isinstance(v, bool): return default
+        if isinstance(v, (int,)): return int(v)
+        s = str(v).strip()
+        if s.isdigit(): return int(s)
+        # أحيانًا يرجع كـ "2.0"
+        if "." in s and s.replace(".","",1).isdigit():
+            f = float(s); 
+            if abs(f - int(f)) < 1e-9: return int(f)
     except Exception:
         pass
-    try:
-        if step_val is not None:
-            s = str(step_val)
-            if "." in s:
-                return len(s.split(".")[1].rstrip("0"))
-    except Exception:
-        pass
-    return 8
+    return default
 
 def load_markets_once():
+    """نقرأ amountPrecision كعدد منازل عشرية مباشرة (مثلاً PUMP-EUR = 2)."""
     global MARKET_MAP, MARKET_META
     if MARKET_MAP and MARKET_META: return
     rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
@@ -107,19 +100,23 @@ def load_markets_once():
         market = r.get("market"); base = (r.get("base") or "").upper()
         if not base or not market: continue
 
-        priceSig       = int(r.get("pricePrecision", 6) or 6)  # significant digits
-        amountPrecision= r.get("amountPrecision", None)
-        amountStep     = r.get("amountStep", r.get("amountStepSize", None))  # احتياطي
-        minQuote       = float(r.get("minOrderInQuoteAsset", 0) or 0.0)
-        minBase        = float(r.get("minOrderInBaseAsset",  0) or 0.0)
-
-        amountDecimals = _infer_amount_decimals(amountPrecision, amountStep)
+        priceSig = _as_int(r.get("pricePrecision"), 6) or 6
+        # أهم سطرين:
+        amountDecimals = _as_int(r.get("amountPrecision"), None)
+        if amountDecimals is None:
+            # احتياط إن API تغيّر: جرّب amountStep أو step
+            step = r.get("amountStep") or r.get("amountStepSize") or r.get("step")
+            if step:
+                s = str(step)
+                amountDecimals = len(s.split(".")[1].rstrip("0")) if "." in s else 0
+            else:
+                amountDecimals = 8  # افتراض آمن
 
         meta[market] = {
-            "priceSig":       priceSig,
-            "amountDecimals": amountDecimals,
-            "minQuote":       minQuote,
-            "minBase":        minBase,
+            "priceSig":       int(priceSig),
+            "amountDecimals": int(amountDecimals),
+            "minQuote":       float(r.get("minOrderInQuoteAsset", 0) or 0.0),
+            "minBase":        float(r.get("minOrderInBaseAsset",  0) or 0.0),
         }
         m[base] = market
     MARKET_MAP, MARKET_META = m, meta
@@ -169,13 +166,13 @@ def get_best_bid_ask(market: str) -> tuple[float, float]:
     return bid, ask
 
 # ========= Place Maker =========
-def place_limit_postonly(market: str, side: str, price: float, amount: float):
+def place_limit_postonly(market: str, side: str, price: float, amount_num: float):
     body = {
         "market": market, "side": side, "orderType": "limit", "postOnly": True,
         "clientOrderId": str(uuid4()),
         "price": fmt_price_sig(market, price),
-        "amount": fmt_amount(market, amount),
-        "operatorId": ""  # كما في نسختك القديمة
+        "amount": fmt_amount(market, amount_num),
+        "operatorId": ""
     }
     ts  = str(int(time.time() * 1000))
     sig = _sign(ts, "POST", "/v2/order", json.dumps(body, separators=(',',':')))
@@ -209,10 +206,8 @@ def buy_open(market: str, eur_amount: float | None):
     price  = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
     amount = float(spend) / float(price)
 
-    # صياغة amount بالعدد الصحيح من الخانات (مع القصّ لأسفل)
-    amount_str = fmt_amount(market, amount)
-    amount_num = float(amount_str)
-
+    # صياغة amount حسب عدد الخانات الحقيقي لهذا السوق
+    amount_num = float(fmt_amount(market, amount))
     if amount_num < minb:
         return {"ok": False, "err": f"minBase={minb}"}
 
@@ -237,10 +232,7 @@ def maker_sell(market: str, amount: float | None):
     else:
         amt = float(amount)
 
-    # قصّ كمية البيع حسب دقة الماركت
-    amt_str = fmt_amount(market, amt)
-    amt_num = float(amt_str)
-
+    amt_num = float(fmt_amount(market, amt))
     if amt_num <= 0: return {"ok": False, "err": f"No {base} to sell"}
 
     minb = _min_base(market)
@@ -251,7 +243,6 @@ def maker_sell(market: str, amount: float | None):
     body, resp = place_limit_postonly(market, "sell", price, amt_num)
     if (resp or {}).get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
-    # متابعة قصيرة
     t0 = time.time(); oid = resp.get("orderId")
     while time.time()-t0 < SHORT_FOLLOW_SEC and oid:
         st = bv_request("GET", f"/order?market={market}&orderId={oid}")
@@ -261,7 +252,6 @@ def maker_sell(market: str, amount: float | None):
 
 # ========= CANCEL (أمر واحد) =========
 def cancel_all_for_active():
-    """يلغي كل أوامر الماركت النشط (إن وجد) بأمر واحد."""
     if not OPEN_ORDERS:
         return {"ok": False, "err": "no_open_order"}
     market = next(iter(OPEN_ORDERS.keys()))
@@ -284,7 +274,7 @@ def _norm_market(arg: str) -> str | None:
     if COIN_RE.match(s): return f"{s}-EUR"
     return None
 
-# ========= Telegram Webhook (3 أوامر فقط) =========
+# ========= Telegram Webhook =========
 @app.route("/tg", methods=["POST"])
 def tg_webhook():
     upd = request.get_json(silent=True) or {}
@@ -304,7 +294,7 @@ def tg_webhook():
             if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
             if market in OPEN_ORDERS:
                 tg_send(f"⛔ يوجد أمر شراء مفتوح: {OPEN_ORDERS[market]}"); return jsonify(ok=True)
-            res = buy_open(market, eur_amount=None)  # كل الرصيد المتاح (مع الهامش)
+            res = buy_open(market, eur_amount=None)
             tg_send(("✅ BUY تم الإرسال" if res.get("ok") else "⚠️ BUY فشل") + f" — {market}\n"
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
@@ -314,7 +304,7 @@ def tg_webhook():
             if len(parts)<2: tg_send("صيغة: /sell COIN"); return jsonify(ok=True)
             market=_norm_market(parts[1].upper())
             if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
-            res = maker_sell(market, amount=None)  # يبيع كامل الرصيد
+            res = maker_sell(market, amount=None)
             tg_send(("✅ SELL تم الإرسال" if res.get("ok") else "⚠️ SELL فشل") + f" — {market}\n"
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
