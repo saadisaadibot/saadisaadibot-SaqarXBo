@@ -1,48 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram (BUY / SELL / CANCEL) + Auto-Chase + Strict Cancel
-- /buy COIN      → يفتح شراء Maker بكل الرصيد المتاح (مع هامش) ويطارد السعر تلقائياً
-- /sell COIN     → يبيع Maker كل الرصيد من العملة
-- /cancel        → يلغي كل أوامر الماركت النشط ويتحقق حتى تزول فعلاً
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram (BUY / SELL / CANCEL فقط)
+- /buy COIN     → فتح أمر شراء Maker (كل الرصيد المتاح مع هامش بسيط)
+- /sell COIN    → بيع Maker (كل الرصيد المتاح من العملة)
+- /cancel       → إلغاء واحد يلغي كل أوامر العملة النشطة الحالية
 
 ملاحظات:
-- مطاردة السعر: تعيد التسعير كل ثانية تقريباً إلى أفضل Bid (مع ضبط دقة السعر)، حتى الامتلاء أو انتهاء المهلة.
-- إلغاء واحد فقط: يرسل DELETE /orders?market=... ثم يفحص /ordersOpen و/أو حالة orderId للتأكد.
-- معالجة دقيقة لمنازل كمية الـ amount (amountPrecision) لتفادي خطأ "too many decimal digits".
+- صفقة واحدة فقط في نفس الوقت (نتتبعها في OPEN_ORDERS).
+- تصحيح amountPrecision باستخدام Decimal لالتزام عدد الخانات الصحيح (مثل PUMP-EUR = خانتين).
 """
 
-import os, re, time, json, hmac, hashlib, math, threading, requests
+import os, re, time, json, hmac, hashlib, math, requests
 from uuid import uuid4
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 # ========= Boot / ENV =========
 load_dotenv()
 app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID     = os.getenv("CHAT_ID", "").strip()
+CHAT_ID     = os.getenv("CHAT_ID", "").strip()  # اختياري لتقييد المحادثة
 API_KEY     = os.getenv("BITVAVO_API_KEY", "").strip()
 API_SECRET  = os.getenv("BITVAVO_API_SECRET", "").strip()
 PORT        = int(os.getenv("PORT", "8080"))
 
 BASE_URL    = "https://api.bitvavo.com/v2"
 
-HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))  # اترك هامش بسيط للرسوم
-CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "12.0"))
-SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))
+HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))        # اترك هامش بسيط من EUR
+CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "8.0"))      # مهلة تأكيد الإلغاء
+SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))     # متابعة قصيرة بعد الإرسال
 
-# مطاردة السعر
-CHASE_REPRICE_EVERY = float(os.getenv("CHASE_REPRICE_EVERY", "1.0"))
-CHASE_TIMEOUT_SEC   = float(os.getenv("CHASE_TIMEOUT_SEC", "90.0"))
-
-# ========= Markets Cache =========
+# كاش للماركتات
 MARKET_MAP  = {}   # "GMX" -> "GMX-EUR"
-MARKET_META = {}   # "GMX-EUR" -> {"priceSig":6,"amountDecimals":8,"minQuote":5.0,"minBase":0.0001}
+MARKET_META = {}   # "GMX-EUR" -> {"priceSig","amountDecimals","minQuote","minBase"}
 
-# ========= Open Orders (واحدة فعلياً) =========
-OPEN_ORDERS = {}    # market -> {"orderId","clientOrderId","amount_init"}
-CHASE_THREADS = {}  # market -> thread
+# تتبع أمر واحد نشط (شراء) لكل ماركت — نحصرها بواحدة فعليًا
+OPEN_ORDERS = {}   # market -> {"orderId": "...", "clientOrderId": "...", "amount_init": float}
 
 # ========= Telegram =========
 def tg_send(text: str):
@@ -84,6 +79,24 @@ def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
         return {"error": r.text}
 
 # ========= Markets / Meta =========
+def _infer_amount_decimals(ap_val, step_val):
+    # ap_val قد يكون int أو "2" كنص. step_val قد يكون 0.01 أو "0.01".
+    try:
+        if ap_val is not None:
+            ap_int = int(str(ap_val))
+            if 0 <= ap_int <= 18:
+                return ap_int
+    except Exception:
+        pass
+    try:
+        if step_val is not None:
+            s = str(step_val)
+            if "." in s:
+                return len(s.split(".")[1].rstrip("0"))
+    except Exception:
+        pass
+    return 8
+
 def load_markets_once():
     global MARKET_MAP, MARKET_META
     if MARKET_MAP and MARKET_META: return
@@ -93,16 +106,20 @@ def load_markets_once():
         if r.get("quote") != "EUR": continue
         market = r.get("market"); base = (r.get("base") or "").upper()
         if not base or not market: continue
-        # pricePrecision = significant digits للسعر
-        priceSig = int(r.get("pricePrecision", 6) or 6)
-        # amountPrecision = عدد المنازل العشرية للكمية (هنا المفتاح لمعالجة خطأ PUMP)
-        ap = r.get("amountPrecision", 8)
-        amountDecimals = int(ap) if isinstance(ap, int) else 8
+
+        priceSig       = int(r.get("pricePrecision", 6) or 6)  # significant digits
+        amountPrecision= r.get("amountPrecision", None)
+        amountStep     = r.get("amountStep", r.get("amountStepSize", None))  # احتياطي
+        minQuote       = float(r.get("minOrderInQuoteAsset", 0) or 0.0)
+        minBase        = float(r.get("minOrderInBaseAsset",  0) or 0.0)
+
+        amountDecimals = _infer_amount_decimals(amountPrecision, amountStep)
+
         meta[market] = {
-            "priceSig": priceSig,
+            "priceSig":       priceSig,
             "amountDecimals": amountDecimals,
-            "minQuote": float(r.get("minOrderInQuoteAsset", 0) or 0.0),
-            "minBase":  float(r.get("minOrderInBaseAsset",  0) or 0.0),
+            "minQuote":       minQuote,
+            "minBase":        minBase,
         }
         m[base] = market
     MARKET_MAP, MARKET_META = m, meta
@@ -116,7 +133,6 @@ def _amount_decimals(market: str) -> int: return int(_meta(market).get("amountDe
 def _min_quote(market: str) -> float: return float(_meta(market).get("minQuote", 0.0))
 def _min_base(market: str) -> float:  return float(_meta(market).get("minBase", 0.0))
 
-# ========= Formatting / Rounding =========
 def round_price_sig_down(price: float, sig: int) -> float:
     if price <= 0 or sig <= 0: return 0.0
     exp = math.floor(math.log10(abs(price)))
@@ -132,12 +148,13 @@ def fmt_price_sig(market: str, price: float) -> str:
 def fmt_amount(market: str, amount: float) -> str:
     dec = _amount_decimals(market)
     if dec < 0: dec = 0
-    # نقطع لأسفل بدقة dec
-    factor = 10 ** dec
-    a = math.floor(float(amount) * factor) / factor
+    q = Decimal(10) ** -dec  # 10^-dec
+    try:
+        a = (Decimal(str(amount))).quantize(q, rounding=ROUND_DOWN)  # قصّ لأسفل
+    except (InvalidOperation, Exception):
+        a = (Decimal(0)).quantize(q, rounding=ROUND_DOWN)
     return f"{a:.{dec}f}"
 
-# ========= Helpers =========
 def get_balance(symbol: str) -> float:
     bals = bv_request("GET", "/balance")
     if isinstance(bals, list):
@@ -151,13 +168,14 @@ def get_best_bid_ask(market: str) -> tuple[float, float]:
     bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     return bid, ask
 
+# ========= Place Maker =========
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
     body = {
         "market": market, "side": side, "orderType": "limit", "postOnly": True,
         "clientOrderId": str(uuid4()),
         "price": fmt_price_sig(market, price),
         "amount": fmt_amount(market, amount),
-        "operatorId": ""
+        "operatorId": ""  # كما في نسختك القديمة
     }
     ts  = str(int(time.time() * 1000))
     sig = _sign(ts, "POST", "/v2/order", json.dumps(body, separators=(',',':')))
@@ -171,47 +189,6 @@ def place_limit_postonly(market: str, side: str, price: float, amount: float):
         return body, r.json()
     except Exception:
         return body, {"error": r.text}
-
-# ========= Strict Cancel =========
-def _poll_status_until(market: str, orderId: str, deadline_ts: float,
-                       initial_sleep=0.20, max_sleep=1.2):
-    last = None
-    time.sleep(max(0.0, initial_sleep))
-    sleep = 0.25
-    while time.time() < deadline_ts:
-        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
-        last = st if isinstance(st, dict) else None
-        s = (st or {}).get("status", "").lower()
-        if s in ("canceled", "filled"):
-            return True, s, last
-        time.sleep(sleep)
-        sleep = min(max_sleep, sleep * 1.5)
-    st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
-    last = st if isinstance(st, dict) else last
-    s = (st or {}).get("status", "").lower()
-    return (s in ("canceled", "filled")), s or "unknown", last
-
-def strict_cancel_all(market: str, known_order_id: str | None, wait_sec=CANCEL_WAIT_SEC):
-    # أرسل إلغاء شامل للماركت
-    _ = bv_request("DELETE", f"/orders?market={market}")
-    deadline = time.time() + wait_sec
-
-    # إن كنا نعرف orderId، راقبه حتى يصبح canceled/filled
-    if known_order_id:
-        ok, st, last = _poll_status_until(market, known_order_id, deadline)
-        if ok:
-            return True, st, last
-
-    # تحقق من /ordersOpen حتى تُفرغ
-    while time.time() < deadline:
-        open_list = bv_request("GET", f"/ordersOpen?market={market}")
-        if isinstance(open_list, list) and len(open_list) == 0:
-            return True, "canceled", {"ordersOpen": []}
-        time.sleep(0.3)
-
-    # محاولة أخيرة سريعة
-    open_list = bv_request("GET", f"/ordersOpen?market={market}")
-    return (isinstance(open_list, list) and len(open_list) == 0), "unknown", {"ordersOpen": open_list}
 
 # ========= BUY / SELL =========
 def buy_open(market: str, eur_amount: float | None):
@@ -229,23 +206,23 @@ def buy_open(market: str, eur_amount: float | None):
         return {"ok": False, "err": f"minQuote={minq:.4f} EUR, have {spend:.2f}"}
 
     bid, ask = get_best_bid_ask(market)
-    # افضل سعر للشراء maker: عند أفضل bid أو أقل بقليل من ask (مع بريدج بسيط)
-    price  = round_price_sig_down(min(bid, ask*(1 - 1e-6)), _price_sig(market))
-    amount = spend / price
-    # صياغة الكمية بدقة amountPrecision
-    amt_str = fmt_amount(market, amount)
-    amount  = float(amt_str)
+    price  = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
+    amount = float(spend) / float(price)
 
-    if amount < minb:
+    # صياغة amount بالعدد الصحيح من الخانات (مع القصّ لأسفل)
+    amount_str = fmt_amount(market, amount)
+    amount_num = float(amount_str)
+
+    if amount_num < minb:
         return {"ok": False, "err": f"minBase={minb}"}
 
-    body, resp = place_limit_postonly(market, "buy", price, amount)
+    body, resp = place_limit_postonly(market, "buy", price, amount_num)
     if (resp or {}).get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
 
     oid  = resp.get("orderId")
     coid = body.get("clientOrderId")
-    OPEN_ORDERS[market] = {"orderId": oid, "clientOrderId": coid, "amount_init": amount}
+    OPEN_ORDERS[market] = {"orderId": oid, "clientOrderId": coid, "amount_init": amount_num}
     return {"ok": True, "request": body, "response": resp, "open": OPEN_ORDERS[market]}
 
 def maker_sell(market: str, amount: float | None):
@@ -259,22 +236,21 @@ def maker_sell(market: str, amount: float | None):
                     amt = float(b.get("available",0) or 0.0); break
     else:
         amt = float(amount)
-    if amt <= 0: return {"ok": False, "err": f"No {base} to sell"}
 
-    # صياغة بدقة amountPrecision
+    # قصّ كمية البيع حسب دقة الماركت
     amt_str = fmt_amount(market, amt)
-    amt     = float(amt_str)
+    amt_num = float(amt_str)
+
+    if amt_num <= 0: return {"ok": False, "err": f"No {base} to sell"}
 
     minb = _min_base(market)
-    if amt < minb: return {"ok": False, "err": f"minBase={minb}"}
+    if amt_num < minb: return {"ok": False, "err": f"minBase={minb}"}
 
     bid, ask = get_best_bid_ask(market)
     price = round_price_sig_down(max(ask, bid*(1+1e-6)), _price_sig(market))
-
-    body, resp = place_limit_postonly(market, "sell", price, amt)
+    body, resp = place_limit_postonly(market, "sell", price, amt_num)
     if (resp or {}).get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
-
     # متابعة قصيرة
     t0 = time.time(); oid = resp.get("orderId")
     while time.time()-t0 < SHORT_FOLLOW_SEC and oid:
@@ -283,74 +259,21 @@ def maker_sell(market: str, amount: float | None):
         time.sleep(0.25)
     return {"ok": True, "request": body, "response": resp}
 
-# ========= Auto Chase =========
-def chase_buy_until_filled(market: str):
-    """يطارد السعر للأمر المفتوح على هذا الماركت حتى الامتلاء أو انتهاء المهلة."""
-    info = OPEN_ORDERS.get(market)
-    if not info: return
-    start = time.time()
-
-    while time.time() - start < CHASE_TIMEOUT_SEC:
-        oid = (OPEN_ORDERS.get(market) or {}).get("orderId")
-        if not oid: return
-
-        # حالة الطلب الحالية
-        st = bv_request("GET", f"/order?market={market}&orderId={oid}")
-        s = (st or {}).get("status","").lower()
-        if s == "filled":
-            OPEN_ORDERS.pop(market, None)
-            tg_send(f"✅ تم تنفيذ الشراء — {market}")
-            return
-
-        # كمية متبقية
-        try:
-            amt_rem = float((st or {}).get("amountRemaining", st.get("amount","0")) or 0.0)
-        except Exception:
-            amt_rem = (OPEN_ORDERS.get(market) or {}).get("amount_init", 0.0)
-        if amt_rem <= 0:
-            amt_rem = (OPEN_ORDERS.get(market) or {}).get("amount_init", 0.0)
-
-        # إعادة تسعير: ألغِ الكل ثم ضع أمر جديد عند أفضل Bid الحالي
-        ok, final, _ = strict_cancel_all(market, oid, wait_sec=CANCEL_WAIT_SEC)
-        if final == "filled":
-            OPEN_ORDERS.pop(market, None)
-            tg_send(f"✅ تم تنفيذ الشراء أثناء الإلغاء — {market}")
-            return
-        if not ok and final not in ("canceled", "filled"):
-            # جرّب جولة أخرى بعد مهلة صغيرة
-            time.sleep(0.4)
-            continue
-
-        bid, ask = get_best_bid_ask(market)
-        new_price = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
-        # صياغة amount المتبقية بالدقة الصحيحة
-        amt_str = fmt_amount(market, max(amt_rem, _min_base(market)))
-        amt_rem = float(amt_str)
-
-        body, resp = place_limit_postonly(market, "buy", new_price, amt_rem)
-        if (resp or {}).get("error"):
-            tg_send(f"⚠️ Reprice فشل — {market}\n{json.dumps({'request':body,'response':resp}, ensure_ascii=False)}")
-            time.sleep(CHASE_REPRICE_EVERY)
-            continue
-
-        # خزّن الـ orderId الجديد
-        OPEN_ORDERS[market] = {"orderId": resp.get("orderId"), "clientOrderId": body.get("clientOrderId"), "amount_init": amt_rem}
-
-        # انتظر قليلًا قبل الجولة التالية
-        time.sleep(CHASE_REPRICE_EVERY)
-
-    tg_send(f"⚠️ انتهت مهلة المطاردة بدون امتلاء — {market}")
-
 # ========= CANCEL (أمر واحد) =========
 def cancel_all_for_active():
+    """يلغي كل أوامر الماركت النشط (إن وجد) بأمر واحد."""
     if not OPEN_ORDERS:
         return {"ok": False, "err": "no_open_order"}
-    market, info = next(iter(OPEN_ORDERS.items()))
-    ok, st, last = strict_cancel_all(market, info.get("orderId"), wait_sec=CANCEL_WAIT_SEC)
-    if ok:
-        OPEN_ORDERS.pop(market, None)
-        return {"ok": True, "status": st, "state": last}
-    return {"ok": False, "err": f"not_cleared (status={st})", "state": last}
+    market = next(iter(OPEN_ORDERS.keys()))
+    _ = bv_request("DELETE", f"/orders?market={market}")
+    t0 = time.time()
+    while time.time()-t0 < CANCEL_WAIT_SEC:
+        open_list = bv_request("GET", f"/ordersOpen?market={market}")
+        if isinstance(open_list, list) and len(open_list) == 0:
+            OPEN_ORDERS.pop(market, None)
+            return {"ok": True, "msg": f"canceled_all_for_{market}"}
+        time.sleep(0.25)
+    return {"ok": False, "err": "not_cleared", "still_open": bv_request("GET", f"/ordersOpen?market={market}")}
 
 # ========= Helpers =========
 COIN_RE = re.compile(r"^[A-Z0-9]{2,15}$")
@@ -381,15 +304,9 @@ def tg_webhook():
             if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
             if market in OPEN_ORDERS:
                 tg_send(f"⛔ يوجد أمر شراء مفتوح: {OPEN_ORDERS[market]}"); return jsonify(ok=True)
-
-            res = buy_open(market, eur_amount=None)  # كل الرصيد (مع هامش)
-            tg_send(("✅ BUY أُرسل" if res.get("ok") else "⚠️ BUY فشل") + f" — {market}\n{json.dumps(res, ensure_ascii=False)}")
-
-            # إن نجح الفتح، شغّل مطاردة تلقائيًا
-            if res.get("ok") and market not in CHASE_THREADS:
-                th = threading.Thread(target=chase_buy_until_filled, args=(market,), daemon=True)
-                CHASE_THREADS[market] = th
-                th.start()
+            res = buy_open(market, eur_amount=None)  # كل الرصيد المتاح (مع الهامش)
+            tg_send(("✅ BUY تم الإرسال" if res.get("ok") else "⚠️ BUY فشل") + f" — {market}\n"
+                    f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
         if low.startswith("/sell"):
@@ -397,8 +314,9 @@ def tg_webhook():
             if len(parts)<2: tg_send("صيغة: /sell COIN"); return jsonify(ok=True)
             market=_norm_market(parts[1].upper())
             if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
-            res = maker_sell(market, amount=None)
-            tg_send(("✅ SELL أُرسل" if res.get("ok") else "⚠️ SELL فشل") + f" — {market}\n{json.dumps(res, ensure_ascii=False)}")
+            res = maker_sell(market, amount=None)  # يبيع كامل الرصيد
+            tg_send(("✅ SELL تم الإرسال" if res.get("ok") else "⚠️ SELL فشل") + f" — {market}\n"
+                    f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
         if low.startswith("/cancel"):
@@ -416,7 +334,7 @@ def tg_webhook():
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker (BUY / SELL / CANCEL + Auto-Chase + Strict Cancel) ✅"
+    return "Saqer Maker (BUY / SELL / CANCEL) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
