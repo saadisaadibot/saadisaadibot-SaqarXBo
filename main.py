@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, hardened + precision-parsers)
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, hardened + smart-precision)
 الأوامر:
 - "اشتري COIN [EUR]"
 - "بيع COIN [AMOUNT]"
@@ -57,21 +57,15 @@ def _sign(ts, method, path, body=""):
     return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
-    """
-    يُعيد JSON الخام (dict/list) من Bitvavo أو dict فيه 'error' عند الفشل النصّي.
-    GET/DELETE بدون body؛ POST/PUT مع body.
-    """
+    """يرجع JSON الخام من Bitvavo أو dict فيه 'error' عند الفشل النصّي."""
     url = f"{BASE_URL}{path}"
     ts  = str(int(time.time() * 1000))
-
     m = method.upper()
     if m in ("GET", "DELETE"):
-        body_str = ""
-        json_payload = None
+        body_str = ""; payload = None
     else:
         body_str = json.dumps(body or {}, separators=(',',':'))
-        json_payload = (body or {})
-
+        payload  = (body or {})
     headers = {
         "Bitvavo-Access-Key": API_KEY,
         "Bitvavo-Access-Timestamp": ts,
@@ -79,49 +73,46 @@ def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
         "Bitvavo-Access-Window": "10000",
         "Content-Type": "application/json",
     }
-
-    r = requests.request(m, url, headers=headers, json=json_payload, timeout=timeout)
+    r = requests.request(m, url, headers=headers, json=payload, timeout=timeout)
     try:
         return r.json()
     except Exception:
         return {"error": r.text, "status_code": r.status_code}
 
-# --- helpers for precisions (جديدة) ---
+# ========= Precision helpers =========
 def _count_decimals_of_step(step: float) -> int:
     s = f"{step:.16f}".rstrip("0").rstrip(".")
-    if "." in s:
-        return len(s.split(".", 1)[1])
+    if "." in s: return len(s.split(".", 1)[1])
     return 0
 
-def _parse_amount_precision(ap) -> tuple[int, float]:
+def _parse_amount_precision(ap, min_base_hint: float | int = 0) -> tuple[int, float]:
     """
     يرجع (amountDecimals, step)
-    ap قد يكون:
-      - عدد منازل (int مثل 8) → step = 10^-8
-      - خطوة مباشرة (float مثل 1 أو 0.5 أو 0.01) → نستخرج المنازل من الخطوة
+    - إذا ap عدد صحيح → اعتبره عدد منازل (decimals) -> step=10^-ap
+      *استثناء*: لو ap ∈ {0,1} و min_base_hint ≥ 1 → اعتبرها سوق step=1 (كميات صحيحة)
+    - إذا ap عشري (0.01/0.5/1.0) → اعتبره step مباشر واستنبط عدد المنازل منه
     """
     try:
         v = float(ap)
-        # إذا كان ليس عددًا صحيحًا (0.01/0.5) أو >= 1 (خطوة 1 مثلاً) → خطوة مباشرة
-        if not float(v).is_integer() or v >= 1.0:
-            step = float(v)
-            decs = _count_decimals_of_step(step)
+        if float(v).is_integer():
+            iv = int(v)
+            if iv in (0, 1) and float(min_base_hint) >= 1.0:
+                return 0, 1.0  # أسواق مثل PUMP: كمية صحيحة فقط
+            decs = max(0, iv)
+            step = float(Decimal(1) / (Decimal(10) ** decs))
             return decs, step
-        # v عدد صحيح = عدد منازل
-        decs = int(v)
-        step = float(Decimal(1) / (Decimal(10) ** decs))
+        # غير صحيح → خطوة مباشرة
+        step = float(v)
+        decs = _count_decimals_of_step(step)
         return decs, step
     except Exception:
         return 8, 1e-8
 
 def _parse_price_precision(pp) -> int:
-    """
-    pricePrecision قد تأتي كعدد منازل أو كخطوة؛ نرجع عدد المنازل.
-    """
+    """pricePrecision قد تكون عدد منازل أو خطوة؛ رجّع عدد المنازل."""
     try:
         v = float(pp)
         if not float(v).is_integer() or v < 1.0:
-            # خطوة (مثل 0.0001) → حولها لعدد منازل
             return _count_decimals_of_step(v)
         return int(v)
     except Exception:
@@ -130,30 +121,27 @@ def _parse_price_precision(pp) -> int:
 def load_markets_once():
     """يجلب /markets مرة واحدة ويثبت دقّات السعر/الكمية والحدود الدنيا."""
     global MARKET_MAP, MARKET_META
-    if MARKET_MAP and MARKET_META:
-        return
+    if MARKET_MAP and MARKET_META: return
     rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
     m, meta = {}, {}
     for r in rows:
-        if r.get("quote") != "EUR":
-            continue
-        market = r.get("market")
-        base   = (r.get("base") or "").upper()
-        if not base or not market:
-            continue
+        if r.get("quote") != "EUR": continue
+        market = r.get("market"); base = (r.get("base") or "").upper()
+        if not base or not market: continue
 
+        min_quote = float(r.get("minOrderInQuoteAsset", 0) or 0.0)
+        min_base  = float(r.get("minOrderInBaseAsset",  0) or 0.0)
         price_dec = _parse_price_precision(r.get("pricePrecision", 6))
-        amt_dec, step = _parse_amount_precision(r.get("amountPrecision", 8))
+        amt_dec, step = _parse_amount_precision(r.get("amountPrecision", 8), min_base)
 
         meta[market] = {
             "priceDecimals": price_dec,
             "amountDecimals": amt_dec,
             "step": float(step),
-            "minQuote": float(r.get("minOrderInQuoteAsset", 0) or 0.0),
-            "minBase":  float(r.get("minOrderInBaseAsset",  0) or 0.0),
+            "minQuote": min_quote,
+            "minBase":  min_base,
         }
         m[base] = market
-
     MARKET_MAP, MARKET_META = m, meta
 
 def coin_to_market(coin: str) -> str | None:
@@ -167,7 +155,6 @@ def _min_quote(market: str) -> float: return float(_meta(market).get("minQuote",
 def _min_base(market: str) -> float:  return float(_meta(market).get("minBase", 0.0))
 
 def fmt_price_dec(market: str, price: float | Decimal) -> str:
-    """تنسيق السعر على عدد منازل السعر المسموح (ROUND_DOWN)."""
     decs = _price_decimals(market)
     q = Decimal(10) ** -decs
     p = (Decimal(str(price))).quantize(q, rounding=ROUND_DOWN)
@@ -183,10 +170,8 @@ def round_amount_down(market: str, amount: float | Decimal) -> float:
     decs = _amount_decimals(market)
     st   = Decimal(str(_step(market) or 0))
     a    = Decimal(str(amount))
-    # قصّ على عدد المنازل
     q = Decimal(10) ** -decs
     a = a.quantize(q, rounding=ROUND_DOWN)
-    # قصّ على الـ step إن وُجد
     if st > 0:
         a = (a // st) * st
     return float(a)
@@ -219,9 +204,8 @@ def get_best_bid_ask(market: str) -> tuple[float, float]:
 def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None = None,
                           wait_sec=CANCEL_WAIT_SEC):
     """
-    نرسل DELETE /order بجسم JSON يتضمن operatorId، ونعتبر النجاح إذا:
-    - status صار canceled/filled، أو
-    - اختفى من /orders
+    DELETE /order بجسم يتضمن operatorId. نجاح إذا:
+    - status صار canceled/filled، أو اختفى من /orders.
     """
     deadline = time.time() + max(wait_sec, 12.0)
 
@@ -255,18 +239,16 @@ def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None =
         data = {"raw": r.text}
     print("DELETE(json+operatorId)", r.status_code, data)
 
-    # انتظر حتى يختفي أو تتغير الحالة
+    # انتظر لتغيّر الحالة أو اختفاء الطلب
     last_s, last_st = "unknown", {}
     while time.time() < deadline:
         s, st = _poll_order()
         last_s, last_st = s, st
-        if s in ("canceled","filled"):
-            return True, s, st
-        if _gone_from_open():
-            return True, "canceled", {"note":"gone_after_delete"}
+        if s in ("canceled","filled"): return True, s, st
+        if _gone_from_open():          return True, "canceled", {"note":"gone_after_delete"}
         time.sleep(0.5)
 
-    # محاولة أخيرة cancelAll
+    # محاولة أخيرة: cancelAll
     end2 = time.time() + 6.0
     while time.time() < end2:
         _ = bv_request("DELETE", f"/orders?market={market}")
@@ -313,7 +295,6 @@ def buy_open(market: str, eur_amount: float | None):
     if spend < minq:
         return {"ok": False, "err": f"minQuote={minq:.4f} EUR, have {spend:.2f}"}
 
-    # سعر/كمية
     ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
     bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     price  = min(bid, ask*(1-1e-6))
@@ -441,7 +422,6 @@ def tg_webhook():
                 tg_send(f"⚠️ فشل الإلغاء — status={final}\n{json.dumps(last, ensure_ascii=False)}")
             return jsonify(ok=True)
 
-        # لا أوامر أخرى
         tg_send("الأوامر: «اشتري COIN [EUR]» ، «بيع COIN [AMOUNT]» ، «الغ COIN»")
         return jsonify(ok=True)
 
@@ -452,7 +432,7 @@ def tg_webhook():
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker — Arabic-only on /tg (hardened + precision-parsers) ✅"
+    return "Saqer Maker — Arabic-only on /tg (smart-precision) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
