@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only)
-الأوامر (نفس مبدأ النسخة القديمة لكن عربية فقط):
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, fixed decimals)
+الأوامر:
 - "اشتري COIN [EUR]"
 - "بيع COIN [AMOUNT]"
 - "الغ COIN"
@@ -11,16 +11,19 @@ import os, re, time, json, hmac, hashlib, math, requests
 from uuid import uuid4
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 # ========= Boot / ENV =========
 load_dotenv()
 app = Flask(__name__)
+getcontext().prec = 28  # أمان حسابي (Decimal)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID     = os.getenv("CHAT_ID", "").strip()
 API_KEY     = os.getenv("BITVAVO_API_KEY", "").strip()
 API_SECRET  = os.getenv("BITVAVO_API_SECRET", "").strip()
 PORT        = int(os.getenv("PORT", "8080"))
+
 BASE_URL    = "https://api.bitvavo.com/v2"
 
 HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))
@@ -28,8 +31,8 @@ CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "8.0"))
 SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))
 
 # كاش الماركت + تتبع
-MARKET_MAP  = {}
-MARKET_META = {}
+MARKET_MAP  = {}   # "ADA" → "ADA-EUR"
+MARKET_META = {}   # meta per market
 OPEN_ORDERS = {}   # market -> {"orderId": "...", "clientOrderId": "...", "amount_init": float}
 
 # ========= Telegram =========
@@ -71,58 +74,96 @@ def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
     except Exception:
         return {"error": r.text}
 
+# --- helpers for precisions ---
+def _infer_decimals(value) -> int:
+    """
+    يحوّل pricePrecision/amountPrecision التي قد تأتي كعدد منازل (مثل 8)
+    أو كخطوة عشرية (مثل 0.01) إلى عدد منازل صحيح.
+    """
+    try:
+        iv = int(value)
+        if iv >= 0 and float(value) == iv:
+            return iv
+    except Exception:
+        pass
+    s = str(value)
+    if "." in s:
+        frac = s.split(".", 1)[1].rstrip("0")
+        return max(0, len(frac))
+    return 8  # fallback آمن
+
 def load_markets_once():
+    """يجلب /markets مرة واحدة ويثبت دقّات السعر/الكمية والحدود الدنيا."""
     global MARKET_MAP, MARKET_META
-    if MARKET_MAP and MARKET_META: return
+    if MARKET_MAP and MARKET_META:
+        return
     rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
     m, meta = {}, {}
     for r in rows:
-        if r.get("quote") != "EUR": continue
-        market = r.get("market"); base = (r.get("base") or "").upper()
-        if not base or not market: continue
-        priceSig = int(r.get("pricePrecision", 6) or 6)  # عدد خانات (نفس طريقتك القديمة)
-        ap = r.get("amountPrecision", 8)
-        step = 10.0 ** (-int(ap)) if isinstance(ap, int) else float(ap or 1e-8)
+        if r.get("quote") != "EUR":
+            continue
+        market = r.get("market")
+        base   = (r.get("base") or "").upper()
+        if not base or not market:
+            continue
+
+        price_dec = _infer_decimals(r.get("pricePrecision", 6))
+        amt_dec   = _infer_decimals(r.get("amountPrecision", 8))
+        step      = float(Decimal(1) / (Decimal(10) ** amt_dec))
+
         meta[market] = {
-            "priceSig": priceSig,
-            "step": float(step),
+            "priceDecimals": price_dec,
+            "amountDecimals": amt_dec,
+            "step": step,
             "minQuote": float(r.get("minOrderInQuoteAsset", 0) or 0.0),
             "minBase":  float(r.get("minOrderInBaseAsset",  0) or 0.0),
         }
         m[base] = market
+
     MARKET_MAP, MARKET_META = m, meta
 
 def coin_to_market(coin: str) -> str | None:
     load_markets_once(); return MARKET_MAP.get((coin or "").upper())
 
 def _meta(market: str) -> dict: load_markets_once(); return MARKET_META.get(market, {})
-def _price_sig(market: str) -> int: return int(_meta(market).get("priceSig", 6))
-def _step(market: str) -> float:     return float(_meta(market).get("step", 1e-8))
-def _min_quote(market: str) -> float:return float(_meta(market).get("minQuote", 0.0))
-def _min_base(market: str) -> float: return float(_meta(market).get("minBase", 0.0))
+def _price_decimals(market: str) -> int: return int(_meta(market).get("priceDecimals", 6))
+def _amount_decimals(market: str) -> int: return int(_meta(market).get("amountDecimals", 8))
+def _step(market: str) -> float: return float(_meta(market).get("step", 1e-8))
+def _min_quote(market: str) -> float: return float(_meta(market).get("minQuote", 0.0))
+def _min_base(market: str) -> float:  return float(_meta(market).get("minBase", 0.0))
 
-def round_price_sig_down(price: float, sig: int) -> float:
-    if price <= 0 or sig <= 0: return 0.0
-    exp = math.floor(math.log10(abs(price)))
-    dec = max(0, sig - exp - 1)
-    factor = 10 ** dec
-    return math.floor(price * factor) / factor
+def fmt_price_dec(market: str, price: float | Decimal) -> str:
+    """تنسيق السعر على عدد منازل السعر المسموح (ROUND_DOWN)."""
+    decs = _price_decimals(market)
+    q = Decimal(10) ** -decs
+    p = (Decimal(str(price))).quantize(q, rounding=ROUND_DOWN)
+    s = f"{p:f}"
+    if "." in s:
+        whole, frac = s.split(".", 1)
+        frac = frac[:decs].rstrip("0")
+        return whole if not frac else f"{whole}.{frac}"
+    return s
 
-def fmt_price_sig(market: str, price: float) -> str:
-    p = round_price_sig_down(price, _price_sig(market))
-    s = f"{p:.12f}".rstrip("0").rstrip(".")
-    return s if s else "0"
+def round_amount_down(market: str, amount: float | Decimal) -> float:
+    """قصّ الكمية على amountDecimals ثم على step (احتياط)."""
+    decs = _amount_decimals(market)
+    q = Decimal(10) ** -decs
+    a = (Decimal(str(amount))).quantize(q, rounding=ROUND_DOWN)
+    st = Decimal(str(_step(market)))
+    if st > 0:
+        a = (a // st) * st
+    return float(a)
 
-def round_amount_down(market: str, amount: float) -> float:
-    st = _step(market)
-    if st <= 0: return max(0.0, amount)
-    return math.floor(float(amount) / st) * st
-
-def fmt_amount(market: str, amount: float) -> str:
-    st = _step(market)
-    s = f"{st:.16f}".rstrip("0").rstrip("."); dec = len(s.split(".")[1]) if "." in s else 0
-    a = round_amount_down(market, amount)
-    return f"{a:.{dec}f}"
+def fmt_amount(market: str, amount: float | Decimal) -> str:
+    decs = _amount_decimals(market)
+    q = Decimal(10) ** -decs
+    a = (Decimal(str(amount))).quantize(q, rounding=ROUND_DOWN)
+    s = f"{a:f}"
+    if "." in s:
+        whole, frac = s.split(".", 1)
+        frac = frac[:decs].rstrip("0")
+        return whole if not frac else f"{whole}.{frac}"
+    return s
 
 def get_balance(symbol: str) -> float:
     bals = bv_request("GET", "/balance")
@@ -134,7 +175,10 @@ def get_balance(symbol: str) -> float:
 
 def get_best_bid_ask(market: str) -> tuple[float, float]:
     ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
-    bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
+    try:
+        bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
+    except Exception:
+        raise RuntimeError(f"Orderbook empty for {market}")
     return bid, ask
 
 # ========= Poll helper =========
@@ -182,7 +226,7 @@ def place_limit_postonly(market: str, side: str, price: float, amount: float):
     body = {
         "market": market, "side": side, "orderType": "limit", "postOnly": True,
         "clientOrderId": str(uuid4()),
-        "price": fmt_price_sig(market, price),
+        "price": fmt_price_dec(market, price),
         "amount": fmt_amount(market, amount),
         "operatorId": ""
     }
@@ -211,15 +255,19 @@ def buy_open(market: str, eur_amount: float | None):
     minq, minb = _min_quote(market), _min_base(market)
     if spend < minq:
         return {"ok": False, "err": f"minQuote={minq:.4f} EUR, have {spend:.2f}"}
-    bid, ask = get_best_bid_ask(market)
-    price  = round_price_sig_down(min(bid, ask*(1-1e-6)), _price_sig(market))
+    try:
+        bid, ask = get_best_bid_ask(market)
+    except RuntimeError as e:
+        return {"ok": False, "err": str(e)}
+    price  = min(bid, ask*(1-1e-6))
     amount = round_amount_down(market, spend/price)
     if amount < minb:
         return {"ok": False, "err": f"minBase={minb}"}
     body, resp = place_limit_postonly(market, "buy", price, amount)
     if (resp or {}).get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
-    oid  = resp.get("orderId"); coid = body.get("clientOrderId")
+    oid  = resp.get("orderId")
+    coid = body.get("clientOrderId")
     OPEN_ORDERS[market] = {"orderId": oid, "clientOrderId": coid, "amount_init": amount}
     return {"ok": True, "request": body, "response": resp, "open": OPEN_ORDERS[market]}
 
@@ -238,11 +286,15 @@ def maker_sell(market: str, amount: float | None):
     if amt <= 0: return {"ok": False, "err": f"No {base} to sell"}
     minb = _min_base(market)
     if amt < minb: return {"ok": False, "err": f"minBase={minb}"}
-    bid, ask = get_best_bid_ask(market)
-    price = round_price_sig_down(max(ask, bid*(1+1e-6)), _price_sig(market))
+    try:
+        bid, ask = get_best_bid_ask(market)
+    except RuntimeError as e:
+        return {"ok": False, "err": str(e)}
+    price = max(ask, bid*(1+1e-6))
     body, resp = place_limit_postonly(market, "sell", price, amt)
     if (resp or {}).get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
+    # متابعة قصيرة لالتقاط partial fill
     t0 = time.time(); oid = resp.get("orderId")
     while time.time()-t0 < SHORT_FOLLOW_SEC and oid:
         st = bv_request("GET", f"/order?market={market}&orderId={oid}")
@@ -260,7 +312,7 @@ def _norm_market_from_text(arg: str) -> str | None:
     if COIN_RE.match(s): return f"{s}-EUR"
     return None
 
-# ========= Telegram Webhook (Arabic-only, نفس المسار القديم) =========
+# ========= Telegram Webhook (Arabic-only على /tg) =========
 @app.route("/tg", methods=["GET"])
 def tg_alive():
     return "OK /tg", 200
@@ -268,13 +320,12 @@ def tg_alive():
 @app.route("/tg", methods=["POST"])
 def tg_webhook():
     upd = request.get_json(silent=True) or {}
-    msg = upd.get("message") or upd.get("edited_message") or {}
+    msg  = upd.get("message") or upd.get("edited_message") or {}
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or "").strip()
-    if not chat_id: return jsonify(ok=True)
-    if not _auth_chat(chat_id): return jsonify(ok=True)
-    if not text: return jsonify(ok=True)
+    if not chat_id or not _auth_chat(chat_id) or not text:
+        return jsonify(ok=True)
 
     low = text.lower()
     try:
@@ -338,7 +389,7 @@ def tg_webhook():
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker — Arabic-only on /tg ✅"
+    return "Saqer Maker — Arabic-only on /tg (fixed decimals) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
