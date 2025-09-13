@@ -212,66 +212,50 @@ def _poll_status_until(market: str, orderId: str, deadline_ts: float,
 # ========= Cancel (strict) =========
 def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None = None,
                           wait_sec=CANCEL_WAIT_SEC):
-    """
-    نحاول الإلغاء بعدة طرق (orderId بدون market، ومع market، clientOrderId، ثم cancelAll)
-    ونعتبر النجاح إذا صارت الحالة canceled/filled أو إذا اختفى الأمر من قائمة الأوامر المفتوحة.
-    نرجّع: (ok, final_status, last_state_or_note)
-    """
-    deadline = time.time() + max(wait_sec, 12.0)  # امدّد شوي
+    deadline = time.time() + max(wait_sec, 12.0)
 
     def _poll_order():
-        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
+        rr = bv_request("GET", f"/order?market={market}&orderId={orderId}")
+        st = (rr["data"] or {}) if isinstance(rr["data"], dict) else {}
         s  = (st or {}).get("status","").lower()
         return s, st
 
-    def _is_gone_from_open():
-        opens = bv_request("GET", f"/orders?market={market}") or []
-        if isinstance(opens, list):
-            return not any(o.get("orderId")==orderId for o in opens)
-        return False
+    def _gone_from_open():
+        rr = bv_request("GET", f"/orders?market={market}")
+        lst = rr["data"] if isinstance(rr["data"], list) else []
+        return not any(o.get("orderId")==orderId for o in lst)
 
-    # محاولات متعددة لمسارات الإلغاء
-    attempts = [
-        f"/order?orderId={orderId}",                                 # بدون market
-        f"/order?market={market}&orderId={orderId}",                 # مع market
-    ]
-    if clientOrderId:
-        attempts.append(f"/order?clientOrderId={clientOrderId}")
-        attempts.append(f"/order?market={market}&clientOrderId={clientOrderId}")
+    # شكل JSON رسمي مع operatorId
+    body = {"orderId": orderId, "market": market, "operatorId": ""}
 
-    # 1) جرّب المسارات المباشرة
-    for path in attempts:
-        resp = bv_request("DELETE", path)
-        # اطبع في اللوج لو فيه خطأ لمساعدتنا بالتشخيص لاحقًا
-        if isinstance(resp, dict) and resp.get("error"):
-            print("DELETE failed:", path, resp)
-        # انتظر تَفَعُّل الإلغاء
-        t = 0.0
-        while t < 4.5:  # لكل محاولة نعطي فسحة قصيرة
-            s, st = _poll_order()
-            if s in ("canceled","filled"):
-                return True, s, st
-            if _is_gone_from_open():
-                return True, "canceled", {"note":"disappeared_from_open_orders"}
-            time.sleep(0.35); t += 0.35
-        if time.time() > deadline:  # انتهت المهلة الكلية
-            return False, s or "new", st
+    url = f"{BASE_URL}/order"
+    ts  = str(int(time.time() * 1000))
+    body_str = json.dumps(body, separators=(',',':'))
+    headers = {
+        "Bitvavo-Access-Key": API_KEY,
+        "Bitvavo-Access-Timestamp": ts,
+        "Bitvavo-Access-Signature": _sign(ts, "DELETE", "/v2/order", body_str),
+        "Bitvavo-Access-Window": "10000",
+        "Content-Type": "application/json",
+    }
+    r = requests.request("DELETE", url, headers=headers, json=body, timeout=10)
+    try:
+        data = r.json()
+    except Exception:
+        data = None
+    print("DELETE(json+operatorId) ->", r.status_code, data or r.text)
 
-    # 2) الملاذ الأخير: cancelAll للماركت عدّة رشقات
-    end2 = time.time() + 8.0
-    last_st = None; last_s = ""
-    while time.time() < end2 and time.time() < deadline:
-        _ = bv_request("DELETE", f"/orders?market={market}")
-        time.sleep(0.5)
+    # انتظر حتى يختفي أو يتغير status
+    t0 = time.time()
+    while time.time() < deadline:
         s, st = _poll_order()
-        last_s, last_st = s, st
         if s in ("canceled","filled"):
             return True, s, st
-        if _is_gone_from_open():
-            return True, "canceled", {"note":"cancelAll+gone"}
+        if _gone_from_open():
+            return True, "canceled", {"note":"gone_after_json_delete"}
+        time.sleep(0.5)
 
-    return False, last_s or "new", last_st
-
+    return False, s or "unknown", st
 # ========= Place Maker =========
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
     body = {
