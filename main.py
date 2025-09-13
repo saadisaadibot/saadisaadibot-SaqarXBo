@@ -32,7 +32,7 @@ CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "12.0"))
 SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))
 
 # مطاردة السعر
-CHASE_WINDOW_SEC    = float(os.getenv("CHASE_WINDOW_SEC", "18"))
+CHASE_WINDOW_SEC    = float(os.getenv("CHASE_WINDOW_SEC", "30"))
 CHASE_REPRICE_PAUSE = float(os.getenv("CHASE_REPRICE_PAUSE","0.35"))
 
 # ربح ذكي (بسيط)
