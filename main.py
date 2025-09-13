@@ -165,7 +165,7 @@ def _min_base(market: str) -> float:  return float(_meta(market).get("minBase", 
 
 def fmt_price_dec(market: str, price: float | Decimal) -> str:
     decs = _price_decimals(market)
-    q = Decimal(10)) ** -decs
+    q = Decimal(10) ** -decs
     p = (Decimal(str(price))).quantize(q, rounding=ROUND_DOWN)
     s = f"{p:f}"
     if "." in s:
