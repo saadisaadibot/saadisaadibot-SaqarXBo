@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, hardened)
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, hardened + precision-parsers)
 الأوامر:
 - "اشتري COIN [EUR]"
 - "بيع COIN [AMOUNT]"
 - "الغ COIN"
 """
 
-import os, re, time, json, hmac, hashlib, math, requests
+import os, re, time, json, hmac, hashlib, requests
 from uuid import uuid4
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -86,23 +86,46 @@ def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
     except Exception:
         return {"error": r.text, "status_code": r.status_code}
 
-# --- helpers for precisions ---
-def _infer_decimals(value) -> int:
+# --- helpers for precisions (جديدة) ---
+def _count_decimals_of_step(step: float) -> int:
+    s = f"{step:.16f}".rstrip("0").rstrip(".")
+    if "." in s:
+        return len(s.split(".", 1)[1])
+    return 0
+
+def _parse_amount_precision(ap) -> tuple[int, float]:
     """
-    يحوّل pricePrecision/amountPrecision التي قد تأتي كعدد منازل (مثل 8)
-    أو كخطوة عشرية (مثل 0.01) إلى عدد منازل صحيح.
+    يرجع (amountDecimals, step)
+    ap قد يكون:
+      - عدد منازل (int مثل 8) → step = 10^-8
+      - خطوة مباشرة (float مثل 1 أو 0.5 أو 0.01) → نستخرج المنازل من الخطوة
     """
     try:
-        iv = int(value)
-        if iv >= 0 and float(value) == iv:
-            return iv
+        v = float(ap)
+        # إذا كان ليس عددًا صحيحًا (0.01/0.5) أو >= 1 (خطوة 1 مثلاً) → خطوة مباشرة
+        if not float(v).is_integer() or v >= 1.0:
+            step = float(v)
+            decs = _count_decimals_of_step(step)
+            return decs, step
+        # v عدد صحيح = عدد منازل
+        decs = int(v)
+        step = float(Decimal(1) / (Decimal(10) ** decs))
+        return decs, step
     except Exception:
-        pass
-    s = str(value)
-    if "." in s:
-        frac = s.split(".", 1)[1].rstrip("0")
-        return max(0, len(frac))
-    return 8  # fallback آمن
+        return 8, 1e-8
+
+def _parse_price_precision(pp) -> int:
+    """
+    pricePrecision قد تأتي كعدد منازل أو كخطوة؛ نرجع عدد المنازل.
+    """
+    try:
+        v = float(pp)
+        if not float(v).is_integer() or v < 1.0:
+            # خطوة (مثل 0.0001) → حولها لعدد منازل
+            return _count_decimals_of_step(v)
+        return int(v)
+    except Exception:
+        return 6
 
 def load_markets_once():
     """يجلب /markets مرة واحدة ويثبت دقّات السعر/الكمية والحدود الدنيا."""
@@ -119,14 +142,13 @@ def load_markets_once():
         if not base or not market:
             continue
 
-        price_dec = _infer_decimals(r.get("pricePrecision", 6))
-        amt_dec   = _infer_decimals(r.get("amountPrecision", 8))
-        step      = float(Decimal(1) / (Decimal(10) ** amt_dec))
+        price_dec = _parse_price_precision(r.get("pricePrecision", 6))
+        amt_dec, step = _parse_amount_precision(r.get("amountPrecision", 8))
 
         meta[market] = {
             "priceDecimals": price_dec,
             "amountDecimals": amt_dec,
-            "step": step,
+            "step": float(step),
             "minQuote": float(r.get("minOrderInQuoteAsset", 0) or 0.0),
             "minBase":  float(r.get("minOrderInBaseAsset",  0) or 0.0),
         }
@@ -157,19 +179,16 @@ def fmt_price_dec(market: str, price: float | Decimal) -> str:
     return s
 
 def round_amount_down(market: str, amount: float | Decimal) -> float:
-    """قصّ الكمية على amountDecimals ثم على step (احتياط)."""
+    """قصّ الكمية على amountDecimals ثم على step (لأسواق مثل PUMP)."""
     decs = _amount_decimals(market)
     st   = Decimal(str(_step(market) or 0))
     a    = Decimal(str(amount))
-
     # قصّ على عدد المنازل
     q = Decimal(10) ** -decs
     a = a.quantize(q, rounding=ROUND_DOWN)
-
     # قصّ على الـ step إن وُجد
     if st > 0:
         a = (a // st) * st
-
     return float(a)
 
 def fmt_amount(market: str, amount: float | Decimal) -> str:
@@ -293,14 +312,15 @@ def buy_open(market: str, eur_amount: float | None):
     minq, minb = _min_quote(market), _min_base(market)
     if spend < minq:
         return {"ok": False, "err": f"minQuote={minq:.4f} EUR, have {spend:.2f}"}
-    try:
-        bid, ask = get_best_bid_ask(market)
-    except RuntimeError as e:
-        return {"ok": False, "err": str(e)}
+
+    # سعر/كمية
+    ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
+    bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     price  = min(bid, ask*(1-1e-6))
     amount = round_amount_down(market, spend/price)
     if amount < minb:
         return {"ok": False, "err": f"minBase={minb}"}
+
     body, resp = place_limit_postonly(market, "buy", price, amount)
     if isinstance(resp, dict) and resp.get("error"):
         return {"ok": False, "request": body, "response": resp,
@@ -329,11 +349,11 @@ def maker_sell(market: str, amount: float | None):
     if amt <= 0: return {"ok": False, "err": f"No {base} to sell"}
     minb = _min_base(market)
     if amt < minb: return {"ok": False, "err": f"minBase={minb}"}
-    try:
-        bid, ask = get_best_bid_ask(market)
-    except RuntimeError as e:
-        return {"ok": False, "err": str(e)}
+
+    ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
+    bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     price = max(ask, bid*(1+1e-6))
+
     body, resp = place_limit_postonly(market, "sell", price, amt)
     if isinstance(resp, dict) and resp.get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
@@ -432,7 +452,7 @@ def tg_webhook():
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker — Arabic-only on /tg (hardened) ✅"
+    return "Saqer Maker — Arabic-only on /tg (hardened + precision-parsers) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
