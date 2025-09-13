@@ -88,17 +88,29 @@ def _count_decimals_of_step(step: float) -> int:
 def _parse_amount_precision(ap, min_base_hint: float | int = 0) -> tuple[int, float]:
     """
     يرجع (amountDecimals, step)
-    - إذا ap عدد صحيح → اعتبره عدد منازل (decimals) -> step=10^-ap
-      *استثناء*: لو ap ∈ {0,1} و min_base_hint ≥ 1 → اعتبرها سوق step=1 (كميات صحيحة)
-    - إذا ap عشري (0.01/0.5/1.0) → اعتبره step مباشر واستنبط عدد المنازل منه
+    قاعدة خاصة: لو min_base_hint عدد صحيح ≥ 1 → السوق غالبًا لوت=1 ⇒ (0 منازل، step=1)
+    غير ذلك:
+      - ap عدد صحيح ⇒ اعتبره عدد منازل (decimals) → step = 10^-ap
+      - ap عشري (0.01 / 0.5 / 1.0) ⇒ اعتبره خطوة مباشرة
     """
     try:
+        mb = float(min_base_hint)
+        if mb >= 1.0 and abs(mb - round(mb)) < 1e-9:
+            return 0, 1.0  # كميات صحيحة فقط (مثل PUMP)
+
         v = float(ap)
         if float(v).is_integer():
-            iv = int(v)
-            if iv in (0, 1) and float(min_base_hint) >= 1.0:
-                return 0, 1.0  # أسواق مثل PUMP: كمية صحيحة فقط
-            decs = max(0, iv)
+            decs = max(0, int(v))
+            step = float(Decimal(1) / (Decimal(10) ** decs))
+            return decs, step
+
+        step = float(v)
+        s = f"{step:.16f}".rstrip("0").rstrip(".")
+        decs = len(s.split(".", 1)[1]) if "." in s else 0
+        return decs, step
+
+    except Exception:
+        return 8, 1e-8ax(0, iv)
             step = float(Decimal(1) / (Decimal(10) ** decs))
             return decs, step
         # غير صحيح → خطوة مباشرة
