@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, fixed decimals)
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, hardened)
 الأوامر:
 - "اشتري COIN [EUR]"
 - "بيع COIN [AMOUNT]"
@@ -57,15 +57,18 @@ def _sign(ts, method, path, body=""):
     return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
+    """
+    يُعيد JSON الخام (dict/list) من Bitvavo أو dict فيه 'error' عند الفشل النصّي.
+    GET/DELETE بدون body؛ POST/PUT مع body.
+    """
     url = f"{BASE_URL}{path}"
     ts  = str(int(time.time() * 1000))
 
     m = method.upper()
-    # مهم: لا جسم للـ GET و DELETE (توقيع على سلسلة فاضية)
     if m in ("GET", "DELETE"):
         body_str = ""
         json_payload = None
-    else:  # POST/PUT فقط
+    else:
         body_str = json.dumps(body or {}, separators=(',',':'))
         json_payload = (body or {})
 
@@ -156,11 +159,17 @@ def fmt_price_dec(market: str, price: float | Decimal) -> str:
 def round_amount_down(market: str, amount: float | Decimal) -> float:
     """قصّ الكمية على amountDecimals ثم على step (احتياط)."""
     decs = _amount_decimals(market)
+    st   = Decimal(str(_step(market) or 0))
+    a    = Decimal(str(amount))
+
+    # قصّ على عدد المنازل
     q = Decimal(10) ** -decs
-    a = (Decimal(str(amount))).quantize(q, rounding=ROUND_DOWN)
-    st = Decimal(str(_step(market)))
+    a = a.quantize(q, rounding=ROUND_DOWN)
+
+    # قصّ على الـ step إن وُجد
     if st > 0:
         a = (a // st) * st
+
     return float(a)
 
 def fmt_amount(market: str, amount: float | Decimal) -> str:
@@ -184,52 +193,34 @@ def get_balance(symbol: str) -> float:
 
 def get_best_bid_ask(market: str) -> tuple[float, float]:
     ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
-    try:
-        bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
-    except Exception:
-        raise RuntimeError(f"Orderbook empty for {market}")
+    bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     return bid, ask
 
-# ========= Poll helper =========
-def _poll_status_until(market: str, orderId: str, deadline_ts: float,
-                       initial_sleep=0.20, max_sleep=1.2):
-    last = None
-    time.sleep(max(0.0, initial_sleep))
-    sleep = 0.25
-    while time.time() < deadline_ts:
-        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
-        last = st if isinstance(st, dict) else None
-        s = (st or {}).get("status", "").lower()
-        if s in ("canceled", "filled"):
-            return True, s, last
-        time.sleep(sleep)
-        sleep = min(max_sleep, sleep * 1.5)
-    st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
-    last = st if isinstance(st, dict) else last
-    s = (st or {}).get("status", "").lower()
-    return (s in ("canceled", "filled")), s or "unknown", last
-
-# ========= Cancel (strict) =========
+# ========= Cancel (strict with operatorId) =========
 def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None = None,
                           wait_sec=CANCEL_WAIT_SEC):
+    """
+    نرسل DELETE /order بجسم JSON يتضمن operatorId، ونعتبر النجاح إذا:
+    - status صار canceled/filled، أو
+    - اختفى من /orders
+    """
     deadline = time.time() + max(wait_sec, 12.0)
 
     def _poll_order():
-        rr = bv_request("GET", f"/order?market={market}&orderId={orderId}")
-        st = (rr["data"] or {}) if isinstance(rr["data"], dict) else {}
-        s  = (st or {}).get("status","").lower()
-        return s, st
+        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
+        s  = (st or {}).get("status","").lower() if isinstance(st, dict) else ""
+        return s, (st if isinstance(st, dict) else {})
 
     def _gone_from_open():
-        rr = bv_request("GET", f"/orders?market={market}")
-        lst = rr["data"] if isinstance(rr["data"], list) else []
-        return not any(o.get("orderId")==orderId for o in lst)
+        lst = bv_request("GET", f"/orders?market={market}")
+        if isinstance(lst, list):
+            return not any(o.get("orderId")==orderId for o in lst)
+        return False
 
-    # شكل JSON رسمي مع operatorId
+    # DELETE /order (JSON body) + operatorId
     body = {"orderId": orderId, "market": market, "operatorId": ""}
-
-    url = f"{BASE_URL}/order"
-    ts  = str(int(time.time() * 1000))
+    url  = f"{BASE_URL}/order"
+    ts   = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(',',':'))
     headers = {
         "Bitvavo-Access-Key": API_KEY,
@@ -242,20 +233,32 @@ def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None =
     try:
         data = r.json()
     except Exception:
-        data = None
-    print("DELETE(json+operatorId) ->", r.status_code, data or r.text)
+        data = {"raw": r.text}
+    print("DELETE(json+operatorId)", r.status_code, data)
 
-    # انتظر حتى يختفي أو يتغير status
-    t0 = time.time()
+    # انتظر حتى يختفي أو تتغير الحالة
+    last_s, last_st = "unknown", {}
     while time.time() < deadline:
         s, st = _poll_order()
+        last_s, last_st = s, st
         if s in ("canceled","filled"):
             return True, s, st
         if _gone_from_open():
-            return True, "canceled", {"note":"gone_after_json_delete"}
+            return True, "canceled", {"note":"gone_after_delete"}
         time.sleep(0.5)
 
-    return False, s or "unknown", st
+    # محاولة أخيرة cancelAll
+    end2 = time.time() + 6.0
+    while time.time() < end2:
+        _ = bv_request("DELETE", f"/orders?market={market}")
+        time.sleep(0.6)
+        s, st = _poll_order()
+        last_s, last_st = s, st
+        if s in ("canceled","filled") or _gone_from_open():
+            return True, "canceled" if s not in ("canceled","filled") else s, st
+
+    return False, last_s or "new", last_st
+
 # ========= Place Maker =========
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
     body = {
@@ -299,8 +302,13 @@ def buy_open(market: str, eur_amount: float | None):
     if amount < minb:
         return {"ok": False, "err": f"minBase={minb}"}
     body, resp = place_limit_postonly(market, "buy", price, amount)
-    if (resp or {}).get("error"):
-        return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
+    if isinstance(resp, dict) and resp.get("error"):
+        return {"ok": False, "request": body, "response": resp,
+                "err": resp.get("error"), "hint": {
+                    "amount": body["amount"], "price": body["price"],
+                    "minQuote": _min_quote(market), "minBase": _min_base(market),
+                    "amountDecimals": _amount_decimals(market)
+                }}
     oid  = resp.get("orderId")
     coid = body.get("clientOrderId")
     OPEN_ORDERS[market] = {"orderId": oid, "clientOrderId": coid, "amount_init": amount}
@@ -327,7 +335,7 @@ def maker_sell(market: str, amount: float | None):
         return {"ok": False, "err": str(e)}
     price = max(ask, bid*(1+1e-6))
     body, resp = place_limit_postonly(market, "sell", price, amt)
-    if (resp or {}).get("error"):
+    if isinstance(resp, dict) and resp.get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
     # متابعة قصيرة لالتقاط partial fill
     t0 = time.time(); oid = resp.get("orderId")
@@ -418,13 +426,13 @@ def tg_webhook():
         return jsonify(ok=True)
 
     except Exception as e:
-        tg_send(f"🐞 خطأ: {e}")
+        tg_send(f"🐞 خطأ: {type(e).__name__}: {e}")
         return jsonify(ok=True)
 
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker — Arabic-only on /tg (fixed decimals) ✅"
+    return "Saqer Maker — Arabic-only on /tg (hardened) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
