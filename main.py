@@ -95,8 +95,9 @@ def _parse_amount_precision(ap, min_base_hint: float | int = 0) -> tuple[int, fl
     """
     try:
         mb = float(min_base_hint)
+        # lot size = 1 (مثل PUMP)
         if mb >= 1.0 and abs(mb - round(mb)) < 1e-9:
-            return 0, 1.0  # كميات صحيحة فقط (مثل PUMP)
+            return 0, 1.0
 
         v = float(ap)
         if float(v).is_integer():
@@ -104,20 +105,14 @@ def _parse_amount_precision(ap, min_base_hint: float | int = 0) -> tuple[int, fl
             step = float(Decimal(1) / (Decimal(10) ** decs))
             return decs, step
 
+        # غير صحيح → step مباشر (مثل 0.01 أو 0.5)
         step = float(v)
         s = f"{step:.16f}".rstrip("0").rstrip(".")
         decs = len(s.split(".", 1)[1]) if "." in s else 0
         return decs, step
 
     except Exception:
-        return 8, 1e-8ax(0, iv)
-            step = float(Decimal(1) / (Decimal(10) ** decs))
-            return decs, step
-        # غير صحيح → خطوة مباشرة
-        step = float(v)
-        decs = _count_decimals_of_step(step)
-        return decs, step
-    except Exception:
+        # fallback آمن
         return 8, 1e-8
 
 def _parse_price_precision(pp) -> int:
