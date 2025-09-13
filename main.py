@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, chase + smart TP)
+Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (chase + smart TP + robust cancel)
 الأوامر:
 - "اشتري COIN"        ← شراء مطارد (Maker) بكل EUR المتاح + تفعيل ربح ذكي (افتراضي 0.05€)
-- "بيع COIN [AMOUNT]" ← بيع يدوي Maker (بدون تغيير)
-- "الغ COIN"          ← إلغاء (بدون تغيير)
+- "بيع COIN [AMOUNT]" ← بيع يدوي Maker
+- "الغ COIN"          ← إلغاء الأمر المفتوح للعملة (مع fallback)
 - "ربح VALUE"         ← ضبط هدف الربح الذكي باليورو (مثال: ربح 0.10)
 """
 
@@ -42,7 +42,7 @@ MAKER_FEE_RATE      = float(os.getenv("MAKER_FEE_RATE",  "0.001"))  # 0.10% كم
 # كاش الماركت + تتبع
 MARKET_MAP  = {}   # "ADA" → "ADA-EUR"
 MARKET_META = {}   # meta per market
-OPEN_ORDERS = {}   # market -> {"orderId": "...", "clientOrderId": "...", "amount_init": float}
+OPEN_ORDERS = {}   # market -> {"orderId": "...", "clientOrderId": "...", "amount_init": float, "side": "buy"/"sell"}
 
 # ========= Telegram =========
 def tg_send(text: str):
@@ -295,19 +295,19 @@ def _price_tick(market: str) -> Decimal:
     return Decimal(1) / (Decimal(10) ** _price_decimals(market))
 
 def maker_buy_price_now(market: str) -> float:
-    bid, ask = get_best_bid_ask(market)
-    p = Decimal(str(bid)) - _price_tick(market)
-    if p <= 0: p = Decimal(str(bid))
+    """سعر شراء Maker سريع: على الـBid مباشرة (بدون -tick)"""
+    bid, _ = get_best_bid_ask(market)
+    p = Decimal(str(bid))
     return float(fmt_price_dec(market, p))
 
 def maker_sell_price_now(market: str) -> float:
-    bid, ask = get_best_bid_ask(market)
+    _, ask = get_best_bid_ask(market)
     p = Decimal(str(ask)) + _price_tick(market)
     return float(fmt_price_dec(market, p))
 
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
     """
-    نسخة مع إعادة محاولة تلقائية إذا كان error = amount decimals،
+    إعادة محاولة تلقائية إذا كان error = amount decimals،
     ومع محاولة إعادة تسعير بسيطة لو حصل رفض postOnly/taker.
     """
     def _send(p: float, a: float):
@@ -358,23 +358,25 @@ def place_limit_postonly(market: str, side: str, price: float, amount: float):
 
     return body, resp
 
-# ========= Chase buy + Smart TP =========
+# ========= Chase buy + Smart TP (with OPEN_ORDERS tracking) =========
 def chase_maker_buy_until_filled(market: str, spend_eur: float) -> dict:
     """
     يطارد السعر لفترة قصيرة ليُنفّذ الشراء بسرعة مع بقاء Maker.
-    يحسب الكمية من جديد عند كل إعادة تسعير لتستغل الميزانية.
+    يحسب الكمية من جديد عند كل إعادة تسعير، ويحدّث OPEN_ORDERS دائمًا.
     """
+    global OPEN_ORDERS
     minq, minb = _min_quote(market), _min_base(market)
     deadline = time.time() + max(CHASE_WINDOW_SEC, 6.0)
     last_oid, last_body = None, None
 
     try:
         while time.time() < deadline:
-            price = maker_buy_price_now(market)
+            price  = maker_buy_price_now(market)
             amount = round_amount_down(market, spend_eur / price)
             if amount < minb:
                 return {"ok": False, "err": f"minBase={minb}", "ctx":"amount_too_small"}
 
+            # لو في أمر سابق، حاول إلغاءه سريعاً
             if last_oid:
                 cancel_order_blocking(market, last_oid, None, wait_sec=3.0)
 
@@ -384,6 +386,15 @@ def chase_maker_buy_until_filled(market: str, spend_eur: float) -> dict:
                 return {"ok": False, "request": body, "response": resp, "err": resp.get("error")}
             oid = resp.get("orderId"); last_oid = oid
 
+            # حدّث الكاش — عشان "الغ COIN" يشتغل فوراً
+            if oid:
+                OPEN_ORDERS[market] = {
+                    "orderId": oid,
+                    "clientOrderId": body.get("clientOrderId"),
+                    "amount_init": amount,
+                    "side": "buy"
+                }
+
             # متابعة قصيرة جدًا بعد كل Reprice
             t0 = time.time()
             while time.time() - t0 < max(0.8, CHASE_REPRICE_PAUSE):
@@ -392,7 +403,7 @@ def chase_maker_buy_until_filled(market: str, spend_eur: float) -> dict:
                 if status in ("filled","partiallyfilled"):
                     filled_base  = float((st or {}).get("filledAmount", 0) or 0)
                     filled_quote = float((st or {}).get("filledAmountQuote", 0) or 0)
-                    avg_price = (filled_quote / filled_base) if (filled_base>0 and filled_quote>0) else float(body["price"])
+                    avg_price = (filled_quote/filled_base) if (filled_base>0 and filled_quote>0) else float(body["price"])
                     return {
                         "ok": True, "status": status, "order": resp,
                         "avg_price": avg_price, "filled_base": filled_base, "spent_eur": filled_quote
@@ -401,14 +412,15 @@ def chase_maker_buy_until_filled(market: str, spend_eur: float) -> dict:
 
             time.sleep(CHASE_REPRICE_PAUSE)
 
-        # انتهت النافذة — أعطِ آخر حالة
+        # انتهت النافذة — رجّع آخر حالة وخلي الكاش يشير لآخر أمر
         if last_oid:
             st = bv_request("GET", f"/order?market={market}&orderId={last_oid}")
             status = (st or {}).get("status","").lower()
-            return {"ok": False, "status": status or "unknown", "order": st, "ctx":"deadline_reached", "request": last_body}
+            return {"ok": False, "status": status or "unknown", "order": st,
+                    "ctx":"deadline_reached", "request": last_body, "last_oid": last_oid}
         return {"ok": False, "err":"no_order_placed"}
     finally:
-        pass  # لا نلغي تلقائيًا بعد انتهاء النافذة؛ سلوك محافظ.
+        pass  # لا نلغي تلقائيًا بعد انتهاء النافذة (محافظ).
 
 # ========= Smart TP helpers =========
 def _target_sell_price_for_profit(market: str, avg_entry: float, base_amount: float,
@@ -436,7 +448,7 @@ def place_smart_takeprofit_sell(market: str, avg_entry: float, filled_base: floa
 # ========= BUY / SELL =========
 def buy_open(market: str, eur_amount: float | None):
     """
-    الآن: يطارد السعر Maker-Only تلقائيًا + يفعّل TP ذكي مباشرة بعد أول تعبئة.
+    يطارد السعر Maker-Only تلقائيًا + يفعّل TP ذكي بعد أول تعبئة.
     يتجاهل eur_amount ويستخدم كل EUR المتاح (بعد HEADROOM_EUR).
     """
     if market in OPEN_ORDERS:
@@ -447,28 +459,26 @@ def buy_open(market: str, eur_amount: float | None):
     if spend <= 0:
         return {"ok": False, "err": f"No EUR to spend (avail={eur_avail:.2f})"}
 
-    # مطاردة الشراء Maker-Only
     buy_res = chase_maker_buy_until_filled(market, spend)
     if not buy_res.get("ok"):
+        # لو عندنا last_oid من المطاردة، اتركه بالكاش ليُلغى لاحقاً
+        if buy_res.get("last_oid"):
+            req = buy_res.get("request") or {}
+            OPEN_ORDERS[market] = {
+                "orderId": buy_res["last_oid"],
+                "clientOrderId": req.get("clientOrderId"),
+                "amount_init": None,
+                "side": "buy"
+            }
         return {"ok": False, "ctx":"buy_chase_failed", **buy_res}
 
     status = buy_res.get("status","")
     avg_price = float(buy_res.get("avg_price") or 0.0)
     filled_base = float(buy_res.get("filled_base") or 0.0)
 
-    # إذا امتلأ كليًا — لا نترك أثر في OPEN_ORDERS
     if status == "filled":
         OPEN_ORDERS.pop(market, None)
-    else:
-        order = buy_res.get("order") or {}
-        OPEN_ORDERS[market] = {
-            "orderId": order.get("orderId") or order.get("orderID"),
-            "clientOrderId": order.get("clientOrderId"),
-            "amount_init": filled_base if filled_base > 0 else None,
-            "side": "buy"
-        }
 
-    # بيع ذكي على أول ربح مطلق
     tp_res = place_smart_takeprofit_sell(market, avg_price, filled_base, TAKE_PROFIT_EUR, MAKER_FEE_RATE)
     return {"ok": True, "buy": buy_res, "tp": tp_res, "open": OPEN_ORDERS.get(market)}
 
@@ -526,8 +536,7 @@ def tg_webhook():
     if not chat_id or not _auth_chat(chat_id) or not text:
         return jsonify(ok=True)
 
-    # مهم: إعلان المتغير العالمي قبل أي استخدام/تعديل
-    global TAKE_PROFIT_EUR
+    global TAKE_PROFIT_EUR  # مهم قبل أي استخدام
 
     low = text.lower()
     try:
@@ -539,7 +548,7 @@ def tg_webhook():
             market = _norm_market_from_text(parts[1])
             if not market:
                 tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
-            res = buy_open(market, None)  # نتجاهل مبلغ ثالث: نستخدم كل EUR المتاح
+            res = buy_open(market, None)  # نستخدم كل EUR المتاح
             tg_send(("✅ شراء مطارد + TP" if res.get("ok") else "⚠️ فشل الشراء") + f" — {market}\n"
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
@@ -561,7 +570,7 @@ def tg_webhook():
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
-        # ----- الغ (Cancel) -----
+        # ----- الغ (Cancel) مع fallback -----
         if low.startswith("الغ"):
             parts = text.split()
             if len(parts) < 2:
@@ -569,15 +578,31 @@ def tg_webhook():
             market = _norm_market_from_text(parts[1])
             if not market:
                 tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+
             info = OPEN_ORDERS.get(market)
-            if not info:
-                tg_send("لا يوجد أمر مفتوح لهذه العملة."); return jsonify(ok=True)
-            ok, final, last = cancel_order_blocking(market, info["orderId"], info.get("clientOrderId"), CANCEL_WAIT_SEC)
-            if ok:
+            ok = False; final = "unknown"; last = {}
+
+            if info and info.get("orderId"):
+                ok, final, last = cancel_order_blocking(
+                    market, info["orderId"], info.get("clientOrderId"), CANCEL_WAIT_SEC)
+                if ok:
+                    OPEN_ORDERS.pop(market, None)
+                    tg_send(f"✅ تم الإلغاء — status={final}\n{json.dumps(last, ensure_ascii=False)}")
+                    return jsonify(ok=True)
+
+            # fallback: الغِ كل أوامر السوق لهاي العملة ثم تحقّق
+            _ = bv_request("DELETE", f"/orders?market={market}")
+            time.sleep(0.7)
+            open_after = bv_request("GET", f"/orders?market={market}")
+            still = []
+            if isinstance(open_after, list):
+                still = [o for o in open_after if (o.get("status","").lower() in ("new","partiallyfilled"))]
+            if not still:
                 OPEN_ORDERS.pop(market, None)
-                tg_send(f"✅ تم الإلغاء — status={final}\n{json.dumps(last, ensure_ascii=False)}")
+                tg_send("✅ تم إلغاء كل أوامر السوق (fallback).")
             else:
-                tg_send(f"⚠️ فشل الإلغاء — status={final}\n{json.dumps(last, ensure_ascii=False)}")
+                tg_send("⚠️ لم أستطع إلغاء كل الأوامر. أعد المحاولة بعد لحظات.\n"
+                        + json.dumps(still[:3], ensure_ascii=False))
             return jsonify(ok=True)
 
         # ----- ربح VALUE (يضبط هدف الربح الذكي) -----
@@ -606,7 +631,7 @@ def tg_webhook():
 # ========= Health =========
 @app.route("/", methods=["GET"])
 def home():
-    return "Saqer Maker — Arabic-only on /tg (chase+smartTP) ✅"
+    return "Saqer Maker — Arabic-only on /tg (chase+smartTP+robust-cancel) ✅"
 
 # ========= Main =========
 if __name__ == "__main__":
