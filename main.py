@@ -27,7 +27,7 @@ PORT        = int(os.getenv("PORT", "8080"))
 BASE_URL    = "https://api.bitvavo.com/v2"
 
 HEADROOM_EUR        = float(os.getenv("HEADROOM_EUR", "0.30"))
-CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "8.0"))
+CANCEL_WAIT_SEC     = float(os.getenv("CANCEL_WAIT_SEC", "12.0"))
 SHORT_FOLLOW_SEC    = float(os.getenv("SHORT_FOLLOW_SEC", "2.0"))
 
 # كاش الماركت + تتبع
@@ -213,64 +213,64 @@ def _poll_status_until(market: str, orderId: str, deadline_ts: float,
 def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None = None,
                           wait_sec=CANCEL_WAIT_SEC):
     """
-    نجاح فقط لو انتهت الحالة بـ canceled أو اختفى الطلب من قائمة الأوامر المفتوحة.
-    المسار:
-      1) DELETE /order?orderId=...
-      2) (اختياري) DELETE /order?clientOrderId=...
-      3) DELETE /orders?market=... (cancelAll)
-      4) إعادة محاولة cancelAll عدة مرات سريعة
-      5) فحص اختفاء الطلب من /orders كإشارة نجاح
+    نحاول الإلغاء بعدة طرق (orderId بدون market، ومع market، clientOrderId، ثم cancelAll)
+    ونعتبر النجاح إذا صارت الحالة canceled/filled أو إذا اختفى الأمر من قائمة الأوامر المفتوحة.
+    نرجّع: (ok, final_status, last_state_or_note)
     """
-    deadline = time.time() + wait_sec
+    deadline = time.time() + max(wait_sec, 12.0)  # امدّد شوي
 
     def _poll_order():
         st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
         s  = (st or {}).get("status","").lower()
         return s, st
 
-    # خطوة 1: إلغاء بالـ orderId (محاولتان)
-    for _ in range(2):
-        _ = bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
-        time.sleep(0.15)
-        s, st = _poll_order()
-        if s in ("canceled","filled"):
-            return True, s, st
-        if s not in ("new","open","awaitingmarket",""):
-            return False, s or "unknown", st
-        if time.time() > deadline:
-            break
-
-    # خطوة 2: بالـ clientOrderId لو متاح
-    if clientOrderId and time.time() < deadline:
-        _ = bv_request("DELETE", f"/order?market={market}&clientOrderId={clientOrderId}")
-        time.sleep(0.15)
-        s, st = _poll_order()
-        if s in ("canceled","filled"):
-            return True, s, st
-        if s not in ("new","open","awaitingmarket",""):
-            return False, s or "unknown", st
-
-    # خطوة 3 + 4: cancelAll + رشقات قصيرة
-    end2 = time.time() + max(4.0, wait_sec*0.75)
-    while time.time() < end2:
-        _ = bv_request("DELETE", f"/orders?market={market}")
-        time.sleep(0.35)
-        s, st = _poll_order()
-        if s in ("canceled","filled"):
-            return True, s, st
-
-    # خطوة 5: تحقق من اختفاء الطلب من قائمة الأوامر المفتوحة
-    # إذا غير موجود نعتبرها Cancel ناجحة (بعض الأحيان /order تبقى ترجع "new" لفترة قصيرة)
-    try:
+    def _is_gone_from_open():
         opens = bv_request("GET", f"/orders?market={market}") or []
-        still = any(o.get("orderId")==orderId for o in (opens if isinstance(opens, list) else []))
-        if not still:
-            return True, "canceled", {"note":"disappeared_from_open_orders"}
-    except Exception:
-        pass
+        if isinstance(opens, list):
+            return not any(o.get("orderId")==orderId for o in opens)
+        return False
 
-    # فشل: أعد آخر حالة
-    return False, s or "new", st
+    # محاولات متعددة لمسارات الإلغاء
+    attempts = [
+        f"/order?orderId={orderId}",                                 # بدون market
+        f"/order?market={market}&orderId={orderId}",                 # مع market
+    ]
+    if clientOrderId:
+        attempts.append(f"/order?clientOrderId={clientOrderId}")
+        attempts.append(f"/order?market={market}&clientOrderId={clientOrderId}")
+
+    # 1) جرّب المسارات المباشرة
+    for path in attempts:
+        resp = bv_request("DELETE", path)
+        # اطبع في اللوج لو فيه خطأ لمساعدتنا بالتشخيص لاحقًا
+        if isinstance(resp, dict) and resp.get("error"):
+            print("DELETE failed:", path, resp)
+        # انتظر تَفَعُّل الإلغاء
+        t = 0.0
+        while t < 4.5:  # لكل محاولة نعطي فسحة قصيرة
+            s, st = _poll_order()
+            if s in ("canceled","filled"):
+                return True, s, st
+            if _is_gone_from_open():
+                return True, "canceled", {"note":"disappeared_from_open_orders"}
+            time.sleep(0.35); t += 0.35
+        if time.time() > deadline:  # انتهت المهلة الكلية
+            return False, s or "new", st
+
+    # 2) الملاذ الأخير: cancelAll للماركت عدّة رشقات
+    end2 = time.time() + 8.0
+    last_st = None; last_s = ""
+    while time.time() < end2 and time.time() < deadline:
+        _ = bv_request("DELETE", f"/orders?market={market}")
+        time.sleep(0.5)
+        s, st = _poll_order()
+        last_s, last_st = s, st
+        if s in ("canceled","filled"):
+            return True, s, st
+        if _is_gone_from_open():
+            return True, "canceled", {"note":"cancelAll+gone"}
+
+    return False, last_s or "new", last_st
 
 # ========= Place Maker =========
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
