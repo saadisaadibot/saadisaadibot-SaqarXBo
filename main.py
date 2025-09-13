@@ -2,7 +2,7 @@
 """
 Saqer — Maker-Only (Bitvavo / EUR) — Telegram /tg (Arabic-only, simplified smart TP)
 الأوامر:
-- "اشتري COIN [EUR]"  ← يشتري الآن بكل EUR المتاح (يتجاهل [EUR]) + يفعّل ربح ذكي (افتراضي 0.05€)
+- "اشتري COIN"        ← يشتري بكل EUR المتاح (يتجاهل [EUR]) + يفعّل ربح ذكي (افتراضي 0.05€)
 - "بيع COIN [AMOUNT]" ← بيع يدوي Maker (بدون تغيير)
 - "الغ COIN"          ← إلغاء (بدون تغيير)
 - "ربح VALUE"         ← ضبط هدف الربح الذكي باليورو (مثال: ربح 0.10)
@@ -62,7 +62,6 @@ def _sign(ts, method, path, body=""):
     return hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
-    """يرجع JSON الخام من Bitvavo أو dict فيه 'error' عند الفشل النصّي."""
     url = f"{BASE_URL}{path}"
     ts  = str(int(time.time() * 1000))
     m = method.upper()
@@ -91,13 +90,6 @@ def _count_decimals_of_step(step: float) -> int:
     return 0
 
 def _parse_amount_precision(ap, min_base_hint: float | int = 0) -> tuple[int, float]:
-    """
-    يرجع (amountDecimals, step)
-    قاعدة خاصة: لو min_base_hint عدد صحيح ≥ 1 → السوق غالبًا لوت=1 ⇒ (0 منازل، step=1)
-    غير ذلك:
-      - ap عدد صحيح ⇒ اعتبره عدد منازل (decimals) → step = 10^-ap
-      - ap عشري (0.01 / 0.5 / 1.0) ⇒ اعتبره خطوة مباشرة
-    """
     try:
         mb = float(min_base_hint)
         if mb >= 1.0 and abs(mb - round(mb)) < 1e-9:
@@ -108,7 +100,8 @@ def _parse_amount_precision(ap, min_base_hint: float | int = 0) -> tuple[int, fl
             step = float(Decimal(1) / (Decimal(10) ** decs))
             return decs, step
         step = float(v)
-        s = f"{step:.16f}".rstrip("0").rstrip(".")
+        s = f"{step:.16f}".rstrip("0").rstrip("."
+        )
         decs = len(s.split(".", 1)[1]) if "." in s else 0
         return decs, step
     except Exception:
@@ -124,7 +117,6 @@ def _parse_price_precision(pp) -> int:
         return 6
 
 def load_markets_once():
-    """يجلب /markets مرة واحدة ويثبت دقّات السعر/الكمية والحدود الدنيا."""
     global MARKET_MAP, MARKET_META
     if MARKET_MAP and MARKET_META: return
     rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
@@ -133,12 +125,10 @@ def load_markets_once():
         if r.get("quote") != "EUR": continue
         market = r.get("market"); base = (r.get("base") or "").upper()
         if not base or not market: continue
-
         min_quote = float(r.get("minOrderInQuoteAsset", 0) or 0.0)
         min_base  = float(r.get("minOrderInBaseAsset",  0) or 0.0)
         price_dec = _parse_price_precision(r.get("pricePrecision", 6))
         amt_dec, step = _parse_amount_precision(r.get("amountPrecision", 8), min_base)
-
         meta[market] = {
             "priceDecimals": price_dec,
             "amountDecimals": amt_dec,
@@ -171,7 +161,6 @@ def fmt_price_dec(market: str, price: float | Decimal) -> str:
     return s
 
 def round_amount_down(market: str, amount: float | Decimal) -> float:
-    """قصّ الكمية على amountDecimals ثم على step."""
     decs = _amount_decimals(market)
     st   = Decimal(str(_step(market) or 0))
     a    = Decimal(str(amount))
@@ -205,27 +194,19 @@ def get_best_bid_ask(market: str) -> tuple[float, float]:
     bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
     return bid, ask
 
-# ========= Cancel (strict with operatorId) =========
+# ========= Cancel =========
 def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None = None,
                           wait_sec=CANCEL_WAIT_SEC):
-    """
-    DELETE /order بجسم يتضمن operatorId. نجاح إذا:
-    - status صار canceled/filled، أو اختفى من /orders.
-    """
     deadline = time.time() + max(wait_sec, 12.0)
-
     def _poll_order():
         st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
         s  = (st or {}).get("status","").lower() if isinstance(st, dict) else ""
         return s, (st if isinstance(st, dict) else {})
-
     def _gone_from_open():
         lst = bv_request("GET", f"/orders?market={market}")
         if isinstance(lst, list):
             return not any(o.get("orderId")==orderId for o in lst)
         return False
-
-    # DELETE /order (JSON body) + operatorId
     body = {"orderId": orderId, "market": market, "operatorId": ""}
     url  = f"{BASE_URL}/order"
     ts   = str(int(time.time() * 1000))
@@ -243,8 +224,6 @@ def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None =
     except Exception:
         data = {"raw": r.text}
     print("DELETE(json+operatorId)", r.status_code, data)
-
-    # انتظر لتغيّر الحالة أو اختفاء الطلب
     last_s, last_st = "unknown", {}
     while time.time() < deadline:
         s, st = _poll_order()
@@ -252,17 +231,6 @@ def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None =
         if s in ("canceled","filled"): return True, s, st
         if _gone_from_open():          return True, "canceled", {"note":"gone_after_delete"}
         time.sleep(0.5)
-
-    # محاولة أخيرة: cancelAll
-    end2 = time.time() + 6.0
-    while time.time() < end2:
-        _ = bv_request("DELETE", f"/orders?market={market}")
-        time.sleep(0.6)
-        s, st = _poll_order()
-        last_s, last_st = s, st
-        if s in ("canceled","filled") or _gone_from_open():
-            return True, "canceled" if s not in ("canceled","filled") else s, st
-
     return False, last_s or "new", last_st
 
 # ========= Place Maker =========
@@ -299,10 +267,9 @@ def maker_sell_price_now(market: str) -> float:
 def _target_sell_price_for_profit(market: str, avg_entry: float, base_amount: float,
                                   profit_eur_abs: float = None,
                                   fee_rate: float = None) -> float:
-    """سعر بيع يضمن ربحًا مطلقًا باليورو بعد رسوم الصانع (تقريب شراء+بيع)."""
     if profit_eur_abs is None: profit_eur_abs = TAKE_PROFIT_EUR
     if fee_rate is None:       fee_rate = MAKER_FEE_RATE
-    fee_mult = (1 + fee_rate) * (1 + fee_rate)  # تقريب بسيط
+    fee_mult = (1 + fee_rate) * (1 + fee_rate)
     base_adj = profit_eur_abs / max(base_amount, 1e-12)
     raw = avg_entry * fee_mult + base_adj
     maker_min = maker_sell_price_now(market)
@@ -311,7 +278,6 @@ def _target_sell_price_for_profit(market: str, avg_entry: float, base_amount: fl
 
 def place_smart_takeprofit_sell(market: str, avg_entry: float, filled_base: float,
                                 profit_eur_abs: float = None, fee_rate: float = None):
-    """يضع أمر بيع Maker يحقق الربح المطلق المحدد."""
     if filled_base <= 0:
         return {"ok": False, "err": "no_filled_amount"}
     target = _target_sell_price_for_profit(market, avg_entry, filled_base, profit_eur_abs, fee_rate)
@@ -322,43 +288,28 @@ def place_smart_takeprofit_sell(market: str, avg_entry: float, filled_base: floa
 
 # ========= BUY / SELL =========
 def buy_open(market: str, eur_amount: float | None):
-    """
-    مبسّط: يتجاهل [EUR] ويشتري بكل رصيد EUR (بعد HEADROOM_EUR) كـ Maker،
-    ثم يحاول فورًا تفعيل ربح ذكي (5 سنت افتراضيًا).
-    """
+    # يتجاهل eur_amount — يشتري بكل EUR المتاح بعد HEADROOM_EUR
     if market in OPEN_ORDERS:
         return {"ok": False, "err": "order_already_open", "open": OPEN_ORDERS[market]}
-
     eur_avail = get_balance("EUR")
-    spend = max(0.0, float(eur_avail) - HEADROOM_EUR)  # يتجاهل eur_amount
+    spend = max(0.0, float(eur_avail) - HEADROOM_EUR)
     if spend <= 0:
         return {"ok": False, "err": f"No EUR to spend (avail={eur_avail:.2f})"}
-
     minq, minb = _min_quote(market), _min_base(market)
     if spend < minq:
         return {"ok": False, "err": f"minQuote={minq:.4f} EUR, have {spend:.2f}"}
-
-    ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
-    bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
+    bid, ask = get_best_bid_ask(market)
     price  = min(bid, ask*(1-1e-6))  # Maker آمن
     amount = round_amount_down(market, spend/price)
     if amount < minb:
         return {"ok": False, "err": f"minBase={minb}"}
-
     body, resp = place_limit_postonly(market, "buy", price, amount)
     if isinstance(resp, dict) and resp.get("error"):
-        return {"ok": False, "request": body, "response": resp,
-                "err": resp.get("error"), "hint": {
-                    "amount": body["amount"], "price": body["price"],
-                    "minQuote": _min_quote(market), "minBase": _min_base(market),
-                    "amountDecimals": _amount_decimals(market)
-                }}
-
+        return {"ok": False, "request": body, "response": resp, "err": resp.get("error")}
     oid  = resp.get("orderId")
     coid = body.get("clientOrderId")
     OPEN_ORDERS[market] = {"orderId": oid, "clientOrderId": coid, "amount_init": amount}
-
-    # متابعة قصيرة لمحاولة تفعيل TP فورًا إذا صار تعبئة
+    # محاولة تفعيل TP فورًا لو صار تعبئة
     tp = {"ok": False, "note": "no_fill_yet"}
     t0 = time.time()
     while time.time()-t0 < max(1.0, SHORT_FOLLOW_SEC*1.5) and oid:
@@ -371,7 +322,6 @@ def buy_open(market: str, eur_amount: float | None):
             tp = place_smart_takeprofit_sell(market, avg_price, filled_base, TAKE_PROFIT_EUR, MAKER_FEE_RATE)
             break
         time.sleep(0.25)
-
     return {"ok": True, "request": body, "response": resp, "open": OPEN_ORDERS[market], "tp": tp}
 
 def maker_sell(market: str, amount: float | None):
@@ -389,11 +339,8 @@ def maker_sell(market: str, amount: float | None):
     if amt <= 0: return {"ok": False, "err": f"No {base} to sell"}
     minb = _min_base(market)
     if amt < minb: return {"ok": False, "err": f"minBase={minb}"}
-
-    ob = requests.get(f"{BASE_URL}/{market}/book?depth=1", timeout=8).json()
-    bid = float(ob["bids"][0][0]); ask = float(ob["asks"][0][0])
+    bid, ask = get_best_bid_ask(market)
     price = max(ask, bid*(1+1e-6))
-
     body, resp = place_limit_postonly(market, "sell", price, amt)
     if isinstance(resp, dict) and resp.get("error"):
         return {"ok": False, "request": body, "response": resp, "err": (resp or {}).get("error")}
@@ -430,28 +377,32 @@ def tg_webhook():
     if not chat_id or not _auth_chat(chat_id) or not text:
         return jsonify(ok=True)
 
+    # مهم: إعلان المتغير العالمي قبل أي استخدام أو تعديل لتجنّب SyntaxError
+    global TAKE_PROFIT_EUR
+
     low = text.lower()
     try:
-        # ----- اشتري (صار يشتري بكل EUR ويجرّب تفعيل ربح ذكي فورًا) -----
+        # ----- اشتري (بكل EUR + محاولة ربح ذكي) -----
         if low.startswith("اشتري"):
             parts = text.split()
             if len(parts) < 2:
                 tg_send("صيغة: اشتري COIN"); return jsonify(ok=True)
             market = _norm_market_from_text(parts[1])
-            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
-            # نتجاهل اي مبلغ ثالث — نشتري بكل المتاح
-            res = buy_open(market, None)
+            if not market:
+                tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+            res = buy_open(market, None)  # نتجاهل أي مبلغ ثالث
             tg_send(("✅ شراء + ربح ذكي" if res.get("ok") else "⚠️ فشل الشراء") + f" — {market}\n"
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
-        # ----- بيع (يدوي — بدون تغيير) -----
+        # ----- بيع (يدوي) -----
         if low.startswith("بيع"):
             parts = text.split()
             if len(parts) < 2:
                 tg_send("صيغة: بيع COIN [AMOUNT]"); return jsonify(ok=True)
             market = _norm_market_from_text(parts[1])
-            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+            if not market:
+                tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
             amt = None
             if len(parts) >= 3:
                 try: amt = float(parts[2])
@@ -461,15 +412,17 @@ def tg_webhook():
                     f"{json.dumps(res, ensure_ascii=False)}")
             return jsonify(ok=True)
 
-        # ----- الغ (Cancel — بدون تغيير) -----
+        # ----- الغ (Cancel) -----
         if low.startswith("الغ"):
             parts = text.split()
             if len(parts) < 2:
                 tg_send("صيغة: الغ COIN"); return jsonify(ok=True)
             market = _norm_market_from_text(parts[1])
-            if not market: tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
+            if not market:
+                tg_send("⛔ عملة غير صالحة."); return jsonify(ok=True)
             info = OPEN_ORDERS.get(market)
-            if not info: tg_send("لا يوجد أمر مفتوح لهذه العملة."); return jsonify(ok=True)
+            if not info:
+                tg_send("لا يوجد أمر مفتوح لهذه العملة."); return jsonify(ok=True)
             ok, final, last = cancel_order_blocking(market, info["orderId"], info.get("clientOrderId"), CANCEL_WAIT_SEC)
             if ok:
                 OPEN_ORDERS.pop(market, None)
@@ -488,7 +441,6 @@ def tg_webhook():
                 val = float(parts[1])
                 if val <= 0:
                     raise ValueError("<=0")
-                global TAKE_PROFIT_EUR
                 TAKE_PROFIT_EUR = val
                 tg_send(f"✅ تم ضبط الربح المطلق إلى: {TAKE_PROFIT_EUR:.4f}€")
             except Exception:
