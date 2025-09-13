@@ -59,20 +59,29 @@ def _sign(ts, method, path, body=""):
 def bv_request(method: str, path: str, body: dict | None = None, timeout=10):
     url = f"{BASE_URL}{path}"
     ts  = str(int(time.time() * 1000))
-    body_str = "" if method == "GET" else json.dumps(body or {}, separators=(',',':'))
+
+    m = method.upper()
+    # مهم: لا جسم للـ GET و DELETE (توقيع على سلسلة فاضية)
+    if m in ("GET", "DELETE"):
+        body_str = ""
+        json_payload = None
+    else:  # POST/PUT فقط
+        body_str = json.dumps(body or {}, separators=(',',':'))
+        json_payload = (body or {})
+
     headers = {
         "Bitvavo-Access-Key": API_KEY,
         "Bitvavo-Access-Timestamp": ts,
-        "Bitvavo-Access-Signature": _sign(ts, method, f"/v2{path}", body_str),
+        "Bitvavo-Access-Signature": _sign(ts, m, f"/v2{path}", body_str),
         "Bitvavo-Access-Window": "10000",
         "Content-Type": "application/json",
     }
-    r = requests.request(method, url, headers=headers,
-                         json=(body or {}) if method != "GET" else None, timeout=timeout)
+
+    r = requests.request(m, url, headers=headers, json=json_payload, timeout=timeout)
     try:
         return r.json()
     except Exception:
-        return {"error": r.text}
+        return {"error": r.text, "status_code": r.status_code}
 
 # --- helpers for precisions ---
 def _infer_decimals(value) -> int:
