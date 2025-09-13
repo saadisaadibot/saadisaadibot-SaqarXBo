@@ -203,23 +203,65 @@ def _poll_status_until(market: str, orderId: str, deadline_ts: float,
 # ========= Cancel (strict) =========
 def cancel_order_blocking(market: str, orderId: str, clientOrderId: str | None = None,
                           wait_sec=CANCEL_WAIT_SEC):
+    """
+    نجاح فقط لو انتهت الحالة بـ canceled أو اختفى الطلب من قائمة الأوامر المفتوحة.
+    المسار:
+      1) DELETE /order?orderId=...
+      2) (اختياري) DELETE /order?clientOrderId=...
+      3) DELETE /orders?market=... (cancelAll)
+      4) إعادة محاولة cancelAll عدة مرات سريعة
+      5) فحص اختفاء الطلب من /orders كإشارة نجاح
+    """
     deadline = time.time() + wait_sec
+
+    def _poll_order():
+        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
+        s  = (st or {}).get("status","").lower()
+        return s, st
+
+    # خطوة 1: إلغاء بالـ orderId (محاولتان)
     for _ in range(2):
         _ = bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
-        ok, st, last = _poll_status_until(market, orderId, deadline)
-        if ok: return True, st, last
-        if st not in ("new", "open", "awaitingmarket", ""):
-            return False, st or "unknown", last
+        time.sleep(0.15)
+        s, st = _poll_order()
+        if s in ("canceled","filled"):
+            return True, s, st
+        if s not in ("new","open","awaitingmarket",""):
+            return False, s or "unknown", st
+        if time.time() > deadline:
+            break
+
+    # خطوة 2: بالـ clientOrderId لو متاح
     if clientOrderId and time.time() < deadline:
         _ = bv_request("DELETE", f"/order?market={market}&clientOrderId={clientOrderId}")
-        ok2, st2, last2 = _poll_status_until(market, orderId, deadline)
-        if ok2: return True, st2, last2
-        if st2 not in ("new", "open", "awaitingmarket", ""):
-            return False, st2 or "unknown", last2
-    _ = bv_request("DELETE", f"/orders?market={market}")
-    ok3, st3, last3 = _poll_status_until(market, orderId, time.time() + 4.0)
-    if ok3: return True, st3, last3
-    return False, st3 or "unknown", last3
+        time.sleep(0.15)
+        s, st = _poll_order()
+        if s in ("canceled","filled"):
+            return True, s, st
+        if s not in ("new","open","awaitingmarket",""):
+            return False, s or "unknown", st
+
+    # خطوة 3 + 4: cancelAll + رشقات قصيرة
+    end2 = time.time() + max(4.0, wait_sec*0.75)
+    while time.time() < end2:
+        _ = bv_request("DELETE", f"/orders?market={market}")
+        time.sleep(0.35)
+        s, st = _poll_order()
+        if s in ("canceled","filled"):
+            return True, s, st
+
+    # خطوة 5: تحقق من اختفاء الطلب من قائمة الأوامر المفتوحة
+    # إذا غير موجود نعتبرها Cancel ناجحة (بعض الأحيان /order تبقى ترجع "new" لفترة قصيرة)
+    try:
+        opens = bv_request("GET", f"/orders?market={market}") or []
+        still = any(o.get("orderId")==orderId for o in (opens if isinstance(opens, list) else []))
+        if not still:
+            return True, "canceled", {"note":"disappeared_from_open_orders"}
+    except Exception:
+        pass
+
+    # فشل: أعد آخر حالة
+    return False, s or "new", st
 
 # ========= Place Maker =========
 def place_limit_postonly(market: str, side: str, price: float, amount: float):
