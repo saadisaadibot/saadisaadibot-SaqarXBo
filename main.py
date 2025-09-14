@@ -182,7 +182,7 @@ def place_limit_postonly(market:str, side:str, price:float, amount:float):
     r = requests.post(f"{BASE_URL}/order", headers=headers, json=body, timeout=10)
     try: data=r.json()
     except: data={"error": r.text}
-    # إصلاح "postOnly → taker": لو أرجع خطأ postOnly، نزّح السعر بـ tick
+    # إصلاح postOnly
     if isinstance(data,dict) and isinstance(data.get("error"),str) and "postOnly" in data["error"]:
         tick = float(Decimal(1) / (Decimal(10)**price_decimals(market)))
         adj = price - tick if side=="buy" else price + tick
