@@ -192,17 +192,56 @@ def place_limit_postonly(market:str, side:str, price:float, amount:float):
         except: data={"error": r.text}
     return body, data
 
-def cancel_order_blocking(market:str, orderId:str, wait_sec:float=12.0):
-    deadline=time.time()+max(wait_sec,6.0)
-    _ = bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
-    last={}
-    while time.time()<deadline:
-        st=bv_request("GET", f"/order?market={market}&orderId={orderId}"); last=st
-        s=(st or {}).get("status","").lower()
-        if s in ("canceled","filled"): return True, s, st
-        time.sleep(0.4)
-    return False, (last or {}).get("status","unknown"), last
+# ===== إلغاء صارم (DELETE /order بجسم JSON + توقيع) =====
+def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
+    """
+    يرسل DELETE /order بجسم JSON (market, orderId, operatorId="")
+    ويعمل Poll حتى يصير الأمر canceled/filled أو ينتهي الوقت.
+    """
+    deadline = time.time() + max(wait_sec, 6.0)
 
+    def _poll():
+        st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
+        s  = (st or {}).get("status","").lower() if isinstance(st, dict) else ""
+        return s, (st if isinstance(st, dict) else {})
+
+    # 1) DELETE بجسم JSON + توقيع يدوي
+    body = {"orderId": orderId, "market": market, "operatorId": ""}  # operatorId ضروري لبعض البيئات
+    ts   = str(int(time.time() * 1000))
+    body_str = json.dumps(body, separators=(',',':'))
+    headers = {
+        "Bitvavo-Access-Key": API_KEY,
+        "Bitvavo-Access-Timestamp": ts,
+        "Bitvavo-Access-Signature": _sign(ts, "DELETE", "/v2/order", body_str),
+        "Bitvavo-Access-Window": "10000",
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.request("DELETE", f"{BASE_URL}/order", headers=headers, json=body, timeout=10)
+        try: _ = r.json()
+        except: pass
+    except Exception:
+        pass
+
+    # 2) Poll سريع
+    last_s, last_st = "unknown", {}
+    while time.time() < deadline:
+        s, st = _poll()
+        last_s, last_st = s, st
+        if s in ("canceled","filled"):
+            return True, s, st
+        time.sleep(0.4)
+
+    # 3) محاولة بديلة عبر QueryString (بعض الحالات بتنجح هي)
+    try: _ = bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
+    except Exception:
+        pass
+
+    # 4) Poll أخير
+    s, st = _poll()
+    if s in ("canceled","filled"):
+        return True, s, st
+    return False, (s or "unknown"), (st or {})
 def order_status(market:str, orderId:str)->dict:
     return bv_request("GET", f"/order?market={market}&orderId={orderId}") or {}
 
