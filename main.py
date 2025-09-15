@@ -3,7 +3,7 @@
 # تشغيل Flask + اتصالات Bitvavo + Redis state + Telegram + Ready callback
 # واجهة CoreAPI ثابتة يستهلكها strategy.py فقط
 
-__SAQER_CORE_VERSION__ = "core-1.1-sigd"
+__SAQER_CORE_VERSION__ = "core-1.2-sigd+tick"
 
 import os, json, time, hmac, hashlib, threading, requests
 from uuid import uuid4
@@ -96,8 +96,8 @@ def _parse_amount_precision(ap, min_base_hint: float|int=0) -> tuple[int,float]:
         step=float(v); return _count_decimals_of_step(step), step
     except: return 8, 1e-8
 
-# ---- NEW: دعم pricePrecision كـ significant digits أو decimals
 def load_markets_once():
+    """يدعم pricePrecision كـ step-decimals أو significant-digits (عدد خانات)."""
     global MARKET_MAP, MARKET_META
     if MARKET_MAP and MARKET_META: return
     rows = requests.get(f"{BASE_URL}/markets", timeout=10).json()
@@ -113,10 +113,10 @@ def load_markets_once():
         pp_raw = r.get("pricePrecision", 6)
         ap_raw = r.get("amountPrecision", 8)
 
-        # amount (كما كان)
+        # amount
         amt_dec, st=_parse_amount_precision(ap_raw, min_base)
 
-        # price: إمّا step-decimals أو significant-digits
+        # price
         price_dec = None
         price_sig = None
         try:
@@ -144,9 +144,57 @@ def load_markets_once():
 def coin_to_market(coin:str)->str|None:
     load_markets_once(); return MARKET_MAP.get((coin or "").upper())
 
-def price_decimals(market:str):
-    # قد ترجع None إذا السوق يعمل بخانات دالّة
-    return MARKET_META.get(market,{}).get("priceDecimals",6)
+# ---- NEW: tick آمن يعمل لكل الأسواق
+def price_tick(market: str) -> float:
+    """
+    يرجع حجم خطوة السعر (tick) بشكل آمن.
+    - للأسواق المعتمدة على decimals: 10^-dec
+    - لأسواق significant-digits: يعتمد على مرتبة السعر الحالية.
+    """
+    meta = MARKET_META.get(market, {}) or {}
+    dec = meta.get("priceDecimals")
+    sig = meta.get("priceSigDigits")
+
+    # نمط decimals
+    if isinstance(dec, int):
+        try:
+            return float(Decimal(1) / (Decimal(10) ** int(dec)))
+        except Exception:
+            return 0.0
+
+    # نمط significant-digits
+    try:
+        bid, ask = get_best_bid_ask(market)
+        p = bid or ask or 1.0
+        d = Decimal(str(p))
+        if d.is_zero():
+            return 0.0
+        exp = d.adjusted()  # موضع أول خانة
+        q   = Decimal(1).scaleb(exp - (int(sig) - 1)) if sig else Decimal("0")
+        return float(q) if q > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def price_decimals(market:str) -> int:
+    """
+    توافقية: لا ترجع أبداً None.
+    - لو السوق decimals → يرجّع العدد الصحيح.
+    - لو السوق sig-digits → يحوّل tick لاعدد منازل (لراحة بعض الاستراتيجيات القديمة).
+    """
+    meta = MARKET_META.get(market, {}) or {}
+    dec = meta.get("priceDecimals")
+    if isinstance(dec, int):
+        return dec
+    # اشتقاق من tick:
+    t = price_tick(market)
+    if t <= 0:
+        return 6
+    d = Decimal(str(t)).normalize()
+    try:
+        exp = -int(d.as_tuple().exponent)
+        return max(0, exp)
+    except Exception:
+        return 6
 
 def amount_decimals(market:str)->int: return int(MARKET_META.get(market,{}).get("amountDecimals",8))
 def step(market:str)->float: return float(MARKET_META.get(market,{}).get("step",1e-8))
@@ -178,7 +226,7 @@ def fmt_price(market:str, price: float|Decimal)->str:
             return w if not f else f"{w}.{f}"
         return s
 
-    # نمط step/decimals (القديم)
+    # نمط step/decimals
     dec = int(dec if dec is not None else 6)
     q = Decimal(10) ** -dec
     s = f"{d.quantize(q, rounding=ROUND_DOWN):f}"
@@ -241,15 +289,10 @@ def place_limit_postonly(market:str, side:str, price:float, amount:float):
     body, resp = _send(price, amount)
     err = (resp or {}).get("error", "")
 
-    # 1) postOnly → حرك تيك بسيط (لو متاح dec) وإلا خفّض شعرة/ارفع شعرة
+    # 1) postOnly → حرك خطوة آمنة
     if isinstance(err, str) and ("postonly" in err.lower() or "taker" in err.lower()):
-        dec = MARKET_META.get(market, {}).get("priceDecimals")
-        if dec is not None:
-            tick = float(Decimal(1) / (Decimal(10) ** int(dec)))
-            adj  = price - tick if side=="buy" else price + tick
-        else:
-            # سوق sig-digits: خفّض/ارفع بنسبة صغيرة جدًا
-            adj = price * (0.999999 if side=="buy" else 1.000001)
+        tick = price_tick(market)
+        adj  = price - tick if side=="buy" else price + tick
         return _send(adj, amount)
 
     # 2) Price is too detailed (sig-digits) — قصّه وأعد المحاولة
@@ -383,9 +426,11 @@ def notify_ready(market:str, reason:str, pnl_eur=None):
     if LINK_SECRET: headers["X-Link-Secret"]=LINK_SECRET
     coin=market.split("-")[0]
     try:
-        requests.post(ABUSIYAH_READY_URL,
-                      json={"coin":coin,"reason":reason,"pnl_eur":pnl_eur},
-                      headers=headers, timeout=6)
+        r = requests.post(ABUSIYAH_READY_URL,
+                          json={"coin":coin,"reason":reason,"pnl_eur":pnl_eur},
+                          headers=headers, timeout=6)
+        if not (200 <= r.status_code < 300):
+            tg_send(f"⚠️ ready فشل — HTTP {r.status_code} | {r.text[:160]}")
     except Exception as e:
         tg_send(f"⚠️ فشل نداء ready: {e}")
 
@@ -472,6 +517,7 @@ class CoreAPI:
     fmt_amount = staticmethod(fmt_amount)
     round_amount_down = staticmethod(round_amount_down)
     price_decimals = staticmethod(price_decimals)
+    price_tick = staticmethod(price_tick)  # <— NEW
 
     # State
     pos_get = staticmethod(pos_get); pos_set = staticmethod(pos_set); pos_clear = staticmethod(pos_clear)
