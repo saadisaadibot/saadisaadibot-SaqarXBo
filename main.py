@@ -538,7 +538,7 @@ CORE = CoreAPI()
 
 # ===== Watchdog: يرصد TP/SL ويحسب PnL ويبلّغ =====
 def start_watchdog():
-    from strategy import maybe_move_sl  # قابل للتعديل
+    from strategy import maybe_move_sl  # يظل موجود (لن يرفع SL لأننا ثابتين -2%)
     def loop():
         while True:
             try:
@@ -548,40 +548,44 @@ def start_watchdog():
                     market = key.split(":", 2)[-1]
                     pos = pos_get(market)
                     if not pos: continue
-                    base=float(pos.get("base") or 0); avg=float(pos.get("avg") or 0)
-                    slp=float(pos.get("sl_price") or 0); tp_oid=pos.get("tp_oid")
-                    # TP filled؟
+
+                    base=float(pos.get("base") or 0)
+                    avg=float(pos.get("avg") or 0)
+                    tp_oid=pos.get("tp_oid")
+                    sl_oid=pos.get("sl_oid")  # NEW: SL الرسمي من المنصّة
+
+                    # 1) TP filled؟
                     if tp_oid:
                         st = order_status(market, tp_oid)
                         if (st or {}).get("status","").lower() == "filled":
                             sell_avg, sold_b = _avg_from_order_fills(st)
                             if sell_avg <= 0 or sold_b <= 0:
-                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=45, want_base=base)
+                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=60, want_base=base)
                             _send_sale_notifications(market, avg, (sold_b or base), (sell_avg or 0.0), reason="tp_filled")
-                            pos_clear(market)
-                            continue
-                    # تحديث SL ذكي (قفل ربح)
+                            pos_clear(market); continue
+
+                    # 2) SL الرسمي filled؟
+                    if sl_oid:
+                        st = order_status(market, sl_oid)
+                        s = (st or {}).get("status","").lower()
+                        if s == "filled":
+                            sell_avg, sold_b = _avg_from_order_fills(st)
+                            if sell_avg <= 0 or sold_b <= 0:
+                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=60, want_base=base)
+                            _send_sale_notifications(market, avg, (sold_b or base), (sell_avg or 0.0), reason="sl_filled")
+                            pos_clear(market); continue
+
+                    # 3) (اختياري) قفل ربح تدريجي — لن يغيّر SL لأننا ثابتين، لكنه لن يؤذي
                     bid,_ = get_best_bid_ask(market)
+                    slp=float(pos.get("sl_price") or 0)
                     new_sl = maybe_move_sl(CORE, market, avg, base, bid, slp)
                     if new_sl and new_sl>0 and (slp<=0 or new_sl>slp):
                         pos["sl_price"]=new_sl; pos_set(market, pos); tg_send(f"🔒 قفل ربح — SL={new_sl:.8f} ({market})")
-                    # SL
-                    if bid>0 and slp>0 and bid <= slp:
-                        if tp_oid:
-                            try: cancel_order_blocking(market, tp_oid, wait_sec=3.0)
-                            except: pass
-                        sell_res = emergency_taker_sell(market, base)
-                        sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=45, want_base=base)
-                        if sell_avg <= 0 or sold_b <= 0:
-                            sell_avg, sold_b = bid, base
-                        _send_sale_notifications(market, avg, sold_b, sell_avg, reason=("sl_triggered" if sell_res.get("ok") else "sl_fail"))
-                        pos_clear(market)
-                        continue
+
                 time.sleep(max(0.4, SL_CHECK_SEC))
             except Exception as e:
                 print("watchdog err:", e); time.sleep(1.0)
     threading.Thread(target=loop, daemon=True).start()
-
 # ===== Webhook & Telegram =====
 COIN_RE = __import__("re").compile(r"^[A-Z0-9]{2,15}$")
 
