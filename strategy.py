@@ -287,7 +287,6 @@ def on_tg_command(core, text):
             res = core.reset_state()
             if res.get("ok"):
                 core.tg_send("✅ تم مسح الحالة بالكامل (Redis). جاهز لأوامر جديدة.")
-                # (اختياري) نداء ready لأبو صياح ليكمل دورة العمل:
                 try: core.notify_ready("ALL-EUR", reason="emergency_reset", pnl_eur=None)
                 except: pass
             else:
@@ -296,33 +295,38 @@ def on_tg_command(core, text):
             core.tg_send(f"🐞 خطأ أثناء reset: {type(e).__name__}: {e}")
         return
 
-    # ... بقية أوامر التلغرام الحالية ...
-    if low.startswith("بيع"):
-        parts=text.split()
-        if len(parts)<2: core.tg_send("صيغة: بيع COIN [AMOUNT]"); return
+    # بيع
+    if t.startswith("بيع"):
+        parts = text.split()
+        if len(parts) < 2:
+            core.tg_send("صيغة: بيع COIN [AMOUNT]"); return
         coin = parts[1].upper().strip()
         market = core.coin_to_market(coin)
-        if not market: core.tg_send("⛔ عملة غير صالحة."); return
-        amt=None
-        if len(parts)>=3:
-            try: amt=float(parts[2])
-            except: amt=None
+        if not market:
+            core.tg_send("⛔ عملة غير صالحة."); return
+        amt = None
+        if len(parts) >= 3:
+            try: amt = float(parts[2])
+            except: amt = None
         if amt is None:
-            base=market.split("-")[0]; bal=core.balance(base)
-            amt=core.round_amount_down(market, bal)
+            base = market.split("-")[0]; bal = core.balance(base)
+            amt = core.round_amount_down(market, bal)
         ask = core.get_best_bid_ask(market)[1]
         _, resp = core.place_limit_postonly(market, "sell", ask, amt)
         ok = not bool((resp or {}).get("error"))
         core.tg_send(("✅ أُرسل أمر بيع" if ok else "⚠️ فشل البيع") + f" — {market}\n{json.dumps(resp,ensure_ascii=False)}")
         return
 
-    if low.startswith("الغ"):
-        parts=text.split()
-        if len(parts)<2: core.tg_send("صيغة: الغ COIN"); return
+    # إلغاء
+    if t.startswith("الغ"):
+        parts = text.split()
+        if len(parts) < 2:
+            core.tg_send("صيغة: الغ COIN"); return
         coin = parts[1].upper().strip()
         market = core.coin_to_market(coin)
-        if not market: core.tg_send("⛔ عملة غير صالحة."); return
-        info=core.open_get(market); ok=False; final="unknown"; last={}
+        if not market:
+            core.tg_send("⛔ عملة غير صالحة."); return
+        info = core.open_get(market); ok = False; final = "unknown"; last = {}
         if info and info.get("orderId"):
             ok, final, last = core.cancel_order_blocking(market, info["orderId"], wait_sec=12.0)
             if ok: core.open_clear(market)
