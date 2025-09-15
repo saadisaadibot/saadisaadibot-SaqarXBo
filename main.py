@@ -3,7 +3,7 @@
 # تشغيل Flask + اتصالات Bitvavo + Redis state + Telegram + Ready callback
 # واجهة CoreAPI ثابتة يستهلكها strategy.py فقط
 
-__SAQER_CORE_VERSION__ = "core-1.2-sigd+tick+resetfix"
+__SAQER_CORE_VERSION__ = "core-1.3-sigd+tick+resetfix+stoploss"
 
 import os, json, time, hmac, hashlib, threading, requests
 from uuid import uuid4
@@ -25,7 +25,7 @@ PORT = int(os.getenv("PORT","8080"))
 BASE_URL = "https://api.bitvavo.com/v2"
 MAKER_FEE_RATE = float(os.getenv("MAKER_FEE_RATE","0.001"))
 
-# مصادر الأسعار (اختياري)
+# مصادر الأسعار
 PRICE_SOURCE     = os.getenv("PRICE_SOURCE","redis_http").lower()  # redis_only|http_only|redis_http
 BOOK_HASH_NS     = os.getenv("BOOK_HASH_NS","saqer:book")
 SESSION_NS       = os.getenv("SESSION_NS","saqer:sessions")
@@ -144,51 +144,33 @@ def load_markets_once():
 def coin_to_market(coin:str)->str|None:
     load_markets_once(); return MARKET_MAP.get((coin or "").upper())
 
-# ---- NEW: tick آمن يعمل لكل الأسواق
+# ---- tick آمن
 def price_tick(market: str) -> float:
-    """
-    يرجع حجم خطوة السعر (tick) بشكل آمن.
-    - للأسواق المعتمدة على decimals: 10^-dec
-    - لأسواق significant-digits: يعتمد على مرتبة السعر الحالية.
-    """
     meta = MARKET_META.get(market, {}) or {}
     dec = meta.get("priceDecimals")
     sig = meta.get("priceSigDigits")
-
-    # نمط decimals
     if isinstance(dec, int):
         try:
             return float(Decimal(1) / (Decimal(10) ** int(dec)))
         except Exception:
             return 0.0
-
-    # نمط significant-digits
     try:
         bid, ask = get_best_bid_ask(market)
         p = bid or ask or 1.0
         d = Decimal(str(p))
-        if d.is_zero():
-            return 0.0
-        exp = d.adjusted()  # موضع أول خانة
+        if d.is_zero(): return 0.0
+        exp = d.adjusted()
         q   = Decimal(1).scaleb(exp - (int(sig) - 1)) if sig else Decimal("0")
         return float(q) if q > 0 else 0.0
     except Exception:
         return 0.0
 
 def price_decimals(market:str) -> int:
-    """
-    توافقية: لا ترجع أبداً None.
-    - لو السوق decimals → يرجّع العدد الصحيح.
-    - لو السوق sig-digits → يحوّل tick لاعدد منازل (لراحة بعض الاستراتيجيات القديمة).
-    """
     meta = MARKET_META.get(market, {}) or {}
     dec = meta.get("priceDecimals")
-    if isinstance(dec, int):
-        return dec
-    # اشتقاق من tick:
+    if isinstance(dec, int): return dec
     t = price_tick(market)
-    if t <= 0:
-        return 6
+    if t <= 0: return 6
     d = Decimal(str(t)).normalize()
     try:
         exp = -int(d.as_tuple().exponent)
@@ -200,33 +182,26 @@ def amount_decimals(market:str)->int: return int(MARKET_META.get(market,{}).get(
 def step(market:str)->float: return float(MARKET_META.get(market,{}).get("step",1e-8))
 def min_base(market:str)->float: return float(MARKET_META.get(market,{}).get("minBase",0.0))
 
-# ---- NEW: تقريب للسفلي حسب عدد الخانات الدالّة
 def _round_to_sig_digits_down(value: float | Decimal, sig: int) -> Decimal:
     d = Decimal(str(value))
     if d.is_zero():
         return Decimal("0")
-    exp = d.adjusted()  # موضع أول خانة
-    quant = Decimal(1).scaleb(exp - (sig - 1))  # 10^(exp-(sig-1))
-    return (d // quant) * quant  # floor على الشبكة
+    exp = d.adjusted()
+    quant = Decimal(1).scaleb(exp - (sig - 1))
+    return (d // quant) * quant
 
-# ---- NEW: fmt_price يدعم sig-digits أو decimals
 def fmt_price(market:str, price: float|Decimal)->str:
     meta = MARKET_META.get(market, {}) or {}
     sig = meta.get("priceSigDigits")
     dec = meta.get("priceDecimals")
-
     d = Decimal(str(price))
-
     if isinstance(sig, int) and sig > 0:
         d = _round_to_sig_digits_down(d, sig)
         s = f"{d:f}"
         if "." in s:
-            w, f = s.split(".",1)
-            f = f.rstrip("0")
+            w, f = s.split(".",1); f = f.rstrip("0")
             return w if not f else f"{w}.{f}"
         return s
-
-    # نمط step/decimals
     dec = int(dec if dec is not None else 6)
     q = Decimal(10) ** -dec
     s = f"{d.quantize(q, rounding=ROUND_DOWN):f}"
@@ -267,14 +242,8 @@ def get_best_bid_ask(market: str) -> tuple[float,float]:
         except: pass
     return bid, ask
 
-# ===== Emergency Reset (قبل استعماله داخل CoreAPI) =====
+# ===== Emergency Reset =====
 def reset_state():
-    """
-    يمسح كل مفاتيح الحالة الخاصة بصقر من Redis:
-    - جلسات المراكز (SESSION_NS)
-    - معلومات الفتح (OPEN_NS)
-    - كاش دفتر الأوامر (BOOK_HASH_NS)
-    """
     if not R:
         tg_send("⚠️ لا يوجد Redis؛ لا شيء أمحوه.")
         return {"ok": True, "deleted": 0}
@@ -310,13 +279,11 @@ def place_limit_postonly(market:str, side:str, price:float, amount:float):
     body, resp = _send(price, amount)
     err = (resp or {}).get("error", "")
 
-    # 1) postOnly → حرك خطوة آمنة
     if isinstance(err, str) and ("postonly" in err.lower() or "taker" in err.lower()):
         tick = price_tick(market)
         adj  = price - tick if side=="buy" else price + tick
         return _send(adj, amount)
 
-    # 2) Price is too detailed (sig-digits) — قصّه وأعد المحاولة
     if isinstance(err, str) and "price is too detailed" in err.lower():
         sig = MARKET_META.get(market, {}).get("priceSigDigits")
         if isinstance(sig, int) and sig > 0:
@@ -324,6 +291,37 @@ def place_limit_postonly(market:str, side:str, price:float, amount:float):
             return _send(p_adj, amount)
 
     return body, resp
+
+def place_stoploss_limit(market: str, amount: float, stop_price: float, limit_price: float):
+    """
+    يضع أمر StopLossLimit رسمي (سيل) — Bitvavo تتطلب operatorId.
+    """
+    body = {
+        "market": market,
+        "side": "sell",
+        "orderType": "stopLossLimit",
+        "triggerType": "price",
+        "triggerPrice": fmt_price(market, stop_price),
+        "price": fmt_price(market, limit_price),
+        "amount": fmt_amount(market, round_amount_down(market, amount)),
+        "timeInForce": "GTC",
+        "operatorId": "saqer-sl"
+    }
+    ts = str(int(time.time() * 1000))
+    sig = _sign(ts, "POST", "/v2/order", json.dumps(body, separators=(',',':')))
+    headers = {
+        "Bitvavo-Access-Key": API_KEY,
+        "Bitvavo-Access-Timestamp": ts,
+        "Bitvavo-Access-Signature": sig,
+        "Bitvavo-Access-Window": "10000",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(f"{BASE_URL}/order", headers=headers, json=body, timeout=10)
+    try:
+        data = r.json()
+    except:
+        data = {"error": r.text}
+    return body, data
 
 def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
     deadline = time.time() + max(wait_sec, 6.0)
@@ -419,8 +417,8 @@ def open_get(market:str)->dict:
     out={}
     for k,v in d.items():
         try: out[k]=json.loads(v)
-        except: out[k]=v
-    return out
+        except: out=k and v
+    return out if isinstance(out, dict) else {}
 
 def open_clear(market:str):
     if R: R.delete(_key(OPEN_NS, market))
@@ -461,7 +459,7 @@ def _avg_from_order_fills(order_obj: dict) -> tuple[float, float]:
             continue
     return ((total_q / total_b), total_b) if (total_b > 0 and total_q > 0) else (0.0, 0.0)
 
-def _recent_sell_avg(market: str, lookback_sec: int = 45, want_base: float | None = None) -> tuple[float, float]:
+def _recent_sell_avg(market: str, lookback_sec: int = 60, want_base: float | None = None) -> tuple[float, float]:
     now_ms = int(time.time() * 1000)
     trades = bv_request("GET", f"/trades?market={market}&limit=50")
     if not isinstance(trades, list): 
@@ -480,9 +478,6 @@ def _recent_sell_avg(market: str, lookback_sec: int = 45, want_base: float | Non
         except Exception:
             continue
     if total_b > 0 and total_q > 0:
-        if want_base is not None and want_base > 0:
-            if abs(total_b - want_base) / want_base > 0.1:
-                pass
         return (total_q / total_b), total_b
     return 0.0, 0.0
 
@@ -512,6 +507,7 @@ class CoreAPI:
     # سوق/أوامر
     get_best_bid_ask = staticmethod(get_best_bid_ask)
     place_limit_postonly = staticmethod(place_limit_postonly)
+    place_stoploss_limit = staticmethod(place_stoploss_limit)  # NEW
     cancel_order_blocking = staticmethod(cancel_order_blocking)
     order_status = staticmethod(order_status)
     emergency_taker_sell = staticmethod(emergency_taker_sell)
@@ -538,7 +534,7 @@ CORE = CoreAPI()
 
 # ===== Watchdog: يرصد TP/SL ويحسب PnL ويبلّغ =====
 def start_watchdog():
-    from strategy import maybe_move_sl  # يظل موجود (لن يرفع SL لأننا ثابتين -2%)
+    from strategy import maybe_move_sl  # موجود لأغراض التوافق
     def loop():
         while True:
             try:
@@ -552,7 +548,8 @@ def start_watchdog():
                     base=float(pos.get("base") or 0)
                     avg=float(pos.get("avg") or 0)
                     tp_oid=pos.get("tp_oid")
-                    sl_oid=pos.get("sl_oid")  # NEW: SL الرسمي من المنصّة
+                    sl_oid=pos.get("sl_oid")
+                    slp=float(pos.get("sl_price") or 0)
 
                     # 1) TP filled؟
                     if tp_oid:
@@ -560,24 +557,22 @@ def start_watchdog():
                         if (st or {}).get("status","").lower() == "filled":
                             sell_avg, sold_b = _avg_from_order_fills(st)
                             if sell_avg <= 0 or sold_b <= 0:
-                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=60, want_base=base)
+                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=60)
                             _send_sale_notifications(market, avg, (sold_b or base), (sell_avg or 0.0), reason="tp_filled")
                             pos_clear(market); continue
 
                     # 2) SL الرسمي filled؟
                     if sl_oid:
                         st = order_status(market, sl_oid)
-                        s = (st or {}).get("status","").lower()
-                        if s == "filled":
+                        if (st or {}).get("status","").lower() == "filled":
                             sell_avg, sold_b = _avg_from_order_fills(st)
                             if sell_avg <= 0 or sold_b <= 0:
-                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=60, want_base=base)
+                                sell_avg, sold_b = _recent_sell_avg(market, lookback_sec=60)
                             _send_sale_notifications(market, avg, (sold_b or base), (sell_avg or 0.0), reason="sl_filled")
                             pos_clear(market); continue
 
-                    # 3) (اختياري) قفل ربح تدريجي — لن يغيّر SL لأننا ثابتين، لكنه لن يؤذي
+                    # 3) (اختياري) قفل ربح — لن يغيّر SL الثابت عندك، لكنه آمن
                     bid,_ = get_best_bid_ask(market)
-                    slp=float(pos.get("sl_price") or 0)
                     new_sl = maybe_move_sl(CORE, market, avg, base, bid, slp)
                     if new_sl and new_sl>0 and (slp<=0 or new_sl>slp):
                         pos["sl_price"]=new_sl; pos_set(market, pos); tg_send(f"🔒 قفل ربح — SL={new_sl:.8f} ({market})")
@@ -586,6 +581,7 @@ def start_watchdog():
             except Exception as e:
                 print("watchdog err:", e); time.sleep(1.0)
     threading.Thread(target=loop, daemon=True).start()
+
 # ===== Webhook & Telegram =====
 COIN_RE = __import__("re").compile(r"^[A-Z0-9]{2,15}$")
 
