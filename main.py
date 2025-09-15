@@ -522,11 +522,31 @@ class CoreAPI:
     # State
     pos_get = staticmethod(pos_get); pos_set = staticmethod(pos_set); pos_clear = staticmethod(pos_clear)
     open_get= staticmethod(open_get); open_set= staticmethod(open_set); open_clear= staticmethod(open_clear)
-
+    reset_state = staticmethod(reset_state)
     # ثوابت
     fee_rate = MAKER_FEE_RATE
 
 CORE = CoreAPI()
+
+# ===== Emergency Reset =====
+def reset_state():
+    """
+    يمسح كل مفاتيح الحالة الخاصة بصقر من Redis:
+    - جلسات المراكز (SESSION_NS)
+    - معلومات الفتح (OPEN_NS)
+    - كاش دفتر الأوامر (BOOK_HASH_NS)
+    """
+    if not R:
+        tg_send("⚠️ لا يوجد Redis؛ لا شيء أمحوه.")
+    deleted = 0
+    for ns in (SESSION_NS, OPEN_NS, BOOK_HASH_NS):
+        for key in R.scan_iter(match=f"{ns}:*"):
+            try:
+                deleted += R.delete(key) or 0
+            except Exception:
+                pass
+    tg_send(f"🧹 Emergency reset — حُذف {deleted} مفتاحاً من Redis.")
+    return {"ok": True, "deleted": deleted}
 
 # ===== Watchdog: يرصد TP/SL ويحسب PnL ويبلّغ =====
 def start_watchdog():
