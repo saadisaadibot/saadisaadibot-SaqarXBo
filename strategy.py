@@ -125,20 +125,13 @@ def _market_regime(core, market: str):
 def _choose_tp_price_percent(core, market: str, avg_price: float) -> float:
     """
     خوارزمية 2025: اندماج RSI+ADX+ATR+اتجاه EMA لتحديد TP%
-    - سوق رينج (ADX<18): 0.30–0.60%
-    - ترند صاعد (ADX≥22 و EMA50>EMA200 و RSI 50–75): 0.70–1.20%
-    - ترند قوي جدًا (ADX≥28): قرب 1.20% (مع سقف)
-    - حالة تشبّع (RSI>75): خفّض الهدف (0.40–0.70%) لتفادي ارتداد
-    - ضبط أدق حسب ATR%
     """
     regime = _market_regime(core, market)
     if not regime.get("ok"):
-        # fallback آمن
         return avg_price * (1.0 + TP_MID_PCT/100.0)
 
     adx = regime["adx"]; rsi = regime["rsi"]; atr_pct = regime["atr_pct"]; trend_up = regime["trend_up"]
 
-    # قاعدة
     if adx < 18:
         base_pct = 0.40
     elif adx < 22:
@@ -148,30 +141,17 @@ def _choose_tp_price_percent(core, market: str, avg_price: float) -> float:
     else:
         base_pct = 1.05 if trend_up else 0.70
 
-    # تعديل RSI
     if rsi >= 75:
-        base_pct = min(base_pct, 0.70)  # قرب ذروة — هدف أهدأ
+        base_pct = min(base_pct, 0.70)
     elif rsi <= 40:
-        # ممكن ارتداد — لا نفرط، لكن إن كان ترند صاعد نخليها متوسطة
         base_pct = max(base_pct, 0.60 if trend_up else 0.40)
 
-    # تعديل ATR% (0.2% = 0.002)
-    # كل 0.1% ATR نضيف ~0.06% للهدف، بس بحد أقصى 0.3%
-    adj_from_atr = min(0.30, (atr_pct * 1000) * 0.06)  # atr_pct*100 = % ، *10 -> لكل 0.1%
-    tp_pct = base_pct + adj_from_atr
-
-    # حدود نهائية
-    tp_pct = max(TP_MIN_PCT, min(tp_pct, TP_MAX_PCT))
+    adj_from_atr = min(0.30, (atr_pct * 1000) * 0.06)
+    tp_pct = max(TP_MIN_PCT, min(base_pct + adj_from_atr, TP_MAX_PCT))
     return avg_price * (1.0 + tp_pct/100.0)
 
-# ============ مطاردة شراء طويلة النفس (لا تفشل) ============
+# ============ مطاردة شراء طويلة النفس ============
 def chase_buy(core, market:str, spend_eur:float) -> dict:
-    """
-    ترجع: {ok, status, avg_price, filled_base, spent_eur, last_oid?, ctx}
-    - تعيد التسعير بهدوء عندما يتحرك الـBid
-    - تلغي الطلب السابق قبل وضع الجديد
-    - تستمر حتى الامتلاء (أو تعيد ctx لو مشكلة حجم)
-    """
     last_oid=None; last_price=None
     min_tick = float(1.0 / (10 ** core.price_decimals(market)))
     while True:
@@ -190,7 +170,6 @@ def chase_buy(core, market:str, spend_eur:float) -> dict:
             time.sleep(0.6); continue
         last_oid = resp.get("orderId"); last_price = price
         core.open_set(market, {"orderId": last_oid, "side":"buy", "amount_init": amount})
-        # متابعة حتى الامتلاء — مع Reprice عند تحرك الـBid
         t0 = time.time()
         while True:
             st = core.order_status(market, last_oid)
@@ -204,7 +183,6 @@ def chase_buy(core, market:str, spend_eur:float) -> dict:
             if bid2 > 0 and (last_price is None or abs(bid2 - last_price) >= min_tick):
                 break
             time.sleep(0.25 if (time.time()-t0) < 5 else 0.5)
-        # يعيد الحلقة لوضع سعر جديد
 
 # ============ تحريك SL (Trailing باستخدام ATR) ============
 def _atr_price(core, market: str):
@@ -213,12 +191,6 @@ def _atr_price(core, market: str):
     return _atr(highs, lows, closes, ATR_LEN)
 
 def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, current_sl_price:float):
-    """
-    قواعد:
-    - إذا الربح غير المحقق > 0.3% → انقل SL إلى BE + 0.25*ATR (إن توفر ATR)
-    - إذا الربح > 0.7% → ارفع SL إلى BE + 0.50*ATR
-    - لا تُنزل SL أبدًا (فقط ارفع)
-    """
     if base<=0 or current_bid<=0 or avg<=0: return current_sl_price
     gain_pct = (current_bid - avg) / avg * 100.0
     atr = _atr_price(core, market)
@@ -226,15 +198,10 @@ def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, cu
         return current_sl_price
     if atr and atr > 0:
         be = avg
-        if gain_pct > 0.7:
-            target = be + 0.50 * atr
-        else:
-            target = be + 0.25 * atr
+        target = be + (0.50 if gain_pct > 0.7 else 0.25) * atr
         new_sl = max(current_sl_price or 0.0, target)
-        # لا ترفع SL فوق السعر الحالي (تحاشي ضرب فوري)
         return min(new_sl, current_bid)
     else:
-        # بدون ATR: انقل إلى BE فقط
         return max(current_sl_price or 0.0, avg)
 
 # ============ تنفيذ شراء عند إشارة أبو صياح ============
@@ -260,22 +227,61 @@ def on_hook_buy(core, coin:str):
         core.notify_ready(market,"buy_failed")
         return
 
-    avg=float(res.get("avg_price") or 0); base=float(res.get("filled_base") or 0)
-    core.tg_send(f"✅ اشترى — {market}\nAvg={avg:.8f}, Base={base}")
+    avg = float(res.get("avg_price") or 0)
+    base_bought = float(res.get("filled_base") or 0)
+    core.tg_send(f"✅ اشترى — {market}\nAvg={avg:.8f}, Base={base_bought}")
 
-    # اختيار هدف TP ديناميكي
+    # هدف TP ديناميكي
     tp_price = _choose_tp_price_percent(core, market, avg)
 
-    # طلب TP Maker
-    _, resp = core.place_limit_postonly(market, "sell", tp_price, core.round_amount_down(market, base))
-    if isinstance(resp, dict) and resp.get("error"):
-        core.tg_send(f"⚠️ فشل وضع TP — {market}\n{json.dumps(resp,ensure_ascii=False)}")
+    # --- ضع TP مثل البيع اليدوي: اعتمد على الرصيد الفعلي بعد مهلة قصيرة ---
+    base_sym = market.split("-")[0]
+    minb     = core.min_base(market)
 
-    tp_oid = (resp or {}).get("orderId")
-    sl_price = avg * (1.0 + (SL_PCT/100.0))  # SL ابتدائي -1%
-    core.pos_set(market, {"avg":avg,"base":base,"tp_oid":tp_oid,"sl_price":sl_price,"tp_target":tp_price})
+    # انتظر ليتحدّث الرصيد (لأن الامتلاء قد يكون على أجزاء)
+    sell_amt = 0.0
+    t0 = time.time()
+    while time.time() - t0 < 6.0:          # انتظار أقصى 6 ثوانٍ
+        avail = core.balance(base_sym)
+        sell_amt = core.round_amount_down(market, max(0.0, avail))
+        if sell_amt >= minb:
+            break
+        time.sleep(0.4)
+
+    if sell_amt < minb:
+        # لو لسه أقل من الحد الأدنى، فعّل SL فقط وخلي الـwatchdog يتابع
+        sl_price = avg * (1.0 + (SL_PCT/100.0))  # -1% افتراضيًا
+        core.pos_set(market, {"avg": avg, "base": base_bought, "tp_oid": None,
+                              "sl_price": sl_price, "tp_target": tp_price})
+        core.open_clear(market)
+        core.tg_send(f"ℹ️ لم أضع TP لأن الكمية المتاحة < minBase ({minb}). SL={sl_price:.8f}")
+        return
+
+    # حاول وضع TP (PostOnly) على كامل الرصيد الفعلي؛ إن صار نقص بسيط قصّ خطوة وكرر
+    tp_oid = None
+    last_err = None
+    for _ in range(4):
+        _, resp = core.place_limit_postonly(market, "sell", tp_price, sell_amt)
+        if isinstance(resp, dict) and not resp.get("error"):
+            tp_oid = resp.get("orderId"); break
+        last_err = resp
+        err = (resp or {}).get("error", "").lower()
+        if "insufficient" in err and sell_amt >= minb:
+            # قلّل بمقدار خطوة كمية واحدة ثم أعد المحاولة
+            step_amt = core.step(market) or 0.0
+            sell_amt = core.round_amount_down(market, max(0.0, sell_amt - step_amt))
+            if sell_amt < minb: break
+        time.sleep(0.5)
+
+    if not tp_oid:
+        core.tg_send(f"⚠️ فشل وضع TP — {market}\n{json.dumps(last_err, ensure_ascii=False)}")
+
+    # ثبّت SL -1% وخزّن الحالة ليستمر القفل المتدرّج عبر الـwatchdog
+    sl_price = avg * (1.0 + (SL_PCT/100.0))
+    core.pos_set(market, {"avg": avg, "base": base_bought, "tp_oid": tp_oid,
+                          "sl_price": sl_price, "tp_target": tp_price})
     core.open_clear(market)
-    core.tg_send(f"📈 TP={tp_price:.8f} ، SL={sl_price:.8f} (RSI+ADX+ATR)")
+    core.tg_send(f"📈 TP={tp_price:.8f} | SL={sl_price:.8f} — تم وضع TP على الرصيد الفعلي.")
 
 # ============ أوامر تيليغرام ============
 def on_tg_command(core, text):
