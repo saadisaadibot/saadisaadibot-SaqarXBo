@@ -3,7 +3,7 @@
 # تشغيل Flask + اتصالات Bitvavo + Redis state + Telegram + Ready callback
 # واجهة CoreAPI ثابتة يستهلكها strategy.py فقط
 
-__SAQER_CORE_VERSION__ = "core-1.2-sigd+tick"
+__SAQER_CORE_VERSION__ = "core-1.2-sigd+tick+resetfix"
 
 import os, json, time, hmac, hashlib, threading, requests
 from uuid import uuid4
@@ -267,6 +267,27 @@ def get_best_bid_ask(market: str) -> tuple[float,float]:
         except: pass
     return bid, ask
 
+# ===== Emergency Reset (قبل استعماله داخل CoreAPI) =====
+def reset_state():
+    """
+    يمسح كل مفاتيح الحالة الخاصة بصقر من Redis:
+    - جلسات المراكز (SESSION_NS)
+    - معلومات الفتح (OPEN_NS)
+    - كاش دفتر الأوامر (BOOK_HASH_NS)
+    """
+    if not R:
+        tg_send("⚠️ لا يوجد Redis؛ لا شيء أمحوه.")
+        return {"ok": True, "deleted": 0}
+    deleted = 0
+    for ns in (SESSION_NS, OPEN_NS, BOOK_HASH_NS):
+        for key in R.scan_iter(match=f"{ns}:*"):
+            try:
+                deleted += R.delete(key) or 0
+            except Exception:
+                pass
+    tg_send(f"🧹 Emergency reset — حُذف {deleted} مفتاحاً من Redis.")
+    return {"ok": True, "deleted": deleted}
+
 # ===== أوامر (place / cancel / status / balance) =====
 def place_limit_postonly(market:str, side:str, price:float, amount:float):
     def _send(p: float, a: float):
@@ -304,20 +325,12 @@ def place_limit_postonly(market:str, side:str, price:float, amount:float):
 
     return body, resp
 
-# ===== إلغاء صارم (DELETE /order بجسم JSON + توقيع) =====
 def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
-    """
-    يرسل DELETE /order بجسم JSON (market, orderId, operatorId="")
-    ويعمل Poll حتى يصير الأمر canceled/filled أو ينتهي الوقت.
-    """
     deadline = time.time() + max(wait_sec, 6.0)
-
     def _poll():
         st = bv_request("GET", f"/order?market={market}&orderId={orderId}")
         s  = (st or {}).get("status","").lower() if isinstance(st, dict) else ""
         return s, (st if isinstance(st, dict) else {})
-
-    # 1) DELETE بجسم JSON + توقيع يدوي
     body = {"orderId": orderId, "market": market, "operatorId": ""}
     ts   = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(',',':'))
@@ -334,8 +347,6 @@ def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
         except: pass
     except Exception:
         pass
-
-    # 2) Poll سريع
     last_s, last_st = "unknown", {}
     while time.time() < deadline:
         s, st = _poll()
@@ -343,13 +354,9 @@ def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
         if s in ("canceled","filled"):
             return True, s, st
         time.sleep(0.4)
-
-    # 3) محاولة بديلة عبر QueryString
     try: _ = bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
     except Exception:
         pass
-
-    # 4) Poll أخير
     s, st = _poll()
     if s in ("canceled","filled"):
         return True, s, st
@@ -517,36 +524,17 @@ class CoreAPI:
     fmt_amount = staticmethod(fmt_amount)
     round_amount_down = staticmethod(round_amount_down)
     price_decimals = staticmethod(price_decimals)
-    price_tick = staticmethod(price_tick)  # <— NEW
+    price_tick = staticmethod(price_tick)
 
     # State
     pos_get = staticmethod(pos_get); pos_set = staticmethod(pos_set); pos_clear = staticmethod(pos_clear)
     open_get= staticmethod(open_get); open_set= staticmethod(open_set); open_clear= staticmethod(open_clear)
     reset_state = staticmethod(reset_state)
+
     # ثوابت
     fee_rate = MAKER_FEE_RATE
 
 CORE = CoreAPI()
-
-# ===== Emergency Reset =====
-def reset_state():
-    """
-    يمسح كل مفاتيح الحالة الخاصة بصقر من Redis:
-    - جلسات المراكز (SESSION_NS)
-    - معلومات الفتح (OPEN_NS)
-    - كاش دفتر الأوامر (BOOK_HASH_NS)
-    """
-    if not R:
-        tg_send("⚠️ لا يوجد Redis؛ لا شيء أمحوه.")
-    deleted = 0
-    for ns in (SESSION_NS, OPEN_NS, BOOK_HASH_NS):
-        for key in R.scan_iter(match=f"{ns}:*"):
-            try:
-                deleted += R.delete(key) or 0
-            except Exception:
-                pass
-    tg_send(f"🧹 Emergency reset — حُذف {deleted} مفتاحاً من Redis.")
-    return {"ok": True, "deleted": deleted}
 
 # ===== Watchdog: يرصد TP/SL ويحسب PnL ويبلّغ =====
 def start_watchdog():
@@ -610,9 +598,30 @@ def tg_webhook():
     text = (msg.get("text") or "").strip()
     if not chat_id or not _auth_chat(chat_id) or not text:
         return jsonify(ok=True)
-    try: on_tg_command(CORE, text)
-    except Exception as e: tg_send(f"🐞 TG err: {type(e).__name__}: {e}")
+
+    # أوامر الطوارئ على مستوى الكور
+    t = text.lower().strip()
+    if t in ("/reset", "reset", "/restart", "restart", "/flush", "flush"):
+        if not _auth_chat(chat_id):
+            return jsonify(ok=True)
+        res = reset_state()
+        try:
+            tg_send(f"✅ تم التنفيذ: reset — {res}")
+        finally:
+            return jsonify(ok=True)
+
+    try:
+        on_tg_command(CORE, text)
+    except Exception as e:
+        tg_send(f"🐞 TG err: {type(e).__name__}: {e}")
     return jsonify(ok=True)
+
+@app.route("/reset", methods=["POST"])
+def http_reset():
+    if LINK_SECRET and request.headers.get("X-Link-Secret","") != LINK_SECRET:
+        return jsonify(ok=False, err="bad secret"), 401
+    res = reset_state()
+    return jsonify(ok=True, **res), 200
 
 @app.route("/hook", methods=["POST"])
 def abusiyah_hook():
