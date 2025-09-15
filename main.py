@@ -3,7 +3,7 @@
 # تشغيل Flask + اتصالات Bitvavo + Redis state + Telegram + Ready callback
 # واجهة CoreAPI ثابتة يستهلكها strategy.py فقط
 
-__SAQER_CORE_VERSION__ = "core-1.0"
+__SAQER_CORE_VERSION__ = "core-1.1-sigd"
 
 import os, json, time, hmac, hashlib, threading, requests
 from uuid import uuid4
@@ -81,6 +81,7 @@ def bv_request(method: str, path: str, body=None, timeout=10):
 
 # ===== Meta & Precision =====
 MARKET_MAP, MARKET_META = {}, {}
+
 def _count_decimals_of_step(step: float) -> int:
     s = f"{step:.16f}".rstrip("0").rstrip(".")
     return len(s.split(".",1)[1]) if "." in s else 0
@@ -95,11 +96,7 @@ def _parse_amount_precision(ap, min_base_hint: float|int=0) -> tuple[int,float]:
         step=float(v); return _count_decimals_of_step(step), step
     except: return 8, 1e-8
 
-def _parse_price_precision(pp) -> int:
-    try:
-        v=float(pp); return _count_decimals_of_step(v) if (not float(v).is_integer() or v<1.0) else int(v)
-    except: return 6
-
+# ---- NEW: دعم pricePrecision كـ significant digits أو decimals
 def load_markets_once():
     global MARKET_MAP, MARKET_META
     if MARKET_MAP and MARKET_META: return
@@ -109,28 +106,84 @@ def load_markets_once():
         if r.get("quote")!="EUR": continue
         market=r.get("market"); base=(r.get("base") or "").upper()
         if not base or not market: continue
+
         min_quote=float(r.get("minOrderInQuoteAsset",0) or 0.0)
         min_base=float(r.get("minOrderInBaseAsset",0) or 0.0)
-        price_dec=_parse_price_precision(r.get("pricePrecision",6))
-        amt_dec, st=_parse_amount_precision(r.get("amountPrecision",8), min_base)
-        meta[market]={"priceDecimals":price_dec,"amountDecimals":amt_dec,"step":float(st),
-                      "minQuote":min_quote,"minBase":min_base}
+
+        pp_raw = r.get("pricePrecision", 6)
+        ap_raw = r.get("amountPrecision", 8)
+
+        # amount (كما كان)
+        amt_dec, st=_parse_amount_precision(ap_raw, min_base)
+
+        # price: إمّا step-decimals أو significant-digits
+        price_dec = None
+        price_sig = None
+        try:
+            v = float(pp_raw)
+            if float(v).is_integer() and v >= 1.0:
+                price_sig = int(v)  # عدد خانات دالّة
+            else:
+                price_dec = _count_decimals_of_step(v)  # دقة step
+        except Exception:
+            price_dec = 6
+
+        meta[market] = {
+            "priceDecimals": price_dec,            # قد تكون None
+            "priceSigDigits": price_sig,           # قد تكون None
+            "amountDecimals": amt_dec,
+            "step": float(st),
+            "minQuote": min_quote,
+            "minBase":  min_base,
+            "pp_raw": pp_raw,
+            "ap_raw": ap_raw,
+        }
         m[base]=market
     MARKET_MAP, MARKET_META=m, meta
 
 def coin_to_market(coin:str)->str|None:
     load_markets_once(); return MARKET_MAP.get((coin or "").upper())
 
-def price_decimals(market:str)->int: return int(MARKET_META.get(market,{}).get("priceDecimals",6))
+def price_decimals(market:str):
+    # قد ترجع None إذا السوق يعمل بخانات دالّة
+    return MARKET_META.get(market,{}).get("priceDecimals",6)
+
 def amount_decimals(market:str)->int: return int(MARKET_META.get(market,{}).get("amountDecimals",8))
 def step(market:str)->float: return float(MARKET_META.get(market,{}).get("step",1e-8))
 def min_base(market:str)->float: return float(MARKET_META.get(market,{}).get("minBase",0.0))
 
+# ---- NEW: تقريب للسفلي حسب عدد الخانات الدالّة
+def _round_to_sig_digits_down(value: float | Decimal, sig: int) -> Decimal:
+    d = Decimal(str(value))
+    if d.is_zero():
+        return Decimal("0")
+    exp = d.adjusted()  # موضع أول خانة
+    quant = Decimal(1).scaleb(exp - (sig - 1))  # 10^(exp-(sig-1))
+    return (d // quant) * quant  # floor على الشبكة
+
+# ---- NEW: fmt_price يدعم sig-digits أو decimals
 def fmt_price(market:str, price: float|Decimal)->str:
-    q = Decimal(10)**-price_decimals(market)
-    s = f"{(Decimal(str(price))).quantize(q, rounding=ROUND_DOWN):f}"
+    meta = MARKET_META.get(market, {}) or {}
+    sig = meta.get("priceSigDigits")
+    dec = meta.get("priceDecimals")
+
+    d = Decimal(str(price))
+
+    if isinstance(sig, int) and sig > 0:
+        d = _round_to_sig_digits_down(d, sig)
+        s = f"{d:f}"
+        if "." in s:
+            w, f = s.split(".",1)
+            f = f.rstrip("0")
+            return w if not f else f"{w}.{f}"
+        return s
+
+    # نمط step/decimals (القديم)
+    dec = int(dec if dec is not None else 6)
+    q = Decimal(10) ** -dec
+    s = f"{d.quantize(q, rounding=ROUND_DOWN):f}"
     if "." in s:
-        w,f = s.split(".",1); f=f[:price_decimals(market)].rstrip("0")
+        w,f = s.split(".",1); f=f[:dec].rstrip("0")
         return w if not f else f"{w}.{f}"
     return s
 
@@ -168,29 +221,45 @@ def get_best_bid_ask(market: str) -> tuple[float,float]:
 
 # ===== أوامر (place / cancel / status / balance) =====
 def place_limit_postonly(market:str, side:str, price:float, amount:float):
-    body = {
-        "market": market, "side": side, "orderType":"limit", "postOnly": True,
-        "clientOrderId": str(uuid4()),
-        "price": fmt_price(market, price),
-        "amount": fmt_amount(market, amount),
-        "operatorId": ""
-    }
-    ts=str(int(time.time()*1000))
-    sig=_sign(ts,"POST","/v2/order", json.dumps(body, separators=(',',':')))
-    headers={"Bitvavo-Access-Key":API_KEY,"Bitvavo-Access-Timestamp":ts,"Bitvavo-Access-Signature":sig,
-             "Bitvavo-Access-Window":"10000","Content-Type":"application/json"}
-    r = requests.post(f"{BASE_URL}/order", headers=headers, json=body, timeout=10)
-    try: data=r.json()
-    except: data={"error": r.text}
-    # إصلاح postOnly
-    if isinstance(data,dict) and isinstance(data.get("error"),str) and "postOnly" in data["error"]:
-        tick = float(Decimal(1) / (Decimal(10)**price_decimals(market)))
-        adj = price - tick if side=="buy" else price + tick
-        body["price"] = fmt_price(market, adj)
+    def _send(p: float, a: float):
+        body = {
+            "market": market, "side": side, "orderType":"limit", "postOnly": True,
+            "clientOrderId": str(uuid4()),
+            "price": fmt_price(market, p),
+            "amount": fmt_amount(market, a),
+            "operatorId": ""
+        }
+        ts=str(int(time.time()*1000))
+        sig=_sign(ts,"POST","/v2/order", json.dumps(body, separators=(',',':')))
+        headers={"Bitvavo-Access-Key":API_KEY,"Bitvavo-Access-Timestamp":ts,"Bitvavo-Access-Signature":sig,
+                 "Bitvavo-Access-Window":"10000","Content-Type":"application/json"}
         r = requests.post(f"{BASE_URL}/order", headers=headers, json=body, timeout=10)
         try: data=r.json()
         except: data={"error": r.text}
-    return body, data
+        return body, data
+
+    body, resp = _send(price, amount)
+    err = (resp or {}).get("error", "")
+
+    # 1) postOnly → حرك تيك بسيط (لو متاح dec) وإلا خفّض شعرة/ارفع شعرة
+    if isinstance(err, str) and ("postonly" in err.lower() or "taker" in err.lower()):
+        dec = MARKET_META.get(market, {}).get("priceDecimals")
+        if dec is not None:
+            tick = float(Decimal(1) / (Decimal(10) ** int(dec)))
+            adj  = price - tick if side=="buy" else price + tick
+        else:
+            # سوق sig-digits: خفّض/ارفع بنسبة صغيرة جدًا
+            adj = price * (0.999999 if side=="buy" else 1.000001)
+        return _send(adj, amount)
+
+    # 2) Price is too detailed (sig-digits) — قصّه وأعد المحاولة
+    if isinstance(err, str) and "price is too detailed" in err.lower():
+        sig = MARKET_META.get(market, {}).get("priceSigDigits")
+        if isinstance(sig, int) and sig > 0:
+            p_adj = float(_round_to_sig_digits_down(price, sig))
+            return _send(p_adj, amount)
+
+    return body, resp
 
 # ===== إلغاء صارم (DELETE /order بجسم JSON + توقيع) =====
 def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
@@ -206,7 +275,7 @@ def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
         return s, (st if isinstance(st, dict) else {})
 
     # 1) DELETE بجسم JSON + توقيع يدوي
-    body = {"orderId": orderId, "market": market, "operatorId": ""}  # operatorId ضروري لبعض البيئات
+    body = {"orderId": orderId, "market": market, "operatorId": ""}
     ts   = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(',',':'))
     headers = {
@@ -232,7 +301,7 @@ def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
             return True, s, st
         time.sleep(0.4)
 
-    # 3) محاولة بديلة عبر QueryString (بعض الحالات بتنجح هي)
+    # 3) محاولة بديلة عبر QueryString
     try: _ = bv_request("DELETE", f"/order?market={market}&orderId={orderId}")
     except Exception:
         pass
@@ -242,6 +311,7 @@ def cancel_order_blocking(market: str, orderId: str, wait_sec: float = 12.0):
     if s in ("canceled","filled"):
         return True, s, st
     return False, (s or "unknown"), (st or {})
+
 def order_status(market:str, orderId:str)->dict:
     return bv_request("GET", f"/order?market={market}&orderId={orderId}") or {}
 
