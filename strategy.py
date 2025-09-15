@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # strategy.py — الجزء القابل للتعديل
-# يضع TP + SL(-2%) فور الشراء، ويبلّغ بوضوح، ويراقب البيع اليدوي لإرسال Ready.
+# يضع TP + SL(-2%) فور الشراء برسائل واضحة، ويراقب البيع اليدوي لإرسال Ready.
 
 import time, json, threading
 from strategy_base import (
@@ -13,15 +13,9 @@ from strategy_base import (
 HEADROOM_EUR = 0.30
 SL_FIXED_PCT = -2.0  # ثابت دائمًا
 
-# ---------- SL trailing (اختياري – لن يؤثر لأن SL رسمي ثابت) ----------
-def _atr_price(core, market: str):
-    # نستخدم شمعات جاهزة من base
-    highs, lows, closes = core.bv_request("GET", f"/{market}/candles?interval=1m&limit=120")
-    if not isinstance(highs, list): return None
-    return None  # لا نحرّك SL – ثابت
-
+# ---------- SL trailing (مُعطَّل لأن SL رسمي ثابت) ----------
 def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, current_sl_price:float):
-    return current_sl_price  # لا نحركه
+    return current_sl_price
 
 # ---------- مراقبة بيع يدوي لإرسال Ready ----------
 def _watch_manual_sell(core, market: str, order_id: str, amt_hint: float|None):
@@ -88,7 +82,7 @@ def on_hook_buy(core, coin:str):
 
     # اختر TP + علّل السبب بإيجاز
     tp_price, reg = choose_tp_price(core, market, avg)
-    tp_pct = reg.get("tp_pct", 0.7)
+    tp_pct = ((tp_price / avg) - 1.0) * 100.0 if avg > 0 else 0.0
     reasons = []
     if reg:
         if reg.get("trend_up"): reasons.append("EMA50>EMA200")
@@ -107,42 +101,29 @@ def on_hook_buy(core, coin:str):
                 tp_oid = tp_resp.get("orderId"); break
             time.sleep(0.45)
 
-    # ضع SL رسمي ثابت -2% (stopLossLimit)
-    sl_price      = avg * (1.0 + SL_FIXED_PCT/100.0)      # 98%
-    trigger_price = avg * (1.0 + (SL_FIXED_PCT-0.1)/100)  # 97.9% لتأمين التفعيل
+    # ضع SL رسمي ثابت -2% (StopLossLimit) — limit تحت الـstop بشوي
+    sl_stop  = avg * (1.0 + SL_FIXED_PCT/100.0)      # 98%
+    sl_limit = sl_stop * 0.999
     sl_oid = None; sl_resp=None
-    try:
-        sl_resp = core.bv_request("POST", "/order", body={
-            "market": market,
-            "side": "sell",
-            "orderType": "stopLossLimit",
-            "amount": core.fmt_amount(market, sell_amt),
-            "price": core.fmt_price(market, sl_price),
-            "triggerType": "last",
-            "triggerPrice": core.fmt_price(market, trigger_price),
-            "timeInForce": "GTC"
-        })
+    if sell_amt >= minb:
+        _, sl_resp = core.place_stoploss_limit(market, sell_amt, sl_stop, sl_limit)
         if isinstance(sl_resp, dict) and not sl_resp.get("error"):
             sl_oid = sl_resp.get("orderId")
-    except Exception as e:
-        sl_resp = {"error": str(e)}
 
     # خزّن المركز للـwatchdog
     core.pos_set(market, {
         "avg": avg, "base": base_bought,
         "tp_oid": tp_oid, "tp_target": tp_price,
-        "sl_oid": sl_oid, "sl_price": sl_price
+        "sl_oid": sl_oid, "sl_price": sl_stop
     })
     core.open_clear(market)
 
     # --- رسائل قصيرة مفهومة ---
     core.tg_send(
-        "✅ BUY {m}\n"
-        "Avg {a:.8f} | Base {b}\n"
-        "TP {tp:.8f} (+{pct:.2f}%) — {why}\n"
-        "SL {sl:.8f} (−2% ثابت)".format(
-            m=market, a=avg, b=base_bought, tp=tp_price, pct=tp_pct, why=reason_txt, sl=sl_price
-        )
+        f"✅ BUY {market}\n"
+        f"Avg {avg:.8f} | Base {base_bought}\n"
+        f"TP {tp_price:.8f} ({tp_pct:+.2f}%) — {reason_txt}\n"
+        f"SL {sl_stop:.8f} (−2% ثابت)"
     )
     if tp_oid:
         core.tg_send(f"🏷️ TP OID: {tp_oid}")
