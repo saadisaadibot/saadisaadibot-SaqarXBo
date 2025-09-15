@@ -278,9 +278,25 @@ def on_hook_buy(core, coin:str):
     core.tg_send(f"📈 TP={tp_price:.8f} ، SL={sl_price:.8f} (RSI+ADX+ATR)")
 
 # ============ أوامر تيليغرام ============
-def on_tg_command(core, text:str):
-    low = text.lower().strip()
+def on_tg_command(core, text):
+    t = (text or "").strip().lower()
 
+    # —— Emergency restart: امسح كل حالة Redis فورًا
+    if t in ("restart", "reset", "ريستارت", "ريست", "اعادة", "إعادة"):
+        try:
+            res = core.reset_state()
+            if res.get("ok"):
+                core.tg_send("✅ تم مسح الحالة بالكامل (Redis). جاهز لأوامر جديدة.")
+                # (اختياري) نداء ready لأبو صياح ليكمل دورة العمل:
+                try: core.notify_ready("ALL-EUR", reason="emergency_reset", pnl_eur=None)
+                except: pass
+            else:
+                core.tg_send(f"⚠️ فشل المسح: {res}")
+        except Exception as e:
+            core.tg_send(f"🐞 خطأ أثناء reset: {type(e).__name__}: {e}")
+        return
+
+    # ... بقية أوامر التلغرام الحالية ...
     if low.startswith("بيع"):
         parts=text.split()
         if len(parts)<2: core.tg_send("صيغة: بيع COIN [AMOUNT]"); return
