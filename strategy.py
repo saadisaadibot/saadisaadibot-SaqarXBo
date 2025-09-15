@@ -1,23 +1,143 @@
 # -*- coding: utf-8 -*-
-# strategy.py — الجزء القابل للتعديل
-# يضع TP + SL(-2%) فور الشراء برسائل واضحة، ويراقب البيع اليدوي لإرسال Ready.
+# strategy.py — يضع TP + SL(-2%) فور الشراء، مع operatorId صحيح للـ SL، ورسائل واضحة.
 
 import time, json, threading
-from strategy_base import (
-    ADX_LEN, RSI_LEN, EMA_FAST, EMA_SLOW, ATR_LEN,
-    TP_MIN_PCT, TP_MID_PCT, TP_MAX_PCT,
-    chase_buy, choose_tp_price, infer_recent_avg_buy
-)
 
-# إعدادات سريعة (تُعدّل هنا فقط)
+# —— إعدادات قابلة للتعديل ——
 HEADROOM_EUR = 0.30
-SL_FIXED_PCT = -2.0  # ثابت دائمًا
+SL_FIXED_PCT = -2.0  # SL ثابت دائماً
 
-# ---------- SL trailing (مُعطَّل لأن SL رسمي ثابت) ----------
+# ===== أدوات مساعدة سريعة =====
+def _fetch_candles(core, market: str, interval="1m", limit=240):
+    data = core.bv_request("GET", f"/{market}/candles?interval={interval}&limit={limit}")
+    if not isinstance(data, list): return [], [], []
+    highs = [float(r[2]) for r in data]
+    lows  = [float(r[3]) for r in data]
+    closes= [float(r[4]) for r in data]
+    return highs, lows, closes
+
+def _series_ema(values, period):
+    if len(values) < period: return []
+    k = 2.0 / (period + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+def _rsi(closes, period=14):
+    if len(closes) < period+1: return None
+    gains = losses = 0.0
+    for i in range(-period, 0):
+        d = closes[i] - closes[i-1]
+        if d >= 0: gains += d
+        else: losses += -d
+    avg_gain = gains / period
+    avg_loss = (losses / period) if losses > 0 else 1e-9
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def _atr(highs, lows, closes, period=14):
+    n = len(closes)
+    if n < period+1: return None
+    trs = []
+    for i in range(1, n):
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr*(period-1) + tr) / period
+    return atr
+
+def _adx(highs, lows, closes, period=14):
+    n = len(closes)
+    if n < period+1: return None
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, n):
+        up = highs[i] - highs[i-1]
+        dn = lows[i-1] - lows[i]
+        plus_dm.append(up if (up > dn and up > 0) else 0.0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+        tr_list.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    tr14 = sum(tr_list[:period]); pDM14 = sum(plus_dm[:period]); mDM14 = sum(minus_dm[:period])
+    for i in range(period, len(tr_list)):
+        tr14  = tr14  - (tr14 / period)  + tr_list[i]
+        pDM14 = pDM14 - (pDM14 / period) + plus_dm[i]
+        mDM14 = mDM14 - (mDM14 / period) + minus_dm[i]
+    if tr14 <= 0: return 0.0
+    pDI = (pDM14 / tr14) * 100.0
+    mDI = (mDM14 / tr14) * 100.0
+    dx = (abs(pDI - mDI) / max(pDI + mDI, 1e-9)) * 100.0
+    return dx
+
+def _market_regime(core, market: str):
+    highs, lows, closes = _fetch_candles(core, market, "1m", 240)
+    if len(closes) < 210:
+        return {"ok": False, "tp_pct": 0.6, "trend_up": False, "adx": 0.0, "rsi": 50.0}
+    ema50  = _series_ema(closes, 50)[-1]
+    ema200 = _series_ema(closes, 200)[-1]
+    trend_up = ema50 > ema200
+    rsi = _rsi(closes, 14) or 50.0
+    atr = _atr(highs, lows, closes, 14) or 0.0
+    last_close = closes[-1]
+    atr_pct = (atr / last_close) if (atr and last_close>0) else 0.0
+    adx_val = _adx(highs, lows, closes, 14) or 0.0
+
+    # اختيار TP% بسيط حسب القوة
+    if adx_val < 18: tp_pct = 0.40
+    elif adx_val < 22: tp_pct = 0.55 if trend_up else 0.45
+    elif adx_val < 28: tp_pct = 0.80 if trend_up else 0.60
+    else: tp_pct = 1.00 if trend_up else 0.70
+    if rsi >= 75: tp_pct = min(tp_pct, 0.70)
+    if rsi <= 40: tp_pct = max(tp_pct, 0.50 if trend_up else 0.40)
+    tp_pct += min(0.30, (atr_pct * 1000) * 0.06)  # تعزيز بسيط مع ATR
+
+    return {"ok": True, "tp_pct": tp_pct, "trend_up": trend_up, "adx": adx_val, "rsi": rsi}
+
+def choose_tp_price(core, market: str, avg_price: float):
+    reg = _market_regime(core, market)
+    tp_pct = reg.get("tp_pct", 0.6)
+    return avg_price * (1.0 + tp_pct/100.0), reg
+
+# ===== مطاردة شراء (نستخدم الموجودة في core.place_limit_postonly) =====
+def chase_buy(core, market:str, spend_eur:float)->dict:
+    """مطاردة Maker سريعة؛ تُعيد أيضا last_oid لنستعمله كـ operatorId للـ SL."""
+    last_oid=None; last_price=None
+    min_tick = float(1.0 / (10 ** core.price_decimals(market)))
+    while True:
+        bid, _ = core.get_best_bid_ask(market)
+        if bid <= 0:
+            time.sleep(0.25); continue
+        price = bid
+        amount = core.round_amount_down(market, spend_eur / max(price,1e-12))
+        if amount < core.min_base(market):
+            return {"ok": False, "ctx":"amount_too_small"}
+        if last_oid:
+            try: core.cancel_order_blocking(market, last_oid, wait_sec=2.5)
+            except: pass
+        _, resp = core.place_limit_postonly(market, "buy", price, amount)
+        if isinstance(resp, dict) and resp.get("error"):
+            time.sleep(0.35); continue
+        last_oid = resp.get("orderId"); last_price = price
+        core.open_set(market, {"orderId": last_oid, "side":"buy", "amount_init": amount})
+        t0 = time.time()
+        while True:
+            st = core.order_status(market, last_oid)
+            s  = (st or {}).get("status","").lower()
+            if s in ("filled","partiallyfilled"):
+                fb = float((st or {}).get("filledAmount",0) or 0)
+                fq = float((st or {}).get("filledAmountQuote",0) or 0)
+                avg = (fq/fb) if (fb>0 and fq>0) else last_price
+                return {"ok": True, "status": s, "avg_price": avg, "filled_base": fb, "spent_eur": fq, "last_oid": last_oid}
+            bid2, _ = core.get_best_bid_ask(market)
+            reprice_due = (bid2 > 0 and abs(bid2 - last_price) >= min_tick) or (time.time()-t0 >= 2.0)
+            if reprice_due: break
+            time.sleep(0.18 if (time.time()-t0) < 4 else 0.35)
+
+# ===== لا نحرك SL (ثابت -2%) — واجهة مطلوبة من الكور =====
 def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, current_sl_price:float):
     return current_sl_price
 
-# ---------- مراقبة بيع يدوي لإرسال Ready ----------
+# ===== مراقبة بيع يدوي لإرسال Ready =====
 def _watch_manual_sell(core, market: str, order_id: str, amt_hint: float|None):
     base_guess = float(amt_hint or 0.0)
     deadline = time.time() + 180.0
@@ -50,7 +170,7 @@ def _watch_manual_sell(core, market: str, order_id: str, amt_hint: float|None):
         time.sleep(0.7)
     core.tg_send(f"ℹ️ مراقبة البيع اليدوي انتهت — {market} (status={last_status}).")
 
-# ---------- on_hook_buy ----------
+# ===== تنفيذ الشراء عند إشارة أبو صياح =====
 def on_hook_buy(core, coin:str):
     market = core.coin_to_market(coin)
     if not market:
@@ -71,18 +191,17 @@ def on_hook_buy(core, coin:str):
 
     avg = float(res.get("avg_price") or 0.0)
     base_bought = float(res.get("filled_base") or 0.0)
+    buy_oid = (res.get("last_oid") or "")  # ← سنستخدمه للـ operatorId
     base_sym = market.split("-")[0]
 
-    # تسوية الرصيد (لو الامتلاء على دفعات) + تحسين المتوسط من آخر دقيقة
+    # تسوية الرصيد
     bal = core.balance(base_sym)
     if bal > base_bought:
         base_bought = core.round_amount_down(market, bal)
-    avg2 = infer_recent_avg_buy(core, market)
-    if avg2 > 0: avg = avg2
 
-    # اختر TP + علّل السبب بإيجاز
+    # اختر TP + سبب مختصر
     tp_price, reg = choose_tp_price(core, market, avg)
-    tp_pct = ((tp_price / avg) - 1.0) * 100.0 if avg > 0 else 0.0
+    tp_pct = reg.get("tp_pct", 0.7)
     reasons = []
     if reg:
         if reg.get("trend_up"): reasons.append("EMA50>EMA200")
@@ -101,44 +220,74 @@ def on_hook_buy(core, coin:str):
                 tp_oid = tp_resp.get("orderId"); break
             time.sleep(0.45)
 
-    # ضع SL رسمي ثابت -2% (StopLossLimit) — limit تحت الـstop بشوي
-    sl_stop  = avg * (1.0 + SL_FIXED_PCT/100.0)      # 98%
-    sl_limit = sl_stop * 0.999
+    # —— SL رسمي ثابت -2% مع operatorId = buy_oid ——
+    sl_price      = avg * (1.0 + SL_FIXED_PCT/100.0)      # 98%
+    trigger_price = avg * (1.0 + (SL_FIXED_PCT-0.1)/100)  # 97.9% لتأمين التفعيل
     sl_oid = None; sl_resp=None
-    if sell_amt >= minb:
-        _, sl_resp = core.place_stoploss_limit(market, sell_amt, sl_stop, sl_limit)
-        if isinstance(sl_resp, dict) and not sl_resp.get("error"):
-            sl_oid = sl_resp.get("orderId")
 
-    # خزّن المركز للـwatchdog
+    def _send_sl(payload):
+        resp = core.bv_request("POST", "/order", body=payload)
+        ok = isinstance(resp, dict) and not resp.get("error")
+        return ok, resp
+
+    # المحاولة 1: الشكل الأكثر شيوعاً
+    sl_body_1 = {
+        "market": market,
+        "side": "sell",
+        "orderType": "stopLossLimit",
+        "amount": core.fmt_amount(market, sell_amt),
+        "price": core.fmt_price(market, sl_price),
+        "triggerType": "last",
+        "triggerPrice": core.fmt_price(market, trigger_price),
+        "timeInForce": "GTC",
+        "operatorId": buy_oid  # << المهم
+    }
+    ok1, resp1 = _send_sl(sl_body_1)
+
+    # المحاولة 2 (fallback): بعض الأسواق تريد triggerReference=lastTrade
+    if not ok1 and isinstance(resp1, dict) and "operatorid" in (resp1.get("error","").lower()):
+        sl_body_2 = dict(sl_body_1)
+        sl_body_2["triggerType"] = "price"
+        sl_body_2["triggerReference"] = "lastTrade"
+        ok2, resp2 = _send_sl(sl_body_2)
+        sl_resp = resp2; ok = ok2
+    else:
+        sl_resp = resp1; ok = ok1
+
+    if ok:
+        sl_oid = (sl_resp or {}).get("orderId")
+
+    # خزّن الحالة للـ watchdog
     core.pos_set(market, {
         "avg": avg, "base": base_bought,
         "tp_oid": tp_oid, "tp_target": tp_price,
-        "sl_oid": sl_oid, "sl_price": sl_stop
+        "sl_oid": sl_oid, "sl_price": sl_price,
+        "buy_oid": buy_oid
     })
     core.open_clear(market)
 
-    # --- رسائل قصيرة مفهومة ---
+    # رسائل واضحة
     core.tg_send(
-        f"✅ BUY {market}\n"
-        f"Avg {avg:.8f} | Base {base_bought}\n"
-        f"TP {tp_price:.8f} ({tp_pct:+.2f}%) — {reason_txt}\n"
-        f"SL {sl_stop:.8f} (−2% ثابت)"
+        "✅ BUY {m}\n"
+        "Avg {a:.8f} | Base {b}\n"
+        "TP {tp:.8f} (+{pct:.2f}%) — {why}\n"
+        "SL {sl:.8f} (−2% ثابت)".format(
+            m=market, a=avg, b=base_bought, tp=tp_price, pct=tp_pct, why=reason_txt, sl=sl_price
+        )
     )
     if tp_oid:
         core.tg_send(f"🏷️ TP OID: {tp_oid}")
     else:
         core.tg_send(f"⚠️ فشل وضع TP — {json.dumps(tp_resp, ensure_ascii=False)[:300]}")
     if sl_oid:
-        core.tg_send(f"🛡️ SL OID: {sl_oid}")
+        core.tg_send(f"🛡️ SL OID: {sl_oid} (linked to buy {buy_oid})")
     else:
         core.tg_send(f"⚠️ فشل وضع SL — {json.dumps(sl_resp, ensure_ascii=False)[:300]}")
 
-# ---------- أوامر تيليغرام ----------
+# ===== أوامر تيليغرام =====
 def on_tg_command(core, text):
     t = (text or "").strip().lower()
 
-    # طوارئ
     if t in ("restart", "reset", "ريستارت", "ريست", "اعادة", "إعادة"):
         try:
             res = core.reset_state()
@@ -152,7 +301,6 @@ def on_tg_command(core, text):
             core.tg_send(f"🐞 reset err: {type(e).__name__}: {e}")
         return
 
-    # بيع يدوي (مع مراقبة جاهز)
     if t.startswith("بيع"):
         parts = text.split()
         if len(parts) < 2:
@@ -176,7 +324,6 @@ def on_tg_command(core, text):
             threading.Thread(target=_watch_manual_sell, args=(core, market, oid, amt), daemon=True).start()
         return
 
-    # إلغاء المطاردة الحالية
     if t.startswith("الغ"):
         parts = text.split()
         if len(parts) < 2:
