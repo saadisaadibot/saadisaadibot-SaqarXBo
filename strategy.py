@@ -1,12 +1,29 @@
 # -*- coding: utf-8 -*-
-# strategy.py — TP + SL(-2%) بعد الشراء، مع طباعة سبب Bitvavo عند الفشل ومحاولات fallback ذكية.
+# strategy.py — دخول من /hook + TP ديناميكي طري بدون SL
+# - TP يعلو مع السوق (ratchet up)
+# - بعد 15 دقيقة يبدأ الانكماش التدريجي للهدف حتى الامتلاء (Maker-only)
+# - خيار طوارئ Taker (اختياري، افتراضياً OFF)
+#
+# واجهات لازمة للكور: on_hook_buy, on_tg_command, chase_buy, maybe_move_sl
 
 import time, json, threading
 
-# —— إعدادات قابلة للتعديل ——
-HEADROOM_EUR = 0.30
-SL_FIXED_PCT = -2.0  # SL ثابت دائماً
-DEBUG_BV = True      # لو True يطبع ردّ Bitvavo الخام عند الأخطاء
+# ===== إعدادات عامة =====
+HEADROOM_EUR = 0.30          # خُلي شوية EUR احتياط
+DEBUG_BV     = True          # طباعة أخطاء Bitvavo
+
+# TP ديناميكي
+TP_INIT_PCT            = 0.70   # الهدف الابتدائي كنسبة من سعر الدخول (مثلاً +0.7%)
+TP_DECAY_START_MIN     = 15     # بعد كم دقيقة يبدأ تنزيل الهدف؟
+TP_DECAY_WINDOW_MIN    = 10     # خلال كم دقيقة ننزل من الهدف الابتدائي إلى الحد الأدنى؟
+TP_MIN_PCT             = 0.25   # أرضية الهدف بعد الانكماش (٪)
+REPRICE_SEC            = 1.2    # كل كم ثانية نعيد تسعير أمر البيع لو لزم
+MIN_TICK_REPRICE       = 1      # كم tick لازم يبتعد السعر لنغيّر الأمر (تقليل الإزعاج)
+EDGE_TICKS_ABOVE_ASK   = 1      # خليه فوق أفضل Ask بـ tick واحد (يبقى Maker)
+CLIP_TO_BOOK           = 1      # قصّ الهدف داخل دفتر الأوامر لزيادة الامتلاء
+
+# وضع استعجال اختياري (Taker) — مُعطّل افتراضياً
+FORCE_TAKER_AFTER_MIN  = 0      # 0 = OFF، أو ضع مثلاً 35 لتفعيل بيع Taker بعد 35 دقيقة
 
 # ===== أدوات مساعدة سريعة =====
 def _fetch_candles(core, market: str, interval="1m", limit=240):
@@ -73,7 +90,7 @@ def _adx(highs, lows, closes, period=14):
 def _market_regime(core, market: str):
     highs, lows, closes = _fetch_candles(core, market, "1m", 240)
     if len(closes) < 210:
-        return {"ok": False, "tp_pct": 0.6, "trend_up": False, "adx": 0.0, "rsi": 50.0}
+        return {"ok": False, "tp_pct": TP_INIT_PCT, "trend_up": False, "adx": 0.0, "rsi": 50.0}
     ema50  = _series_ema(closes, 50)[-1]
     ema200 = _series_ema(closes, 200)[-1]
     trend_up = ema50 > ema200
@@ -83,25 +100,24 @@ def _market_regime(core, market: str):
     atr_pct = (atr / last_close) if (atr and last_close>0) else 0.0
     adx_val = _adx(highs, lows, closes, 14) or 0.0
 
-    # اختيار TP% بسيط حسب القوة
+    # هدف ابتدائي مرن حسب القوة
     if adx_val < 18: tp_pct = 0.40
     elif adx_val < 22: tp_pct = 0.55 if trend_up else 0.45
     elif adx_val < 28: tp_pct = 0.80 if trend_up else 0.60
     else: tp_pct = 1.00 if trend_up else 0.70
     if rsi >= 75: tp_pct = min(tp_pct, 0.70)
     if rsi <= 40: tp_pct = max(tp_pct, 0.50 if trend_up else 0.40)
-    tp_pct += min(0.30, (atr_pct * 1000) * 0.06)  # تعزيز بسيط مع ATR
-
+    tp_pct += min(0.30, (atr_pct * 1000) * 0.06)
+    tp_pct = max(TP_MIN_PCT, tp_pct)
     return {"ok": True, "tp_pct": tp_pct, "trend_up": trend_up, "adx": adx_val, "rsi": rsi}
 
 def choose_tp_price(core, market: str, avg_price: float):
     reg = _market_regime(core, market)
-    tp_pct = reg.get("tp_pct", 0.6)
+    tp_pct = reg.get("tp_pct", TP_INIT_PCT)
     return avg_price * (1.0 + tp_pct/100.0), reg
 
-# ===== مطاردة شراء (نستخدم الموجودة في core.place_limit_postonly) =====
+# ===== مطاردة شراء Maker =====
 def chase_buy(core, market:str, spend_eur:float)->dict:
-    """مطاردة Maker سريعة؛ تُعيد أيضا last_oid لنستعمله كـ operatorId للـ SL."""
     last_oid=None; last_price=None
     min_tick = float(1.0 / (10 ** core.price_decimals(market)))
     while True:
@@ -134,65 +150,152 @@ def chase_buy(core, market:str, spend_eur:float)->dict:
             if reprice_due: break
             time.sleep(0.18 if (time.time()-t0) < 4 else 0.35)
 
-# ===== لا نحرك SL (ثابت -2%) — واجهة مطلوبة من الكور =====
+# ===== لا نحرّك SL — لأننا بلا SL أصلاً (متطلبات الكور) =====
 def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, current_sl_price:float):
     return current_sl_price
 
-# ===== أدوات طباعة أخطاء Bitvavo =====
-def _explain_bv_error(resp, where:str, body_preview:dict, core):
-    """
-    يطبع ردّ Bitvavo كما هو + تفسير مختصر.
-    body_preview: جزء آمن من البودي (بدون أسرار).
-    """
-    if not DEBUG_BV: return
-    try:
-        msg = json.dumps(resp, ensure_ascii=False)
-    except Exception:
-        msg = str(resp)
-    hint = ""
-    try:
-        code = int(resp.get("errorCode"))
-        err  = (resp.get("error") or "").lower()
-        if code == 205 and "operatorid" in err:
-            hint = "💡 بعض الأسواق لا تقبل operatorId مع أوامر SL؛ سنجرب بدون operatorId."
-        elif code == 205 and "triggertype" in err:
-            hint = "💡 استخدمنا triggerType=price + triggerReference (lastTrade/bestBid/bestAsk)."
-    except Exception:
-        pass
-    core.tg_send(f"🩻 BV ERROR @ {where}\n{msg}\n— payload: {json.dumps(body_preview, ensure_ascii=False)}\n{hint}")
+# ===== حلقة TP ديناميكية “طرية” =====
+def _clip_to_orderbook_sell(core, market: str, target_price: float, bid: float, ask: float) -> float:
+    if ask <= 0 or bid <= 0: return target_price
+    # حافظ على Maker: السعر دائماً >= ask + edge*tick
+    tick = core.price_tick(market) or (1.0 / (10 ** core.price_decimals(market)))
+    p = max(target_price, ask + EDGE_TICKS_ABOVE_ASK * tick)
+    return p
 
-# ===== مراقبة بيع يدوي لإرسال Ready =====
-def _watch_manual_sell(core, market: str, order_id: str, amt_hint: float|None):
-    base_guess = float(amt_hint or 0.0)
-    deadline = time.time() + 180.0
-    last_status = ""
-    while time.time() < deadline:
-        st = core.order_status(market, order_id) or {}
-        s = (st.get("status") or "").lower()
-        last_status = s or last_status
-        if s == "filled":
-            try:
-                fa = float(st.get("filledAmount",0) or 0)
-                fq = float(st.get("filledAmountQuote",0) or 0)
-                sell_avg = (fq/fa) if (fa>0 and fq>0) else 0.0
-                sold_b   = fa if fa>0 else base_guess
-            except: sell_avg, sold_b = 0.0, base_guess
-            pos = core.pos_get(market) or {}
-            avg_in = float(pos.get("avg") or 0.0)
-            if avg_in>0 and sold_b>0 and sell_avg>0:
-                pnl_eur = (sell_avg-avg_in)*sold_b
-                core.tg_send(
-                    f"💰 بيع يدوي — {market}\n"
-                    f"AvgIn {avg_in:.8f} → AvgOut {sell_avg:.8f} | Base {sold_b}\n"
-                    f"PnL €{pnl_eur:.2f}"
-                )
-                core.notify_ready(market, reason="manual_sell_filled", pnl_eur=round(pnl_eur,4))
-            else:
-                core.tg_send(f"💬 بيع يدوي مملوء — {market} (لا أقدر أحسب PnL بدقة).")
-                core.notify_ready(market, reason="manual_sell_filled", pnl_eur=None)
+def _dynamic_tp_loop(core, market: str, entry: float, base_size: float, tp_init_price: float):
+    """
+    - Phase A (0..DECAY_START): ratchet-up فقط (لا نهبط الهدف)
+    - Phase B (DECAY_START..DECAY_START+WINDOW): نهبط تدريجيًا نحو TP_MIN_PCT
+    - نعيد تسعير أمر البيع Maker بلطف حسب REPRICE_SEC و MIN_TICK_REPRICE
+    - خيار اختياري: بعد FORCE_TAKER_AFTER_MIN نمسح الأمر ونعمل تياكر طوارئ
+    """
+    try:
+        start = time.time()
+        coin = market.split("-")[0]
+        minb = core.min_base(market)
+        amt  = core.round_amount_down(market, min(base_size, core.balance(coin)))
+        if amt < minb:
+            core.tg_send(f"⛔ لا توجد كمية كافية للبيع — {market}")
+            core.notify_ready(market, reason="no_amount", pnl_eur=None)
             return
-        time.sleep(0.7)
-    core.tg_send(f"ℹ️ مراقبة البيع اليدوي انتهت — {market} (status={last_status}).")
+
+        # حالة داخلية
+        last_oid = None
+        last_price = 0.0
+        last_place_ts = 0.0
+        tp_floor_price = entry * (1.0 + TP_MIN_PCT/100.0)
+        tp_top_price   = max(tp_init_price, tp_floor_price)  # سقف مبدئي
+        current_target = tp_init_price                        # يبدأ من الابتدائي
+
+        core.tg_send(f"🎯 بدء TP ديناميكي — {market}\n"
+                     f"Entry {entry:.8f} | Amt {amt}\n"
+                     f"InitTP {tp_init_price:.8f} → MinTP {tp_floor_price:.8f}")
+
+        while True:
+            # تحقق حالة الفل / الكمية
+            pos = core.pos_get(market) or {}
+            if float(pos.get("base", amt) or amt) <= 0.0:
+                core.notify_ready(market, reason="closed_external", pnl_eur=None)
+                return
+
+            bid, ask = core.get_best_bid_ask(market)
+            now = time.time()
+            elapsed_min = int((now - start) / 60)
+
+            # Phase A: ratchet-up مع الصعود (لا هبوط للهدف)
+            if elapsed_min < TP_DECAY_START_MIN:
+                # خلّي الهدف يطارد القمة: لو ask طلع نخليه يطلع معاه
+                if ask > 0:
+                    tick = core.price_tick(market) or (1.0 / (10 ** core.price_decimals(market)))
+                    candidate = ask + EDGE_TICKS_ABOVE_ASK * tick
+                    # لا ننزل الهدف أبداً في Phase A
+                    current_target = max(current_target, candidate, tp_top_price)
+            else:
+                # Phase B: انكماش خطي من tp_top → tp_floor
+                span = max(1, TP_DECAY_WINDOW_MIN)
+                prog = min(1.0, (elapsed_min - TP_DECAY_START_MIN) / span)
+                target_pct = (TP_MIN_PCT/100.0) + (1.0 - prog) * ((tp_top_price/entry) - 1.0)
+                current_target = entry * max(1.0 + target_pct, 1.0 + TP_MIN_PCT/100.0)
+                # اسمح أن ينخفض (الانكماش) — لكن لا ننزل تحت الأرضية
+                current_target = max(current_target, tp_floor_price)
+
+                # نقرّبه من الدفتر إذا CLIP_TO_BOOK مفعّل
+                if CLIP_TO_BOOK and ask > 0:
+                    current_target = _clip_to_orderbook_sell(core, market, current_target, bid, ask)
+
+            # إعادة تسعير لطيفة
+            tick = core.price_tick(market) or (1.0 / (10 ** core.price_decimals(market)))
+            need_reprice = (abs(current_target - last_price) >= (MIN_TICK_REPRICE * tick)) or ((time.time() - last_place_ts) >= max(2.5, REPRICE_SEC*2))
+            if need_reprice:
+                # ألغِ القديم (إن وجد) ثم ضع الجديد
+                if last_oid:
+                    try: core.cancel_order_blocking(market, last_oid, wait_sec=4.0)
+                    except: pass
+                    last_oid = None
+
+                # قصّ الهدف لضمان Maker
+                p_to_place = current_target
+                if CLIP_TO_BOOK and ask > 0:
+                    p_to_place = _clip_to_orderbook_sell(core, market, current_target, bid, ask)
+
+                _, resp = core.place_limit_postonly(market, "sell", p_to_place, amt)
+                if isinstance(resp, dict) and not resp.get("error"):
+                    last_oid = resp.get("orderId"); last_price = p_to_place; last_place_ts = time.time()
+                else:
+                    if DEBUG_BV:
+                        try: core.tg_send(f"🩻 BV ERR place sell: {json.dumps(resp,ensure_ascii=False)[:200]}")
+                        except: core.tg_send(f"🩻 BV ERR place sell (unserializable)")
+                    # لو فشل، حاول بعد ثواني بسيطة
+                    time.sleep(0.6)
+
+            # فُحص الامتلاء
+            if last_oid:
+                st = core.order_status(market, last_oid) or {}
+                s  = (st.get("status") or "").lower()
+                if s == "filled":
+                    # احسب PnL وأرسل ready
+                    try:
+                        fq = float(st.get("filledAmountQuote",0) or 0)
+                        fa = float(st.get("filledAmount",0) or 0)
+                        avg_out = (fq/fa) if (fa>0 and fq>0) else last_price
+                    except:
+                        avg_out = last_price
+                        fa = amt
+                    pnl_eur = (avg_out - entry) * fa
+                    core.tg_send(f"🏁 TP مكتمل — {market} @ {avg_out:.8f} | PnL≈€{pnl_eur:.2f}")
+                    core.pos_clear(market)
+                    core.notify_ready(market, reason="tp_filled", pnl_eur=round(pnl_eur,4))
+                    return
+
+            # خيار طوارئ: Taker بعد زمن طويل (اختياري)
+            if FORCE_TAKER_AFTER_MIN and elapsed_min >= FORCE_TAKER_AFTER_MIN:
+                if last_oid:
+                    try: core.cancel_order_blocking(market, last_oid, wait_sec=3.0)
+                    except: pass
+                core.tg_send(f"⚡ خروج طوارئ Taker — {market}")
+                res = core.emergency_taker_sell(market, amt)
+                if res.get("ok"):
+                    # حاول نستنتج متوسط البيع
+                    st2 = res.get("response") or {}
+                    try:
+                        fq = float(st2.get("filledAmountQuote",0) or 0)
+                        fa = float(st2.get("filledAmount",0) or 0)
+                        avg_out = (fq/fa) if (fa>0 and fq>0) else (core.get_best_bid_ask(market)[0] or entry)
+                    except:
+                        avg_out = core.get_best_bid_ask(market)[0] or entry
+                        fa = amt
+                    pnl_eur = (avg_out - entry) * fa
+                    core.pos_clear(market)
+                    core.notify_ready(market, reason="taker_emergency", pnl_eur=round(pnl_eur,4))
+                else:
+                    core.notify_ready(market, reason="taker_failed", pnl_eur=None)
+                return
+
+            time.sleep(REPRICE_SEC)
+
+    except Exception as e:
+        core.tg_send(f"⛔ خطأ في TP loop — {market}\n{type(e).__name__}: {e}")
+        core.notify_ready(market, reason="tp_loop_error", pnl_eur=None)
 
 # ===== تنفيذ الشراء عند إشارة أبو صياح =====
 def on_hook_buy(core, coin:str):
@@ -215,141 +318,43 @@ def on_hook_buy(core, coin:str):
 
     avg = float(res.get("avg_price") or 0.0)
     base_bought = float(res.get("filled_base") or 0.0)
-    buy_oid = (res.get("last_oid") or "")  # سنحاول ربط SL به؛ ولو رفضت المنصة نزيله.
     base_sym = market.split("-")[0]
 
-    # تسوية الرصيد
+    # تسوية الكمية بحسب الرصيد الحقيقي
     bal = core.balance(base_sym)
     if bal > base_bought:
         base_bought = core.round_amount_down(market, bal)
 
-    # اختر TP + سبب مختصر
-    tp_price, reg = choose_tp_price(core, market, avg)
-    tp_pct = reg.get("tp_pct", 0.7)
-    reasons = []
+    # اختر TP ابتدائي حسب قوّة السوق
+    tp_price_init, reg = choose_tp_price(core, market, avg)
+    tp_pct = round( (tp_price_init/avg - 1.0) * 100.0, 2 )
+
+    # خزن الحالة لأغراض مراقبة بسيطة (بدون SL)
+    core.pos_set(market, {
+        "avg": avg, "base": base_bought,
+        "tp_oid": None, "tp_target": tp_price_init,
+        "sl_oid": None, "sl_price": 0.0
+    })
+    core.open_clear(market)
+
+    # رسائل
+    reasons=[]
     if reg:
         if reg.get("trend_up"): reasons.append("EMA50>EMA200")
         reasons.append(f"ADX={reg.get('adx',0):.1f}")
         reasons.append(f"RSI={reg.get('rsi',0):.0f}")
-    reason_txt = ", ".join(reasons)
-
-    # ضع TP Maker على كامل المتاح (مع محاولات)
-    minb = core.min_base(market)
-    sell_amt = core.round_amount_down(market, max(core.balance(base_sym), base_bought))
-    tp_oid = None; tp_resp=None
-    if sell_amt >= minb:
-        for _ in range(5):
-            _, tp_resp = core.place_limit_postonly(market, "sell", tp_price, sell_amt)
-            if isinstance(tp_resp, dict) and not tp_resp.get("error"):
-                tp_oid = tp_resp.get("orderId"); break
-            time.sleep(0.45)
-
-    # —— تأكيد الامتلاء قبل أي SL (تحقق مزدوج) ——
-    st_buy = core.order_status(market, buy_oid) or {}
-    if (st_buy.get("status","").lower() not in ("filled","partiallyfilled")):
-        time.sleep(0.4)
-        st_buy = core.order_status(market, buy_oid) or {}
-
-    # —— SL رسمي ثابت -2% ——
-    sl_price      = avg * (1.0 + SL_FIXED_PCT/100.0)       # 98%
-    trigger_price = avg * (1.0 + (SL_FIXED_PCT-0.1)/100.0) # 97.9%
-
-    def _send_sl(payload, tag):
-        resp = core.bv_request("POST", "/order", body=payload)
-        ok = isinstance(resp, dict) and not resp.get("error")
-        if not ok:
-            # اطبع الرد الخام + جزء من البودي لتشخيص المشكلة
-            preview = {
-                "market": payload.get("market"),
-                "orderType": payload.get("orderType"),
-                "amount": payload.get("amount"),
-                "price": payload.get("price"),
-                "triggerType": payload.get("triggerType"),
-                "triggerReference": payload.get("triggerReference", None),
-                "triggerPrice": payload.get("triggerPrice"),
-                "operator": payload.get("operator", None),
-                "hasOperatorId": "operatorId" in payload,
-                "hasClientOrderId": "clientOrderId" in payload
-            }
-            _explain_bv_error(resp, f"SL:{tag}", preview, core)
-        return ok, resp
-
-    # الشكل الأساسي: triggerType="price" + triggerReference + operator=lte (لأننا SL بيع)
-    base_sl_body = {
-        "market": market,
-        "side": "sell",
-        "orderType": "stopLossLimit",
-        "amount": core.fmt_amount(market, sell_amt),
-        "price": core.fmt_price(market, sl_price),              # سعر تنفيذ الأمر (Limit)
-        "triggerType": "price",
-        "triggerReference": "lastTrade",
-        "triggerPrice": core.fmt_price(market, trigger_price),  # سعر التفعيل
-        "timeInForce": "GTC",
-        "responseRequired": True,
-        "operator": "lte"  # اتجاه التريغر للـ SL بيع
-    }
-
-    sl_oid = None
-    last_resp = None
-
-    # A) مع operatorId مربوط بأمر الشراء
-    bodyA = dict(base_sl_body); bodyA["operatorId"] = buy_oid
-    okA, respA = _send_sl(bodyA, "A/operatorId")
-    if okA:
-        sl_oid = (respA or {}).get("orderId"); last_resp = respA
-    else:
-        last_resp = respA
-        # إذا المنصة لا تقبل 'operator' كحقل، احذفه للمحاولات التالية
-        try:
-            if "operator" in bodyA and "operator" in str(respA.get("error","")).lower():
-                base_sl_body.pop("operator", None)
-        except Exception:
-            pass
-
-    # B) جرّب clientOrderId بدل operatorId
-    if not sl_oid:
-        bodyB = dict(base_sl_body); bodyB["clientOrderId"] = buy_oid
-        okB, respB = _send_sl(bodyB, "B/clientOrderId")
-        if okB:
-            sl_oid = (respB or {}).get("orderId"); last_resp = respB
-        else:
-            last_resp = respB
-
-    # C) بدون أي ربط
-    if not sl_oid:
-        bodyC = dict(base_sl_body)
-        okC, respC = _send_sl(bodyC, "C/no-link")
-        if okC:
-            sl_oid = (respC or {}).get("orderId"); last_resp = respC
-        else:
-            last_resp = respC
-
-    # خزّن الحالة للـ watchdog
-    core.pos_set(market, {
-        "avg": avg, "base": base_bought,
-        "tp_oid": tp_oid, "tp_target": tp_price,
-        "sl_oid": sl_oid, "sl_price": sl_price,
-        "buy_oid": buy_oid
-    })
-    core.open_clear(market)
-
-    # رسائل واضحة
     core.tg_send(
         "✅ BUY {m}\n"
         "Avg {a:.8f} | Base {b}\n"
-        "TP {tp:.8f} (+{pct:.2f}%) — {why}\n"
-        "SL {sl:.8f} (−2% ثابت)".format(
-            m=market, a=avg, b=base_bought, tp=tp_price, pct=tp_pct, why=reason_txt, sl=sl_price
+        "Init TP {tp:.8f} (+{pct:.2f}%) — {why}\n"
+        "SL: ❌ (غير مفعّل)".format(
+            m=market, a=avg, b=base_bought, tp=tp_price_init, pct=tp_pct, why=(", ".join(reasons) or "-")
         )
     )
-    if tp_oid:
-        core.tg_send(f"🏷️ TP OID: {tp_oid}")
-    else:
-        core.tg_send(f"⚠️ فشل وضع TP — {json.dumps(tp_resp, ensure_ascii=False)[:300]}")
-    if sl_oid:
-        core.tg_send(f"🛡️ SL OID: {sl_oid}" + (" (linked to buy)" if buy_oid else ""))
-    else:
-        core.tg_send(f"⚠️ فشل وضع SL — {json.dumps(last_resp, ensure_ascii=False)[:300]}")
+
+    # شغّل حلقة TP الديناميكية بخيط مستقل
+    threading.Thread(target=_dynamic_tp_loop, args=(core, market, avg, base_bought, tp_price_init), daemon=True).start()
+
 # ===== أوامر تيليغرام =====
 def on_tg_command(core, text):
     t = (text or "").strip().lower()
@@ -387,7 +392,8 @@ def on_tg_command(core, text):
         oid = (resp or {}).get("orderId")
         core.tg_send(("✅ أمر بيع أُرسل" if ok else "⚠️ فشل البيع") + f" — {market}")
         if ok and oid:
-            threading.Thread(target=_watch_manual_sell, args=(core, market, oid, amt), daemon=True).start()
+            # لا نحتاج ready هنا، الكور أصلاً عنده watch يدوي مبسّط؛ لكن خلّيه بسيط
+            pass
         return
 
     if t.startswith("الغ"):
@@ -400,11 +406,12 @@ def on_tg_command(core, text):
         info = core.open_get(market) or {}
         info["abort"] = True
         core.open_set(market, info)
-        ok=False; final="unknown"; last={}
         if info.get("orderId"):
             ok, final, last = core.cancel_order_blocking(market, info["orderId"], wait_sec=12.0)
             if ok: core.open_clear(market)
-        core.tg_send(("✅ تم الإلغاء" if ok else "ℹ️ أوقفت المطاردة") + f" — status={final}")
+            core.tg_send(("✅ تم الإلغاء" if ok else "ℹ️ أوقفت المطاردة") + f" — status={final}")
+        else:
+            core.tg_send("ℹ️ أوقفت المطاردة (لا يوجد OID)")
         return
 
     core.tg_send("الأوامر: «بيع COIN [AMOUNT]» ، «الغ COIN» — الشراء عبر /hook")
