@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# strategy.py — يضع TP + SL(-2%) فور الشراء، مع operatorId صحيح للـ SL، ورسائل واضحة.
+# strategy.py — TP + SL(-2%) بعد الشراء، مع طباعة سبب Bitvavo عند الفشل ومحاولات fallback ذكية.
 
 import time, json, threading
 
 # —— إعدادات قابلة للتعديل ——
 HEADROOM_EUR = 0.30
 SL_FIXED_PCT = -2.0  # SL ثابت دائماً
+DEBUG_BV = True      # لو True يطبع ردّ Bitvavo الخام عند الأخطاء
 
 # ===== أدوات مساعدة سريعة =====
 def _fetch_candles(core, market: str, interval="1m", limit=240):
@@ -137,6 +138,29 @@ def chase_buy(core, market:str, spend_eur:float)->dict:
 def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, current_sl_price:float):
     return current_sl_price
 
+# ===== أدوات طباعة أخطاء Bitvavo =====
+def _explain_bv_error(resp, where:str, body_preview:dict, core):
+    """
+    يطبع ردّ Bitvavo كما هو + تفسير مختصر.
+    body_preview: جزء آمن من البودي (بدون أسرار).
+    """
+    if not DEBUG_BV: return
+    try:
+        msg = json.dumps(resp, ensure_ascii=False)
+    except Exception:
+        msg = str(resp)
+    hint = ""
+    try:
+        code = int(resp.get("errorCode"))
+        err  = (resp.get("error") or "").lower()
+        if code == 205 and "operatorid" in err:
+            hint = "💡 بعض الأسواق لا تقبل operatorId مع أوامر SL؛ سنجرب بدون operatorId."
+        elif code == 205 and "triggertype" in err:
+            hint = "💡 استخدمنا triggerType=price + triggerReference (lastTrade/bestBid/bestAsk)."
+    except Exception:
+        pass
+    core.tg_send(f"🩻 BV ERROR @ {where}\n{msg}\n— payload: {json.dumps(body_preview, ensure_ascii=False)}\n{hint}")
+
 # ===== مراقبة بيع يدوي لإرسال Ready =====
 def _watch_manual_sell(core, market: str, order_id: str, amt_hint: float|None):
     base_guess = float(amt_hint or 0.0)
@@ -191,7 +215,7 @@ def on_hook_buy(core, coin:str):
 
     avg = float(res.get("avg_price") or 0.0)
     base_bought = float(res.get("filled_base") or 0.0)
-    buy_oid = (res.get("last_oid") or "")  # ← سنستخدمه للـ operatorId
+    buy_oid = (res.get("last_oid") or "")  # سنحاول ربط SL به؛ ولو رفضت المنصة نزيله.
     base_sym = market.split("-")[0]
 
     # تسوية الرصيد
@@ -220,38 +244,68 @@ def on_hook_buy(core, coin:str):
                 tp_oid = tp_resp.get("orderId"); break
             time.sleep(0.45)
 
-    # —— SL رسمي ثابت -2% مع operatorId = buy_oid ——
+    # —— SL رسمي ثابت -2% ——
     sl_price      = avg * (1.0 + SL_FIXED_PCT/100.0)      # 98%
     trigger_price = avg * (1.0 + (SL_FIXED_PCT-0.1)/100)  # 97.9% لتأمين التفعيل
 
-    def _send_sl(payload):
+    def _send_sl(payload, tag):
         resp = core.bv_request("POST", "/order", body=payload)
         ok = isinstance(resp, dict) and not resp.get("error")
+        if not ok:
+            # اطبع الرد الخام + جزء من البودي لتشخيص المشكلة
+            preview = {
+                "market": payload.get("market"),
+                "orderType": payload.get("orderType"),
+                "amount": payload.get("amount"),
+                "price": payload.get("price"),
+                "triggerType": payload.get("triggerType"),
+                "triggerReference": payload.get("triggerReference", None),
+                "triggerPrice": payload.get("triggerPrice"),
+                "hasOperatorId": "operatorId" in payload
+            }
+            _explain_bv_error(resp, f"SL:{tag}", preview, core)
         return ok, resp
 
-    # الشكل المقبول: triggerType="price" + triggerReference (lastTrade/bestBid/bestAsk)
+    # الشكل الأساسي: triggerType="price" + triggerReference
     base_sl_body = {
         "market": market,
         "side": "sell",
         "orderType": "stopLossLimit",
         "amount": core.fmt_amount(market, sell_amt),
         "price": core.fmt_price(market, sl_price),            # سعر تنفيذ الأمر (Limit)
-        "triggerType": "price",                                # ← المهم
+        "triggerType": "price",
         "triggerPrice": core.fmt_price(market, trigger_price), # سعر التفعيل
         "timeInForce": "GTC",
-        "operatorId": buy_oid,
         "responseRequired": True
     }
 
     sl_oid = None
-    last_err = None
+    last_resp = None
+
+    # المحاولة A: مع operatorId مرتبط بأمر الشراء
     for ref in ("lastTrade", "bestBid", "bestAsk"):
-        body = dict(base_sl_body); body["triggerReference"] = ref
-        ok, resp = _send_sl(body)
-        if ok:
-            sl_oid = (resp or {}).get("orderId"); break
-        last_err = resp
+        bodyA = dict(base_sl_body); bodyA["triggerReference"] = ref; bodyA["operatorId"] = buy_oid
+        okA, respA = _send_sl(bodyA, f"A/{ref}")
+        if okA:
+            sl_oid = (respA or {}).get("orderId"); last_resp = respA; break
+        last_resp = respA
+        # إذا الخطأ يتكلم عن operatorId invalid، جرّب B مباشرة
+        try:
+            if str(respA.get("error","")).lower().find("operatorid") != -1:
+                break
+        except Exception:
+            pass
         time.sleep(0.25)
+
+    # المحاولة B: نفس الطلب لكن بدون operatorId (بعض الأسواق ترفضه)
+    if not sl_oid:
+        for ref in ("lastTrade", "bestBid", "bestAsk"):
+            bodyB = dict(base_sl_body); bodyB["triggerReference"] = ref
+            okB, respB = _send_sl(bodyB, f"B/{ref}")
+            if okB:
+                sl_oid = (respB or {}).get("orderId"); last_resp = respB; break
+            last_resp = respB
+            time.sleep(0.25)
 
     # خزّن الحالة للـ watchdog
     core.pos_set(market, {
@@ -276,9 +330,9 @@ def on_hook_buy(core, coin:str):
     else:
         core.tg_send(f"⚠️ فشل وضع TP — {json.dumps(tp_resp, ensure_ascii=False)[:300]}")
     if sl_oid:
-        core.tg_send(f"🛡️ SL OID: {sl_oid} (linked to buy {buy_oid})")
+        core.tg_send(f"🛡️ SL OID: {sl_oid}" + (" (linked to buy)" if buy_oid else ""))
     else:
-        core.tg_send(f"⚠️ فشل وضع SL — {json.dumps(last_err, ensure_ascii=False)[:300]}")
+        core.tg_send(f"⚠️ فشل وضع SL — {json.dumps(last_resp, ensure_ascii=False)[:300]}")
 
 # ===== أوامر تيليغرام =====
 def on_tg_command(core, text):
