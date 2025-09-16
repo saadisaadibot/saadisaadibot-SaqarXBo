@@ -1,33 +1,34 @@
 # -*- coding: utf-8 -*-
 # strategy.py — دخول من /hook + TP ديناميكي خارق الذكاء بدون SL
 # - TP مبدئي Maker مباشرة بعد الشراء + إعلان واضح.
-# - Ratchet-up: يطارد الصعود ويرفع السقف الفعلي للهدف.
-# - بعد 15د: انكماش تدريجي نحو أرضية ربح لضمان الخروج السريع.
+# - Ratchet-up أول 15 دقيقة (لا يُنزّل الهدف أثناء الصعود).
+# - بعد 15 دقيقة: انكماش ذكي تدريجي نحو أرضية ربح لضمان الخروج السريع (~25د).
 # - قصّ السعر على دفتر الأوامر للحفاظ على Maker.
 # - يتعامل مع partial fills ويحدّث الكمية المتبقية تلقائياً.
-# - طباعة أخطاء Bitvavo + رسائل تيليغرام شفافة.
+# - مكبح سبام للتنبيهات + تعامل خاص مع خطأ Bitvavo 216.
+# - رسائل تيليغرام شفافة.
 #
 # واجهات مطلوبة من الكور: on_hook_buy, on_tg_command, chase_buy, maybe_move_sl
 
 import time, json, threading
 
 # ===== إعدادات عامة =====
-HEADROOM_EUR = 0.30
-DEBUG_BV     = True
+HEADROOM_EUR = 0.30        # احتياطي بسيط من EUR
+DEBUG_BV     = True        # لطباعة ردود Bitvavo عند الفشل
 
 # ===== منطق TP الذكي =====
-TP_INIT_PCT            = 0.70   # هدف ابتدائي
-TP_DECAY_START_MIN     = 15     # بدء الانكماش
-TP_DECAY_WINDOW_MIN    = 10     # مدة الانكماش
-TP_MIN_PCT             = 0.25   # أرضية ربح
-REPRICE_SEC            = 1.2    # قدّيش نعيد التسعير
-MIN_TICK_REPRICE       = 1      # فرق ticks ليستاهل إعادة التسعير
-EDGE_TICKS_ABOVE_ASK   = 1      # فوق أفضل Ask بـ tick
-CLIP_TO_BOOK           = 1      # قصّ السعر على الدفتر
-FORCE_TAKER_AFTER_MIN  = 0      # 0 = OFF (قيّم بالدقائق للتفعيل)
-ERROR_BACKOFF_SEC      = 0.8    # انتظار بسيط بعد خطأ في وضع أمر
+TP_INIT_PCT            = 0.70   # هدف ابتدائي (+0.7%)
+TP_DECAY_START_MIN     = 15     # ابدأ الانكماش بعد 15 دقيقة
+TP_DECAY_WINDOW_MIN    = 10     # مدة الانكماش (حتى أرضية الربح)
+TP_MIN_PCT             = 0.25   # أرضية ربح دنيا (+0.25%)
+REPRICE_SEC            = 1.2    # تكرار إعادة التسعير
+MIN_TICK_REPRICE       = 1      # أقل فرق ticks لتغيير السعر
+EDGE_TICKS_ABOVE_ASK   = 1      # اجعل السعر فوق أفضل Ask بـ tick (Maker)
+CLIP_TO_BOOK           = 1      # قصّ الهدف داخل دفتر الأوامر
+FORCE_TAKER_AFTER_MIN  = 0      # 0=OFF، أو رقم دقائق لبيع طوارئ Taker
+ERROR_BACKOFF_SEC      = 0.8    # انتظار بعد خطأ وضع أمر
 
-# ===== مؤشرات مساعدة خفيفة =====
+# ===== مؤشرات مساعدة خفيفة (للاختيار والمعلومات) =====
 def _fetch_candles(core, market: str, interval="1m", limit=240):
     data = core.bv_request("GET", f"/{market}/candles?interval={interval}&limit={limit}")
     if not isinstance(data, list): return [], [], []
@@ -49,8 +50,8 @@ def _rsi(closes, period=14):
     gains = losses = 0.0
     for i in range(-period, 0):
         d = closes[i] - closes[i-1]
-        if d >= 0: gains += d
-        else: losses += -d
+        gains += d if d >= 0 else 0.0
+        losses += -d if d < 0 else 0.0
     avg_gain = gains / period
     avg_loss = (losses / period) if losses > 0 else 1e-9
     rs = avg_gain / avg_loss
@@ -109,7 +110,7 @@ def _market_regime(core, market: str):
     else: tp_pct = 1.00 if trend_up else 0.70
     if rsi >= 75: tp_pct = min(tp_pct, 0.70)
     if rsi <= 40: tp_pct = max(tp_pct, 0.50 if trend_up else 0.40)
-    tp_pct += min(0.30, (atr_pct * 1000) * 0.06)  # تعزيز مع ATR
+    tp_pct += min(0.30, (atr_pct * 1000) * 0.06)  # تعزيز خفيف مع ATR
     tp_pct = max(TP_MIN_PCT, tp_pct)
     return {"ok": True, "tp_pct": tp_pct, "trend_up": trend_up, "adx": adx_val, "rsi": rsi}
 
@@ -117,6 +118,28 @@ def choose_tp_price(core, market: str, avg_price: float):
     reg = _market_regime(core, market)
     tp_pct = reg.get("tp_pct", TP_INIT_PCT)
     return avg_price * (1.0 + tp_pct/100.0), reg
+
+# ===== Anti-spam للتنبيهات =====
+_NOTIFY_MUTE = {}  # key -> last_ts
+
+def tg_once(core, key: str, text: str, window_sec: float = 20.0):
+    """يرسل رسالة مرة واحدة ضمن نافذة زمنية لتجنّب السيل."""
+    now = time.time()
+    last = _NOTIFY_MUTE.get(key, 0)
+    if now - last >= window_sec:
+        _NOTIFY_MUTE[key] = now
+        core.tg_send(text)
+
+def _amount_nudge_down(core, market: str, amt: float) -> float:
+    """نزّل الكمية خطوة صغيرة لتفادي 216 عند رزرف الرصيد."""
+    try:
+        tick = getattr(core, "amount_tick", None)
+        step = tick(market) if tick else (1.0 / (10 ** max(0, core.amount_decimals(market))))
+    except Exception:
+        step = 0.0
+    if step and amt > step:
+        return core.round_amount_down(market, max(0.0, amt - step))
+    return core.round_amount_down(market, amt * 0.9995)
 
 # ===== مطاردة شراء Maker =====
 def chase_buy(core, market:str, spend_eur:float)->dict:
@@ -152,7 +175,7 @@ def chase_buy(core, market:str, spend_eur:float)->dict:
             if reprice_due: break
             time.sleep(0.18 if (time.time()-t0) < 4 else 0.35)
 
-# ===== SL غير مستخدم =====
+# ===== SL غير مستخدم (مطلوب من الكور) =====
 def maybe_move_sl(core, market:str, avg:float, base:float, current_bid:float, current_sl_price:float):
     return current_sl_price
 
@@ -166,8 +189,7 @@ def _remaining_from_status(st: dict, fallback_amt: float) -> float:
     """احسب الكمية المتبقية اعتماداً على filledAmount إن توفر."""
     try:
         fa = float(st.get("filledAmount", 0) or 0.0)
-        rem = max(0.0, fallback_amt - fa)
-        return rem
+        return max(0.0, fallback_amt - fa)
     except Exception:
         return fallback_amt
 
@@ -176,7 +198,7 @@ def _dynamic_tp_loop(core, market: str, entry: float, base_size: float,
                      tp_init_price: float, init_oid: str|None, init_price: float|None):
 
     try:
-        # استخدم الكمية المشتراة كما هي (لا تعتمد على balance لأنه محجوز مع أوامر الميكر)
+        # استخدم الكمية المشتراة كما هي (أوامر الميكر قد تحجز الرصيد)
         minb = core.min_base(market)
         amt  = core.round_amount_down(market, float(base_size))
         if amt < minb:
@@ -190,7 +212,7 @@ def _dynamic_tp_loop(core, market: str, entry: float, base_size: float,
         last_place_ts = time.time() if init_oid else 0.0
 
         tp_floor_price = entry * (1.0 + TP_MIN_PCT/100.0)
-        tp_top_price   = max(tp_init_price, tp_floor_price)   # سقف يمكن أن يُرفع بالratchet
+        tp_top_price   = max(tp_init_price, tp_floor_price)   # سقف قابل للرفع بالـratchet
         current_target = max(tp_init_price, tp_floor_price)
 
         core.tg_send(
@@ -203,7 +225,7 @@ def _dynamic_tp_loop(core, market: str, entry: float, base_size: float,
         phaseB_announced = False
 
         while True:
-            # حالة خارجية: إن اتصفرت الكمية من مكان آخر
+            # خروج خارجي
             pos = core.pos_get(market) or {}
             if float(pos.get("base", amt) or amt) <= 0.0:
                 core.notify_ready(market, reason="closed_external", pnl_eur=None); return
@@ -212,14 +234,14 @@ def _dynamic_tp_loop(core, market: str, entry: float, base_size: float,
             now = time.time()
             elapsed_min = int((now - start) / 60)
 
-            # Phase A — ratchet-up فقط
+            # Phase A — ratchet-up
             if elapsed_min < TP_DECAY_START_MIN:
                 if ask > 0:
                     tick = core.price_tick(market) or (1.0 / (10 ** core.price_decimals(market)))
                     candidate = ask + EDGE_TICKS_ABOVE_ASK * tick
                     if candidate > current_target: current_target = candidate
                     if candidate > tp_top_price:   tp_top_price   = candidate
-            # Phase B — انكماش تدريجي من السقف الحقيقي
+            # Phase B — انكماش تدريجي
             else:
                 if not phaseB_announced:
                     core.tg_send(f"⤵️ بدء الانكماش — {market} (من {tp_top_price:.8f} نحو ≥{tp_floor_price:.8f})")
@@ -233,13 +255,13 @@ def _dynamic_tp_loop(core, market: str, entry: float, base_size: float,
                 if CLIP_TO_BOOK and ask > 0:
                     current_target = _clip_to_orderbook_sell(core, market, current_target, bid, ask)
 
-            # إعادة تسعير (مع حماية من السبام)
+            # إعادة تسعير (محمية من السبام)
             tick = core.price_tick(market) or (1.0 / (10 ** core.price_decimals(market)))
             need_reprice = (abs(current_target - last_price) >= (MIN_TICK_REPRICE * tick)) or \
                            ((time.time() - last_place_ts) >= max(3.0, REPRICE_SEC*2))
 
             if need_reprice:
-                # إذا عندنا أمر سابق: شوف إذا امتلأ جزئياً وعدّل الكمية المتبقية
+                # 1) لو عندي OID: افحص الامتلاء وعدّل amt المتبقي
                 if last_oid:
                     st = core.order_status(market, last_oid) or {}
                     s  = (st.get("status") or "").lower()
@@ -256,35 +278,43 @@ def _dynamic_tp_loop(core, market: str, entry: float, base_size: float,
                         core.pos_clear(market)
                         core.notify_ready(market, reason="tp_filled", pnl_eur=round(pnl_eur,4))
                         return
-                    # لو partial: حدّث الكمية المتبقية
-                    amt = core.round_amount_down(market, _remaining_from_status(st, amt))
 
-                    # ألغِ القديم قبل وضع الجديد (لا تترك رزرف محجوز)
+                    # حدّث amt بالمتبقي ثم ألغِ القديم لتحرير الرصيد
+                    amt = core.round_amount_down(market, _remaining_from_status(st, amt))
                     try: core.cancel_order_blocking(market, last_oid, wait_sec=4.0)
                     except: pass
                     last_oid = None
+                    time.sleep(0.25)  # اترك الرصيد يتحرر فعليًا
 
-                # قصّ الهدف لضمان Maker
+                # 2) قصّ الهدف للحفاظ على Maker
                 p_to_place = current_target
                 if CLIP_TO_BOOK and ask > 0:
                     p_to_place = _clip_to_orderbook_sell(core, market, current_target, bid, ask)
 
-                # إذا الكمية أصبحت صغيرة جداً بعد partial، تأكّد من حدّ المنصّة
+                # 3) تحقق من الحد الأدنى بعد partial
                 if amt < minb:
                     core.tg_send(f"ℹ️ الكمية المتبقية تحت الحد الأدنى — {market} (amt={amt}, min={minb})")
                     core.notify_ready(market, reason="dust_leftover", pnl_eur=None)
                     return
 
+                # 4) جرّب وضع أمر البيع + معالجة 216 بدون سبام
                 _, resp = core.place_limit_postonly(market, "sell", p_to_place, amt)
                 if isinstance(resp, dict) and not resp.get("error"):
                     last_oid = resp.get("orderId"); last_price = p_to_place; last_place_ts = time.time()
                 else:
-                    if DEBUG_BV:
-                        try: core.tg_send(f"🩻 BV ERR place sell: {json.dumps(resp,ensure_ascii=False)[:220]}")
-                        except: core.tg_send("🩻 BV ERR place sell (unserializable)")
+                    try: code = int(resp.get("errorCode", 0))
+                    except Exception: code = 0
+                    if code == 216:
+                        tg_once(core, f"216:{market}",
+                                f"🧯 BV 216 — {market}: insufficient balance (تحرير رزرف/تعديل الكمية)")
+                        amt = _amount_nudge_down(core, market, amt)  # نزّل الكمية شعرة
+                    else:
+                        # أخطاء أخرى — إعلان غير مُكرر
+                        tg_once(core, f"ERR:{market}:{code}",
+                                f"🩻 BV ERR place sell @{market}: {json.dumps(resp, ensure_ascii=False)[:220]}")
                     time.sleep(ERROR_BACKOFF_SEC)
 
-            # طوارئ تياكر (اختياري)
+            # طوارئ Taker (اختياري)
             if FORCE_TAKER_AFTER_MIN and elapsed_min >= FORCE_TAKER_AFTER_MIN:
                 if last_oid:
                     try: core.cancel_order_blocking(market, last_oid, wait_sec=3.0)
@@ -334,7 +364,7 @@ def on_hook_buy(core, coin:str):
     base_bought = float(res.get("filled_base") or 0.0)
     base_sym = market.split("-")[0]
 
-    # مهلة صغيرة ثم تسوية على الرصيد الحقيقي (لو صار rounding من المنصة)
+    # مهلة صغيرة ثم تسوية على الرصيد الحقيقي (لو صار rounding داخلي)
     time.sleep(1.0)
     bal = core.balance(base_sym)
     if bal > base_bought:
@@ -430,9 +460,7 @@ def on_tg_command(core, text):
         ask = core.get_best_bid_ask(market)[1]
         _, resp = core.place_limit_postonly(market, "sell", ask, amt)
         ok = isinstance(resp, dict) and not resp.get("error")
-        oid = (resp or {}).get("orderId")
         core.tg_send(("✅ أمر بيع أُرسل" if ok else "⚠️ فشل البيع") + f" — {market}")
-        # مراقبة منفصلة ليست ضرورية هنا؛ الكور يرسل ready عند الامتلاء.
         return
 
     if t.startswith("الغ"):
