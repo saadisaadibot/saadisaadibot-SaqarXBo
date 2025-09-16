@@ -223,39 +223,35 @@ def on_hook_buy(core, coin:str):
     # —— SL رسمي ثابت -2% مع operatorId = buy_oid ——
     sl_price      = avg * (1.0 + SL_FIXED_PCT/100.0)      # 98%
     trigger_price = avg * (1.0 + (SL_FIXED_PCT-0.1)/100)  # 97.9% لتأمين التفعيل
-    sl_oid = None; sl_resp=None
 
     def _send_sl(payload):
         resp = core.bv_request("POST", "/order", body=payload)
         ok = isinstance(resp, dict) and not resp.get("error")
         return ok, resp
 
-    # المحاولة 1: الشكل الأكثر شيوعاً
-    sl_body_1 = {
+    # الشكل المقبول: triggerType="price" + triggerReference (lastTrade/bestBid/bestAsk)
+    base_sl_body = {
         "market": market,
         "side": "sell",
         "orderType": "stopLossLimit",
         "amount": core.fmt_amount(market, sell_amt),
-        "price": core.fmt_price(market, sl_price),
-        "triggerType": "last",
-        "triggerPrice": core.fmt_price(market, trigger_price),
+        "price": core.fmt_price(market, sl_price),            # سعر تنفيذ الأمر (Limit)
+        "triggerType": "price",                                # ← المهم
+        "triggerPrice": core.fmt_price(market, trigger_price), # سعر التفعيل
         "timeInForce": "GTC",
-        "operatorId": buy_oid  # << المهم
+        "operatorId": buy_oid,
+        "responseRequired": True
     }
-    ok1, resp1 = _send_sl(sl_body_1)
 
-    # المحاولة 2 (fallback): بعض الأسواق تريد triggerReference=lastTrade
-    if not ok1 and isinstance(resp1, dict) and "operatorid" in (resp1.get("error","").lower()):
-        sl_body_2 = dict(sl_body_1)
-        sl_body_2["triggerType"] = "price"
-        sl_body_2["triggerReference"] = "lastTrade"
-        ok2, resp2 = _send_sl(sl_body_2)
-        sl_resp = resp2; ok = ok2
-    else:
-        sl_resp = resp1; ok = ok1
-
-    if ok:
-        sl_oid = (sl_resp or {}).get("orderId")
+    sl_oid = None
+    last_err = None
+    for ref in ("lastTrade", "bestBid", "bestAsk"):
+        body = dict(base_sl_body); body["triggerReference"] = ref
+        ok, resp = _send_sl(body)
+        if ok:
+            sl_oid = (resp or {}).get("orderId"); break
+        last_err = resp
+        time.sleep(0.25)
 
     # خزّن الحالة للـ watchdog
     core.pos_set(market, {
@@ -282,7 +278,7 @@ def on_hook_buy(core, coin:str):
     if sl_oid:
         core.tg_send(f"🛡️ SL OID: {sl_oid} (linked to buy {buy_oid})")
     else:
-        core.tg_send(f"⚠️ فشل وضع SL — {json.dumps(sl_resp, ensure_ascii=False)[:300]}")
+        core.tg_send(f"⚠️ فشل وضع SL — {json.dumps(last_err, ensure_ascii=False)[:300]}")
 
 # ===== أوامر تيليغرام =====
 def on_tg_command(core, text):
