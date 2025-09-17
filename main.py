@@ -427,18 +427,18 @@ def open_clear(market:str):
 def notify_ready(market:str, reason:str, pnl_eur=None):
     if not ABUSIYAH_READY_URL:
         tg_send(f"ready — {market} ({reason})"); return
+    if not ABUSIYAH_READY_URL.rstrip("/").endswith("/ready"):
+        tg_send(f"⚠️ ABUSIYAH_READY_URL لا ينتهي بـ /ready: {ABUSIYAH_READY_URL}")
     headers={"Content-Type":"application/json"}
     if LINK_SECRET: headers["X-Link-Secret"]=LINK_SECRET
     coin=market.split("-")[0]
     try:
-        r = requests.post(ABUSIYAH_READY_URL,
-                          json={"coin":coin,"reason":reason,"pnl_eur":pnl_eur},
+        r = requests.post(ABUSIYAH_READY_URL, json={"coin":coin,"reason":reason,"pnl_eur":pnl_eur},
                           headers=headers, timeout=6)
         if not (200 <= r.status_code < 300):
             tg_send(f"⚠️ ready فشل — HTTP {r.status_code} | {r.text[:160]}")
     except Exception as e:
         tg_send(f"⚠️ فشل نداء ready: {e}")
-
 # ===== Helpers: average sell & PnL =====
 def _avg_from_order_fills(order_obj: dict) -> tuple[float, float]:
     try:
