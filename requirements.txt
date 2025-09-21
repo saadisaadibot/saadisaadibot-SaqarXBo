@@ -1,6 +1,6 @@
-Flask
-gunicorn
-requests
-redis
-python-dotenv
-websocket-client
+Flask==3.0.3
+gunicorn==21.2.0
+requests==2.32.3
+websockets==12.0
+redis==5.0.8
+python-dotenv==1.0.1
